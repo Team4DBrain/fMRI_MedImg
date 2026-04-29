@@ -134,8 +134,11 @@ What each batch contains
 Each batch is a dictionary:
 
 input → low-resolution volume (LR)
+
 target → high-resolution volume (HR)
+
 mask_hr → brain mask at HR resolution
+
 mask_lr → downsampled mask
 
 Typical shapes:
