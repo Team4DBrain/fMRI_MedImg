@@ -95,22 +95,68 @@ python -m src.data.compute_metadata \
 `build.py` just calls these two in order.
 
 ### Stage 3 — training (every epoch, on the fly)
-```python
+Once you’ve run the build step and have:
+
+<out>/manifest.json
+<out>/masks/
+
+you do not run any more data pipeline scripts.
+All data loading and preprocessing happens automatically inside the Dataset.
+
+```
 from src.data.datasets import SpatialSRDataset
 from src.data.degradation_spatial import make_spatial_degradation
 from torch.utils.data import DataLoader
 
-degrade = make_spatial_degradation(source_voxel_mm=1.5, target_voxel_mm=3.0)
-ds = SpatialSRDataset(
-    "manifest.json",
-    subject_filter=["01", "04"],     # train subjects
+# Define LR ← HR degradation
+degrade = make_spatial_degradation(
+    source_voxel_mm=1.5,
+    target_voxel_mm=3.0,
+)
+
+train_ds = SpatialSRDataset(
+    "<out>/manifest.json",
+    subject_filter=["01", "04", "07"],  # training subjects
     degrade_fn=degrade,
 )
-loader = DataLoader(ds, batch_size=8, num_workers=2, shuffle=True)
+
+val_ds = SpatialSRDataset(
+    "<out>/manifest.json",
+    subject_filter=["11"],              # validation subject(s)
+    degrade_fn=degrade,
+)
+
+train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=4, num_workers=2, shuffle=False)
 ```
+What each batch contains
 
-Each sample comes back as a dict with input/target/mask tensors.
+Each batch is a dictionary:
 
+input → low-resolution volume (LR)
+target → high-resolution volume (HR)
+mask_hr → brain mask at HR resolution
+mask_lr → downsampled mask
+
+Typical shapes:
+
+input: (B, 1, 64, 64, 46)
+target: (B, 1, 128, 128, 93)
+```
+for batch in train_loader:
+    lr = batch["input"].to("cuda")
+    hr_target = batch["target"].to("cuda")
+    mask = batch["mask_hr"].to("cuda")
+
+    hr_pred = model(lr)  # your model upsamples LR → HR
+
+    # masked MSE (only brain voxels contribute)
+    loss = ((hr_pred - hr_target) ** 2 * mask).sum() / mask.sum()
+
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
 ## Design decisions worth knowing
 
 - **Raw data only**, no preprocessing pipeline yet (no motion correction, no
