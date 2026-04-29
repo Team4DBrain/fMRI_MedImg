@@ -73,10 +73,19 @@ def build_manifest(bids_root: Path) -> list[RunEntry]:
     if not bids_root.is_dir():
         raise FileNotFoundError(f"BIDS root not found: {bids_root}")
 
-    # Pattern: sub-*/ses-*/func/*_bold.nii.gz
-    # If your BIDS dataset has no session dirs, you'd need a second glob.
-    # IBC always has sessions, so this is fine for now.
-    bold_files = sorted(bids_root.glob("sub-*/ses-*/func/*_bold.nii.gz"))
+    # Find BOLD files anywhere under bids_root, supporting both layouts:
+    #   nested BIDS: sub-XX/ses-YY/func/*_bold.nii.gz
+    #   flat:        *_bold.nii.gz directly in bids_root
+    # rglob walks recursively, so it finds both. Dedupe by absolute path
+    # (just in case of symlinks/hard links pointing to the same file).
+    seen: set[Path] = set()
+    bold_files: list[Path] = []
+    for path in sorted(bids_root.rglob("*_bold.nii.gz")):
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        bold_files.append(path)
     logger.info(f"Found {len(bold_files)} BOLD files under {bids_root}")
 
     entries: list[RunEntry] = []

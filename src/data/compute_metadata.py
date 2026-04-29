@@ -83,6 +83,7 @@ def process_run(
     derivatives_dir: Path,
     target_shape: tuple[int, int, int],
     overwrite: bool = False,
+    mask_method: str = "auto",
 ) -> RunMetadata:
     """Compute all per-run metadata. Writes the (padded) HR mask to disk.
 
@@ -91,6 +92,9 @@ def process_run(
 
     Norm ref and tSNR are computed on the un-padded mean volume so they aren't
     biased by the zero-padding regions.
+
+    Args:
+        mask_method: "auto", "synthstrip", or "percentile". See masks.py.
     """
     run_path = bids_root / run_entry["path"]
     run_id = run_entry["run_id"]
@@ -124,8 +128,6 @@ def process_run(
                 f"for {run_id}. Try --overwrite."
             )
         # We need the unpadded version for norm_ref / tSNR. Crop back.
-        # Using compute_pad_widths inverse: the brain is centered, so we can
-        # crop the central region matching the original shape.
         pad_widths = []
         for axis in range(3):
             diff = target_shape[axis] - reader.shape[axis]
@@ -137,14 +139,11 @@ def process_run(
             pad_widths[2][0]:pad_widths[2][1],
         ]
     else:
-        logger.info(f"  Computing mask for {run_id}")
-        mask_unpadded = compute_brain_mask(mean_vol)
-        # Pad to target_shape before saving
+        logger.info(f"  Computing mask for {run_id} (method={mask_method})")
+        mask_unpadded = compute_brain_mask(
+            mean_vol, affine=reader.img.affine, method=mask_method,
+        )
         mask_padded = center_pad_mask(mask_unpadded, target_shape)
-        # Save padded mask. Affine is approximate — strictly the padding shifts
-        # the origin by `before` voxels, but this affine is just for viewer
-        # alignment and is rarely critical here. If you visualize the mask
-        # against the unpadded data, expect a small offset.
         mask_img = nib.Nifti1Image(mask_padded.astype(np.uint8), affine=reader.img.affine)
         mask_abs.parent.mkdir(parents=True, exist_ok=True)
         nib.save(mask_img, str(mask_abs))
@@ -168,6 +167,7 @@ def compute_all(
     derivatives_dir: Path,
     target_shape: tuple[int, int, int] = (DEFAULT_TARGET_XY, DEFAULT_TARGET_XY, DEFAULT_TARGET_Z),
     overwrite: bool = False,
+    mask_method: str = "auto",
 ) -> None:
     """Process every run in the manifest, write updated manifest in place.
 
@@ -178,6 +178,9 @@ def compute_all(
             volumes during training) are padded. Default (128, 128, 93).
             Crashes if any run exceeds this — re-run with larger target.
         overwrite: recompute masks even if they already exist.
+        mask_method: "auto" (default), "synthstrip", or "percentile". See
+            masks.compute_brain_mask for details. "auto" prefers synthstrip
+            and falls back with a warning.
     """
     manifest = load_manifest(manifest_path)
     bids_root = Path(manifest["bids_root"])
@@ -187,6 +190,7 @@ def compute_all(
     logger.info(f"Processing {manifest['n_runs']} runs from {bids_root}")
     logger.info(f"Writing derivatives to {derivatives_dir}")
     logger.info(f"Target shape: {target_shape}")
+    logger.info(f"Mask method: {mask_method}")
 
     max_seen = [0, 0, 0]  # track max dimensions encountered
 
@@ -199,7 +203,8 @@ def compute_all(
 
         try:
             metadata = process_run(
-                entry, bids_root, derivatives_dir, target_shape, overwrite=overwrite,
+                entry, bids_root, derivatives_dir, target_shape,
+                overwrite=overwrite, mask_method=mask_method,
             )
         except Exception as e:
             logger.error(f"  FAILED on {entry['run_id']}: {e}")
@@ -272,6 +277,16 @@ def _cli() -> None:
         action="store_true",
         help="Recompute masks even if they already exist on disk",
     )
+    parser.add_argument(
+        "--mask-method",
+        choices=["auto", "synthstrip", "percentile"],
+        default="auto",
+        help="Brain masking method. 'auto' (default) prefers synthstrip if "
+             "installed and falls back to percentile with a warning. "
+             "'synthstrip' requires mri_synthstrip / synthstrip-docker / "
+             "synthstrip-singularity on PATH; raises if missing. "
+             "'percentile' uses pure-Python intensity thresholding (imperfect).",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -286,6 +301,7 @@ def _cli() -> None:
         args.derivatives_dir,
         target_shape=target_shape,
         overwrite=args.overwrite,
+        mask_method=args.mask_method,
     )
     print(f"Done. Updated manifest: {args.manifest}")
 

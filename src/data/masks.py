@@ -1,64 +1,165 @@
 """Brain mask computation for fMRI volumes.
 
-Custom implementation using intensity thresholding + morphological cleanup.
-Deliberately simple — we own and understand every line.
+Two backends:
 
-KNOWN LIMITATIONS:
-This is a percentile-based intensity threshold approach. Empirically it tends
-to either include too much skull/scalp (low percentile) or carve into the
-cerebellum (high percentile). It cannot cleanly separate brain from bright
-non-brain tissue (fat, scalp) because they overlap in EPI intensity.
+  - "synthstrip" (default): SynthStrip (Hoopes et al. 2022, NeuroImage). DL-based
+    skull stripping designed for cross-modality. Works directly on EPI without
+    needing T1 coregistration. Robust and accurate. Requires one of these
+    executables on PATH: mri_synthstrip (full FreeSurfer), synthstrip-docker
+    (needs Docker), or synthstrip-singularity (needs Apptainer/Singularity).
 
-For local development this is acceptable but flawed. The plan is to replace
-with SynthStrip (Hoopes et al. 2022, NeuroImage) when running on the VM:
-  - State-of-the-art DL-based skull stripping designed for cross-modality
-  - Works directly on EPI without needing T1 coregistration
-  - Distributed via FreeSurfer or as a standalone Docker container
-  - GitHub: https://github.com/freesurfer/freesurfer/tree/dev/mri_synthstrip
+  - "percentile": fallback intensity-thresholding + morphological cleanup.
+    Pure numpy/scipy, no external tools. Empirically imperfect: tends to
+    include some skull/scalp at low percentiles or carve into cerebellum at
+    high percentiles. Use only when SynthStrip isn't available.
 
-TODO: When FSL or SynthStrip is available, swap compute_brain_mask to use it.
-The function signature can stay the same (mean_volume in, bool array out) so
-no downstream code changes are needed.
+  - "auto" (default for the dispatch): try synthstrip; if unavailable, log a
+    warning and fall back to percentile.
+
+Reference:
+  https://surfer.nmr.mgh.harvard.edu/docs/synthstrip/
+  https://github.com/freesurfer/freesurfer/tree/dev/mri_synthstrip
 """
 
 from __future__ import annotations
 
+import logging
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Literal
+
+import nibabel as nib
 import numpy as np
 from scipy import ndimage
 
+logger = logging.getLogger(__name__)
 
-def compute_brain_mask(
+# Executables that all support the same -i / -m CLI for SynthStrip.
+# Order matters: we prefer the native FreeSurfer install over containers
+# because it's faster (no container startup overhead).
+_SYNTHSTRIP_CANDIDATES = ("mri_synthstrip", "synthstrip-docker", "synthstrip-singularity")
+
+
+def find_synthstrip_executable() -> str | None:
+    """Return the first available synthstrip executable on PATH, or None."""
+    for name in _SYNTHSTRIP_CANDIDATES:
+        path = shutil.which(name)
+        if path is not None:
+            return path
+    return None
+
+
+def _compute_synthstrip_mask(
+    mean_volume: np.ndarray,
+    affine: np.ndarray,
+    executable: str,
+    border: int = 1,
+    no_csf: bool = False,
+) -> np.ndarray:
+    """Run SynthStrip on a mean volume and return the brain mask.
+
+    SynthStrip is an external program that reads/writes NIfTI files. We:
+      1. Write mean_volume to a temp NIfTI.
+      2. Call synthstrip with -i temp_input.nii.gz -m temp_mask.nii.gz.
+      3. Read the mask, return as boolean array.
+      4. Clean up temp files.
+
+    Args:
+        mean_volume: 3D float array, shape (X, Y, Z). The temporal mean of a run.
+        affine: 4x4 voxel-to-world transform from the source NIfTI. Needed so
+            SynthStrip knows the voxel size and orientation. Typically copied
+            from reader.img.affine.
+        executable: full path to a synthstrip-compatible executable.
+        border: -b parameter. Distance in mm from brain boundary to include.
+            Default 1 (SynthStrip's default). Use 0 for tighter masks.
+        no_csf: if True, pass --no-csf so the mask excludes surrounding CSF.
+            Tighter masks are usually preferred for fMRI denoising/SR work.
+
+    Returns:
+        3D boolean array, same shape as mean_volume.
+    """
+    if mean_volume.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got shape {mean_volume.shape}")
+
+    # Use a tempdir; SynthStrip needs files on disk, not in memory.
+    with tempfile.TemporaryDirectory(prefix="synthstrip_") as tmpdir:
+        tmpdir = Path(tmpdir)
+        in_path = tmpdir / "input.nii.gz"
+        mask_path = tmpdir / "mask.nii.gz"
+
+        # Write input
+        in_img = nib.Nifti1Image(mean_volume.astype(np.float32), affine=affine)
+        nib.save(in_img, str(in_path))
+
+        # Build CLI invocation
+        cmd = [executable, "-i", str(in_path), "-m", str(mask_path), "-b", str(border)]
+        if no_csf:
+            cmd.append("--no-csf")
+
+        logger.debug(f"Running: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=300,  # 5 min should be plenty for one volume
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"SynthStrip failed (exit code {e.returncode}).\n"
+                f"stdout: {e.stdout}\nstderr: {e.stderr}"
+            ) from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"SynthStrip timed out after {e.timeout}s. "
+                f"Container pull may be in progress; try running once manually first."
+            ) from e
+
+        if not mask_path.exists():
+            raise RuntimeError(
+                f"SynthStrip ran but didn't produce mask file at {mask_path}.\n"
+                f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            )
+
+        # Read result back into memory before tempdir is cleaned up.
+        mask = np.asarray(nib.load(str(mask_path)).dataobj).astype(bool)
+
+    if mask.shape != mean_volume.shape:
+        raise RuntimeError(
+            f"SynthStrip output shape {mask.shape} doesn't match input "
+            f"{mean_volume.shape}. This shouldn't happen — file a bug."
+        )
+
+    return mask
+
+
+def _compute_percentile_mask(
     mean_volume: np.ndarray,
     lower_percentile: float = 55.0,
     opening_iterations: int = 2,
     closing_iterations: int = 2,
 ) -> np.ndarray:
-    """Compute a brain mask from a temporally-averaged 3D volume.
+    """Percentile-threshold + morphology brain masking. Fallback method.
 
     Algorithm:
-      1. Threshold at the `lower_percentile`-th percentile of non-zero voxels.
-         Rationale: exact zeros are padding/air, so percentile-on-nonzero gives
-         a more informative threshold than a simple percentile of all voxels.
-      2. Morphological opening: removes small bright specks outside the brain
-         (fat, skin, noise).
-      3. Keep largest connected component: throws away disconnected regions
-         (eyeballs, sinus artifacts).
-      4. Morphological closing: fills small holes inside the brain (e.g.,
-         ventricles can have lower signal than threshold).
+      1. Threshold at the lower_percentile-th percentile of non-zero voxels.
+      2. Morphological opening — removes small bright specks (fat, skin, noise).
+      3. Keep largest connected component (throws away eyeballs, sinus artifacts).
+      4. Morphological closing — fills small holes (e.g., ventricles).
+      5. Hole-filling for any topologically enclosed cavities that survived.
 
     Args:
-        mean_volume: 3D array, shape (X, Y, Z). Should be the temporal mean of
-            a BOLD run, not a single volume (too noisy).
+        mean_volume: 3D float array. The temporal mean of a run.
         lower_percentile: percentile of non-zero voxels used as threshold.
-            Lower = larger mask. 20 is a good default for EPI data.
-        opening_iterations: morphological opening strength.
-        closing_iterations: morphological closing strength.
+            Lower = larger mask. 55 is empirically reasonable for IBC EPI.
+        opening_iterations: opening strength (1 voxel per iteration).
+        closing_iterations: closing strength (1 voxel per iteration).
 
     Returns:
-        Boolean array, same shape as input, True inside brain.
-
-    Raises:
-        ValueError: if input is not 3D or is all zeros.
+        3D boolean array, same shape as input.
     """
     if mean_volume.ndim != 3:
         raise ValueError(f"Expected 3D volume, got shape {mean_volume.shape}")
@@ -69,12 +170,8 @@ def compute_brain_mask(
 
     threshold = np.percentile(nonzero, lower_percentile)
     mask = mean_volume > threshold
-
-    # Opening = erosion then dilation. Removes small bright specks.
     mask = ndimage.binary_opening(mask, iterations=opening_iterations)
 
-    # Keep only the largest connected component.
-    # Labels every connected region with a unique integer; component 0 is background.
     labeled, n_components = ndimage.label(mask)
     if n_components == 0:
         raise ValueError(
@@ -82,19 +179,100 @@ def compute_brain_mask(
             "or the input has no discernible brain"
         )
 
-    # Count voxels in each component (skipping label 0 = background).
     sizes = np.bincount(labeled.ravel())
-    sizes[0] = 0  # ignore background
+    sizes[0] = 0
     largest_label = int(np.argmax(sizes))
     mask = labeled == largest_label
 
-    # Closing = dilation then erosion. Fills small holes (e.g., ventricles).
     mask = ndimage.binary_closing(mask, iterations=closing_iterations)
-
-    # Final hole-filling pass for any cavities that survived closing.
     mask = ndimage.binary_fill_holes(mask)
 
     return mask.astype(bool)
+
+
+def compute_brain_mask(
+    mean_volume: np.ndarray,
+    affine: np.ndarray | None = None,
+    method: Literal["auto", "synthstrip", "percentile"] = "auto",
+    *,
+    # synthstrip params
+    border: int = 1,
+    no_csf: bool = False,
+    # percentile params
+    lower_percentile: float = 55.0,
+    opening_iterations: int = 2,
+    closing_iterations: int = 2,
+) -> np.ndarray:
+    """Compute a brain mask. Dispatches between SynthStrip and percentile.
+
+    Args:
+        mean_volume: 3D float array, the temporal mean of a BOLD run.
+        affine: 4x4 voxel-to-world transform. REQUIRED for synthstrip; ignored
+            for percentile. Get it from `VolumeReader.img.affine`.
+        method:
+            - "auto" (default): use synthstrip if available, else percentile.
+            - "synthstrip": use synthstrip; raise if unavailable.
+            - "percentile": use percentile masking unconditionally.
+        border, no_csf: SynthStrip parameters (see _compute_synthstrip_mask).
+        lower_percentile, opening_iterations, closing_iterations:
+            percentile method parameters.
+
+    Returns:
+        3D boolean mask, same shape as mean_volume.
+    """
+    if method == "synthstrip":
+        executable = find_synthstrip_executable()
+        if executable is None:
+            raise RuntimeError(
+                "method='synthstrip' requested but no synthstrip executable found "
+                f"on PATH. Looked for: {_SYNTHSTRIP_CANDIDATES}. "
+                f"Install FreeSurfer or use one of the wrapper scripts from "
+                f"https://surfer.nmr.mgh.harvard.edu/docs/synthstrip/ , "
+                f"or fall back with method='percentile'."
+            )
+        if affine is None:
+            raise ValueError("synthstrip requires `affine`. Pass reader.img.affine.")
+        return _compute_synthstrip_mask(
+            mean_volume, affine, executable=executable, border=border, no_csf=no_csf,
+        )
+
+    if method == "percentile":
+        return _compute_percentile_mask(
+            mean_volume,
+            lower_percentile=lower_percentile,
+            opening_iterations=opening_iterations,
+            closing_iterations=closing_iterations,
+        )
+
+    if method == "auto":
+        executable = find_synthstrip_executable()
+        if executable is not None:
+            if affine is None:
+                logger.warning(
+                    "synthstrip available but no affine given; "
+                    "falling back to percentile."
+                )
+                return _compute_percentile_mask(
+                    mean_volume, lower_percentile=lower_percentile,
+                    opening_iterations=opening_iterations,
+                    closing_iterations=closing_iterations,
+                )
+            return _compute_synthstrip_mask(
+                mean_volume, affine, executable=executable, border=border, no_csf=no_csf,
+            )
+        logger.warning(
+            "synthstrip executable not found on PATH (looked for: %s). "
+            "Falling back to percentile masking — known to be imperfect.",
+            ", ".join(_SYNTHSTRIP_CANDIDATES),
+        )
+        return _compute_percentile_mask(
+            mean_volume,
+            lower_percentile=lower_percentile,
+            opening_iterations=opening_iterations,
+            closing_iterations=closing_iterations,
+        )
+
+    raise ValueError(f"Unknown method={method!r}; expected auto/synthstrip/percentile")
 
 
 def mask_fraction(mask: np.ndarray) -> float:
