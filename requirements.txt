@@ -1,4 +1,7 @@
-torch
+# Minimum dependencies for the data pipeline.
+# Tested with Python 3.12.
+
+torch>=2.1
 torchvision
 numpy
 tensorboard
@@ -8,4 +11,6 @@ scipy
 scikit-image
 scikit-learn
 scikit-learn
-nbstripout
+nibabel>=5.0
+numpy>=1.26
+scipy>=1.11
