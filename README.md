@@ -16,19 +16,22 @@ src/data/
   build.py                # Wrapper: runs manifest + metadata in one go
   manifest.py             # Walk BIDS tree, parse filenames, build a JSON manifest
   compute_metadata.py     # Compute brain mask + norm_ref + tSNR per run
-  reader.py               # Lazy 3D-volume access to 4D NIfTI files
+  reader.py               # Lazy 3D-volume access to 4D NIfTI files (with per-process cache)
   masks.py                # Brain masking: SynthStrip (preferred) or percentile fallback
   normalize.py            # Per-run scalar normalization (volume / norm_ref)
-  padding.py              # Center-pad volumes/masks to a fixed target shape
+  padding.py              # Center-pad / crop volumes and masks to a fixed target shape
   datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR)
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
-
-notebooks/
   compare_masks.py        # Visualize percentile vs SynthStrip masks side by side
 
 tests/
-  test_data_local.py      # End-to-end smoke test on real data
+  test_degradation_spatial.py   # Unit tests incl. k-space scale regression
+  test_padding.py               # Pad-then-crop round-trip
+  test_reader.py                # VolumeReader and per-process cache
+  test_datasets_synthetic.py    # End-to-end Datasets on a synthetic BIDS layout
 ```
+
+Run the tests with `python -m pytest tests/ -v`.
 
 ## How it works
 
@@ -94,72 +97,152 @@ python -m src.data.compute_metadata \
 
 `build.py` just calls these two in order.
 
-### Stage 3 — training (every epoch, on the fly)
-Once you’ve run the build step and have:
+### Using the data in your training code
 
-<out>/manifest.json
-<out>/masks/
+Once `build.py` has produced `<out>/manifest.json` and `<out>/masks/`, you do
+not run any more data pipeline scripts. All loading and preprocessing happens
+inside the Dataset, per-sample.
 
-you do not run any more data pipeline scripts.
-All data loading and preprocessing happens automatically inside the Dataset.
+The three Datasets share the same construction pattern. Pick the one for your
+model, instantiate it, hand it to a DataLoader. Each sample comes back as a
+dict; the keys differ slightly per task — see below.
 
-```
+#### Spatial SR — `SpatialSRDataset`
+
+```python
 from src.data.datasets import SpatialSRDataset
 from src.data.degradation_spatial import make_spatial_degradation
 from torch.utils.data import DataLoader
 
-# Define LR ← HR degradation
-degrade = make_spatial_degradation(
-    source_voxel_mm=1.5,
-    target_voxel_mm=3.0,
-)
+degrade = make_spatial_degradation(source_voxel_mm=1.5, target_voxel_mm=3.0)
 
 train_ds = SpatialSRDataset(
     "<out>/manifest.json",
-    subject_filter=["01", "04", "07"],  # training subjects
+    subject_filter=["01", "04", "07"],
     degrade_fn=degrade,
 )
-
 val_ds = SpatialSRDataset(
     "<out>/manifest.json",
-    subject_filter=["11"],              # validation subject(s)
+    subject_filter=["11"],
     degrade_fn=degrade,
 )
-
 train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
-val_loader = DataLoader(val_ds, batch_size=4, num_workers=2, shuffle=False)
+val_loader   = DataLoader(val_ds,   batch_size=4, num_workers=2, shuffle=False)
 ```
-What each batch contains
 
-Each batch is a dictionary:
+Each batch is a dict with:
 
-input → low-resolution volume (LR)
+| key       | shape                  | meaning                                   |
+|-----------|------------------------|-------------------------------------------|
+| `input`   | `(B, 1, 64, 64, 46)`   | LR volume (3mm simulated acquisition)     |
+| `target`  | `(B, 1, 128, 128, 93)` | HR volume (1.5mm ground truth)            |
+| `mask_hr` | `(B, 1, 128, 128, 93)` | brain mask at HR — for HR-domain loss     |
+| `mask_lr` | `(B, 1, 64, 64, 46)`   | brain mask at LR — derived from `mask_hr` |
 
-target → high-resolution volume (HR)
+Your model takes `input` (LR) and must produce something the shape of `target`
+(HR) — it has to upsample internally. Compute loss in HR space, weighted by
+`mask_hr`:
 
-mask_hr → brain mask at HR resolution
-
-mask_lr → downsampled mask
-
-Typical shapes:
-
-input: (B, 1, 64, 64, 46)
-target: (B, 1, 128, 128, 93)
-```
+```python
 for batch in train_loader:
-    lr = batch["input"].to("cuda")
+    lr        = batch["input"].to("cuda")
     hr_target = batch["target"].to("cuda")
-    mask = batch["mask_hr"].to("cuda")
+    mask      = batch["mask_hr"].to("cuda")
 
-    hr_pred = model(lr)  # your model upsamples LR → HR
-
-    # masked MSE (only brain voxels contribute)
+    hr_pred = model(lr)
     loss = ((hr_pred - hr_target) ** 2 * mask).sum() / mask.sum()
-
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
 ```
+
+#### Denoising — `DenoisingDataset`
+
+```python
+from src.data.datasets import DenoisingDataset
+from torch.utils.data import DataLoader
+
+# You decide what counts as "noisy". Pass a function that takes a clean
+# numpy volume and returns a noisy one. Stub example:
+def add_gaussian_noise(clean, sigma=0.05):
+    import numpy as np
+    return clean + np.random.normal(0, sigma, clean.shape).astype(np.float32)
+
+train_ds = DenoisingDataset(
+    "<out>/manifest.json",
+    subject_filter=["01", "04", "07"],
+    degrade_fn=add_gaussian_noise,
+)
+train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
+```
+
+Each batch:
+
+| key      | shape                  | meaning                              |
+|----------|------------------------|--------------------------------------|
+| `input`  | `(B, 1, 128, 128, 93)` | noisy volume (output of degrade_fn)  |
+| `target` | `(B, 1, 128, 128, 93)` | clean volume                         |
+| `mask`   | `(B, 1, 128, 128, 93)` | brain mask                           |
+
+Both input and target are full-resolution. If you go noise2noise (where both
+sides are noisy and there's no "clean" target), the current API doesn't fit out
+of the box — talk to the data pipeline owner before going down that path.
+
+```python
+for batch in train_loader:
+    noisy = batch["input"].to("cuda")
+    clean = batch["target"].to("cuda")
+    mask  = batch["mask"].to("cuda")
+
+    pred = model(noisy)
+    loss = ((pred - clean) ** 2 * mask).sum() / mask.sum()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+#### Temporal SR — `TemporalSRDataset`
+
+No `degrade_fn` here. The sampler skips a timepoint and gives you its two
+neighbors as input — that's the degradation.
+
+```python
+from src.data.datasets import TemporalSRDataset
+from torch.utils.data import DataLoader
+
+train_ds = TemporalSRDataset(
+    "<out>/manifest.json",
+    subject_filter=["01", "04", "07"],
+    gap=1,    # use t-1 and t+1 to predict t. Bump to simulate larger TR multipliers.
+)
+train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
+```
+
+Each batch:
+
+| key      | shape                  | meaning                                     |
+|----------|------------------------|---------------------------------------------|
+| `input`  | `(B, 2, 128, 128, 93)` | two neighbors stacked: [t-gap, t+gap]       |
+| `target` | `(B, 1, 128, 128, 93)` | the "missing" middle volume at time t       |
+| `mask`   | `(B, 1, 128, 128, 93)` | brain mask                                  |
+
+```python
+for batch in train_loader:
+    neighbors = batch["input"].to("cuda")   # 2 channels: before, after
+    middle    = batch["target"].to("cuda")
+    mask      = batch["mask"].to("cuda")
+
+    pred = model(neighbors)
+    loss = ((pred - middle) ** 2 * mask).sum() / mask.sum()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+The loss formulas above are illustrative — masked L1, SSIM, or other choices
+are all viable. Train/val/test splits in `subject_filter` are placeholders too;
+the group decides who's in which.
+
 ## Design decisions worth knowing
 
 - **Raw data only**, no preprocessing pipeline yet (no motion correction, no
@@ -175,6 +258,17 @@ for batch in train_loader:
   Model is responsible for upsampling.
 - **Temporal SR has no separate degradation**. Sampling at gap=1 (predict t from
   t-1, t+1) IS the degradation — equivalent to half-rate acquisition.
+- **k-space LR scale**: `kspace_downsample_3d` scales the magnitude image by
+  `M/N` (output size / input size) to preserve mean intensity. There's a
+  regression test for this in `tests/test_degradation_spatial.py`; if you
+  touch the scale logic, run the tests.
+- **`indexed_gzip` is required** (pinned in `requirements.txt`). Without it,
+  every random-access volume read decompresses the gzip stream from byte 0.
+  nibabel picks it up automatically when present — no code change needed.
+- **VolumeReader caching**. `reader.get_reader(path)` is a per-process cache.
+  Each DataLoader worker keeps one open handle per run instead of reopening
+  on every `__getitem__`. Cache is keyed by `(pid, resolved_path)` so it's
+  fork-safe.
 
 ## Open issues / things to be aware of
 
@@ -188,7 +282,10 @@ Two backends, dispatched by `--mask-method`:
   thresholds. Acceptable for code-correctness testing, not for final results.
 
 When SynthStrip isn't installed, `auto` mode falls back to percentile and prints
-a warning.
+a warning. `compute_metadata` also logs a per-run warning when `mask_fraction`
+exceeds 0.55 (a rough sanity floor — whole-brain BOLD masks should be ~0.2-0.4
+of the native volume, so anything above 0.55 almost certainly contains
+non-brain tissue).
 
 ### Stub degradations
 - `DenoisingDataset` requires you to pass a `degrade_fn`. None implemented yet —
@@ -197,25 +294,7 @@ a warning.
 - `SpatialSRDataset` has a working degradation in `degradation_spatial.py`.
 - `TemporalSRDataset` has no degradation by design (see above).
 
-### Sample API differs by Dataset
-- `DenoisingDataset` / `TemporalSRDataset`: `mask` key
-- `SpatialSRDataset`: `mask_hr` and `mask_lr` keys (LR mask is derived from HR
-  via `downsample_mask_to_lr`)
-
 ### Dtype heterogeneity in IBC
 Some IBC files are stored as int16, others as float32 (with ~20× larger raw
 intensities). This is not preprocessing — it's a storage-format difference
 across releases. Per-run normalization handles it cleanly.
-
-## Smoke test
-
-Optional end-to-end test on a small data subset, useful before running the full
-pipeline:
-
-```
-pip install -r requirements.txt
-python tests/test_data_local.py --bids-root <path/to/test/data> --target-z 93
-```
-
-Exercises manifest, metadata, all three Datasets, and DataLoader batching
-across runs of different native shapes.

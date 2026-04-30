@@ -1,29 +1,46 @@
 """PyTorch Dataset classes for fMRI training.
 
 Architecture:
-  - BaseFMRIDataset handles the common stuff: manifest, reader, mask loading,
-    normalization, sample indexing, and padding to target_shape.
+  - BaseFMRIDataset handles the common stuff: manifest parsing, sample
+    indexing, mask loading, normalization, z-axis cropping to target shape.
   - Subclasses (DenoisingDataset, SpatialSRDataset, TemporalSRDataset) override
     __getitem__ to return the right (input, target) pair for their model.
-  - Degradation functions are STUBBED. They raise NotImplementedError until we
-    implement them with each model's owner. (Spatial degradation IS implemented
-    in degradation_spatial.py — pass make_spatial_degradation() as degrade_fn.)
+  - Degradation functions are STUBBED for the denoising path. They raise
+    NotImplementedError until we implement them with each model's owner.
+    (Spatial degradation IS implemented; pass make_spatial_degradation()
+    as degrade_fn to SpatialSRDataset.)
 
-Padding: all volumes are center-padded to manifest["target_shape"] (default
-128×128×93). This makes batching possible across runs of different shapes
-and keeps the brain at a roughly consistent absolute position in the grid.
+Shape policy (option B, z-only crop):
+  - All volumes are served at (X, Y, target_z) where X, Y match IBC's native
+    in-plane (128×128). target_z is set in compute_metadata, stored in the
+    manifest as `target_z`, and is the smallest native z across runs by
+    default.
+  - Per run, `z_start` (also in the manifest) tells us where to crop along z
+    so the brain's z-bbox is centered in the window.
+  - No padding anywhere. xy is unchanged.
 
 For SpatialSRDataset (Option A), the input is at LR shape and the target at HR
 shape — the model is responsible for upsampling.
 
-Important: nibabel image handles don't fork cleanly. We open VolumeReader
-inside __getitem__, not __init__. This costs a few ms per sample but avoids
-subtle bugs with num_workers>0.
+Performance notes:
+  - VolumeReaders are obtained via reader.get_reader (per-process cache), so
+    multiple samples from the same run inside a worker share one open handle.
+  - TemporalSR reads (t-gap, t, t+gap) as ONE range read, not three separate
+    timepoint reads.
+  - Mask cache stores ready-to-use float32 tensors; __getitem__ clones on
+    access so in-place ops downstream cannot corrupt the cache.
+
+Fork-safety:
+  - nibabel image handles don't always fork cleanly. The reader cache is
+    process-local (keyed by pid) and is naturally re-populated lazily in each
+    DataLoader worker after fork. Do not call get_reader from the main
+    process before spawning workers, or you risk a stale entry.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import nibabel as nib
@@ -31,13 +48,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .cropping import crop_z
 from .degradation_spatial import (
     downsample_mask_to_lr,
     voxel_size_to_target_shape,
 )
 from .normalize import normalize
-from .padding import center_pad_volume
-from .reader import VolumeReader
+from .reader import get_reader
+
+logger = logging.getLogger(__name__)
 
 
 class BaseFMRIDataset(Dataset):
@@ -52,16 +71,32 @@ class BaseFMRIDataset(Dataset):
         self,
         manifest_path: str | Path,
         subject_filter: list[str] | None = None,
+        check_files_exist: bool = True,
     ):
         """
         Args:
             manifest_path: path to JSON manifest produced by compute_metadata.py.
+                Must be from the z_crop pipeline (has `target_z` and per-run
+                `z_start` fields). Old padding-pipeline manifests are rejected.
             subject_filter: if given, keep only runs whose subject is in this list.
-                Use this for train/val/test splits by subject.
+                Use this for train/val/test splits by subject. Subjects must match
+                the manifest's exact string form (typically zero-padded, e.g. "01").
+            check_files_exist: if True (default), validate at construction time
+                that every kept run's BOLD file and mask file exist. Trades a
+                small startup cost (one stat() per file) for fail-fast behavior
+                instead of a mysterious crash deep in __getitem__. Set False
+                when the cost matters and you trust your manifest.
         """
         self.manifest_path = Path(manifest_path)
         with self.manifest_path.open() as f:
             manifest = json.load(f)
+
+        if manifest.get("pipeline") != "z_crop":
+            raise RuntimeError(
+                "Manifest is not from the z_crop pipeline. Re-run "
+                "compute_metadata.py to regenerate (you'll need --overwrite "
+                "since the on-disk masks have a different shape now)."
+            )
 
         self.bids_root = Path(manifest["bids_root"])
         self.derivatives_dir = Path(manifest.get("derivatives_dir", ""))
@@ -71,18 +106,36 @@ class BaseFMRIDataset(Dataset):
                 "Did you run compute_metadata.py?"
             )
 
-        if "target_shape" not in manifest:
+        if "target_shape" not in manifest or "target_z" not in manifest:
             raise RuntimeError(
-                "manifest is missing 'target_shape' field. Re-run compute_metadata.py."
+                "manifest is missing 'target_shape' or 'target_z'. "
+                "Re-run compute_metadata.py."
             )
         self.target_shape: tuple[int, int, int] = tuple(manifest["target_shape"])
+        self.target_z: int = int(manifest["target_z"])
 
         # Keep only runs that have complete metadata.
-        runs = manifest["runs"]
-        runs = [r for r in runs if "norm_ref" in r and "mask_path" in r]
+        all_runs = manifest["runs"]
+        runs = [
+            r for r in all_runs
+            if "norm_ref" in r and "mask_path" in r and "z_start" in r
+        ]
+        if len(runs) < len(all_runs):
+            logger.warning(
+                "Dropped %d/%d runs missing metadata. Re-run compute_metadata.py "
+                "if you expected them.", len(all_runs) - len(runs), len(all_runs),
+            )
 
         if subject_filter is not None:
             wanted = set(subject_filter)
+            available = {r["subject"] for r in runs}
+            unmatched = wanted - available
+            if unmatched:
+                raise ValueError(
+                    f"subject_filter contains subjects not in manifest: {sorted(unmatched)}. "
+                    f"Available: {sorted(available)}. Note: subjects are typically "
+                    f"zero-padded ('01', not '1')."
+                )
             runs = [r for r in runs if r["subject"] in wanted]
 
         if not runs:
@@ -90,11 +143,36 @@ class BaseFMRIDataset(Dataset):
                 f"No runs matched after filtering. subject_filter={subject_filter}"
             )
 
+        if check_files_exist:
+            self._validate_paths(runs)
+
         self.runs = runs
-        # Cache HR (padded) masks by run_id. ~170 KB each at 128×128×93 bool.
-        self._mask_cache: dict[str, np.ndarray] = {}
+        # Cache HR (cropped) masks as ready-to-use float32 tensors keyed by
+        # run_id. Negligible memory.
+        self._mask_cache: dict[str, torch.Tensor] = {}
 
         self.samples = self._build_sample_index()
+        if not self.samples:
+            raise RuntimeError(
+                f"{type(self).__name__} produced an empty sample index. "
+                "Check filtering and (for TemporalSR) gap parameter."
+            )
+
+    def _validate_paths(self, runs: list[dict]) -> None:
+        """Fail-fast check that referenced data and mask files exist."""
+        missing = []
+        for r in runs:
+            if not (self.bids_root / r["path"]).is_file():
+                missing.append(("bold", r["run_id"], self.bids_root / r["path"]))
+            if not (self.derivatives_dir / r["mask_path"]).is_file():
+                missing.append(("mask", r["run_id"], self.derivatives_dir / r["mask_path"]))
+        if missing:
+            n_show = 5
+            preview = "\n".join(f"  [{kind}] {rid}: {p}" for kind, rid, p in missing[:n_show])
+            extra = f"\n  ... and {len(missing) - n_show} more" if len(missing) > n_show else ""
+            raise FileNotFoundError(
+                f"{len(missing)} referenced file(s) missing on disk:\n{preview}{extra}"
+            )
 
     def _build_sample_index(self) -> list:
         """Default: one sample per (run, timepoint). Subclasses can override."""
@@ -104,35 +182,55 @@ class BaseFMRIDataset(Dataset):
                 samples.append((run_idx, t))
         return samples
 
-    def _get_hr_mask(self, run_idx: int) -> np.ndarray:
-        """Load (and cache) the HR brain mask. Already at target_shape."""
+    def _get_hr_mask(self, run_idx: int) -> torch.Tensor:
+        """Return a CLONED HR brain mask tensor (float32, target_shape).
+
+        Mask on disk is already at the (X, Y, target_z) shape we serve.
+        """
         run = self.runs[run_idx]
         run_id = run["run_id"]
-        if run_id not in self._mask_cache:
+        cached = self._mask_cache.get(run_id)
+        if cached is None:
             mask_path = self.derivatives_dir / run["mask_path"]
-            mask = np.asarray(nib.load(str(mask_path)).dataobj).astype(bool)
-            if mask.shape != self.target_shape:
+            arr = np.asarray(nib.load(str(mask_path)).dataobj).astype(np.float32)
+            if arr.shape != self.target_shape:
                 raise RuntimeError(
-                    f"Mask for {run_id} has shape {mask.shape}, expected "
+                    f"Mask for {run_id} has shape {arr.shape}, expected "
                     f"target_shape {self.target_shape}. Re-run compute_metadata.py "
-                    f"with the same target_shape."
+                    f"with the same target_z."
                 )
-            self._mask_cache[run_id] = mask
-        return self._mask_cache[run_id]
+            arr = np.ascontiguousarray(arr)
+            cached = torch.from_numpy(arr)
+            self._mask_cache[run_id] = cached
+        return cached.clone()
 
-    def _read_and_normalize(self, run_idx: int, t: int) -> np.ndarray:
-        """Read volume at (run_idx, t), normalize, pad to target_shape, return float32.
+    def _read_volume(self, run_idx: int, t: int) -> np.ndarray:
+        """Read one volume (run_idx, t), normalize, crop z. Returns float32 (X,Y,target_z)."""
+        run = self.runs[run_idx]
+        path = self.bids_root / run["path"]
+        z_start = int(run["z_start"])
+        # get_reader is process-local, populated lazily inside the worker.
+        reader = get_reader(path)
+        vol = reader.read_volume(t).astype(np.float32)
+        vol = normalize(vol, run["norm_ref"])
+        vol = crop_z(vol, z_start, self.target_z)
+        return vol
 
-        Returns shape == target_shape, regardless of source volume's native shape.
+    def _read_range(self, run_idx: int, t_start: int, t_end: int) -> np.ndarray:
+        """Read volumes [t_start, t_end), normalize, crop z. Returns (T, X, Y, target_z) float32.
+
+        ONE underlying disk read for the contiguous span, not (t_end - t_start)
+        independent ones. Crop is applied to the 4D block in one shot.
         """
         run = self.runs[run_idx]
         path = self.bids_root / run["path"]
-        # Open reader here, not in __init__: fork-safety for DataLoader workers.
-        reader = VolumeReader(path)
-        vol = reader.read_volume(t).astype(np.float32)
-        vol = normalize(vol, run["norm_ref"])
-        vol = center_pad_volume(vol, self.target_shape, pad_value=0.0)
-        return vol
+        z_start = int(run["z_start"])
+        reader = get_reader(path)
+        block = reader.read_range(t_start, t_end).astype(np.float32)  # (X,Y,Z_native,T)
+        block = normalize(block, run["norm_ref"])
+        block = crop_z(block, z_start, self.target_z)                 # (X,Y,target_z,T)
+        # Move T to the front: (T, X, Y, target_z)
+        return np.moveaxis(block, -1, 0)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -142,9 +240,8 @@ class BaseFMRIDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Task-specific datasets
+# Helpers
 # ---------------------------------------------------------------------------
-
 
 def _not_implemented_degradation(*args, **kwargs):
     raise NotImplementedError(
@@ -153,13 +250,23 @@ def _not_implemented_degradation(*args, **kwargs):
     )
 
 
+def _to_tensor(arr: np.ndarray) -> torch.Tensor:
+    """Wrap numpy → torch. Ensures C-contiguous to avoid from_numpy footguns."""
+    return torch.from_numpy(np.ascontiguousarray(arr))
+
+
+# ---------------------------------------------------------------------------
+# Task-specific datasets
+# ---------------------------------------------------------------------------
+
+
 class DenoisingDataset(BaseFMRIDataset):
     """Samples for the denoising model.
 
     Returns dict with:
-        input:  noisy volume,  shape (1, X, Y, Z) at target_shape
-        target: clean volume,  shape (1, X, Y, Z) at target_shape
-        mask:   HR brain mask, shape (1, X, Y, Z) at target_shape
+        input:  noisy volume,  shape (1, X, Y, target_z) (float32)
+        target: clean volume,  shape (1, X, Y, target_z) (float32)
+        mask:   HR brain mask, shape (1, X, Y, target_z) (float32)
     """
 
     def __init__(
@@ -167,20 +274,25 @@ class DenoisingDataset(BaseFMRIDataset):
         manifest_path,
         subject_filter=None,
         degrade_fn=_not_implemented_degradation,
+        check_files_exist: bool = True,
     ):
-        super().__init__(manifest_path, subject_filter=subject_filter)
+        super().__init__(
+            manifest_path,
+            subject_filter=subject_filter,
+            check_files_exist=check_files_exist,
+        )
         self.degrade_fn = degrade_fn
 
     def __getitem__(self, idx: int) -> dict:
         run_idx, t = self.samples[idx]
-        clean = self._read_and_normalize(run_idx, t)  # (X, Y, Z) padded
-        mask = self._get_hr_mask(run_idx)             # (X, Y, Z) padded
-        noisy = self.degrade_fn(clean)                # same shape
+        clean = self._read_volume(run_idx, t)             # (X, Y, target_z)
+        noisy = self.degrade_fn(clean)                    # same shape
+        mask = self._get_hr_mask(run_idx)                 # (X, Y, target_z) float32
 
         return {
-            "input": torch.from_numpy(noisy).unsqueeze(0),
-            "target": torch.from_numpy(clean).unsqueeze(0),
-            "mask": torch.from_numpy(mask).unsqueeze(0),
+            "input": _to_tensor(noisy).unsqueeze(0),
+            "target": _to_tensor(clean).unsqueeze(0),
+            "mask": mask.unsqueeze(0),
             "run_id": self.runs[run_idx]["run_id"],
             "t": t,
         }
@@ -189,14 +301,14 @@ class DenoisingDataset(BaseFMRIDataset):
 class SpatialSRDataset(BaseFMRIDataset):
     """Samples for the spatial SR model — Option A.
 
-    Input is at LR shape (e.g., 64×64×46 for 3mm), target is at HR shape
-    (e.g., 128×128×93 for 1.5mm). The model is responsible for upsampling.
+    Input is at LR shape (e.g. 64×64×42 for 3mm with target_z=84), target at
+    HR shape (X, Y, target_z). The model is responsible for upsampling.
 
     Returns dict with:
-        input:    LR volume,    shape (1, kx, ky, kz)
-        target:   HR volume,    shape (1, X, Y, Z)
-        mask_hr:  HR mask,      shape (1, X, Y, Z) — for HR-domain loss/eval
-        mask_lr:  LR mask,      shape (1, kx, ky, kz) — for LR-domain logic if needed
+        input:    LR volume,  shape (1, kx, ky, kz)
+        target:   HR volume,  shape (1, X, Y, target_z)
+        mask_hr:  HR mask,    shape (1, X, Y, target_z)
+        mask_lr:  LR mask,    shape (1, kx, ky, kz)
     """
 
     def __init__(
@@ -206,8 +318,13 @@ class SpatialSRDataset(BaseFMRIDataset):
         degrade_fn=_not_implemented_degradation,
         source_voxel_mm: float = 1.5,
         target_voxel_mm: float = 3.0,
+        check_files_exist: bool = True,
     ):
-        super().__init__(manifest_path, subject_filter=subject_filter)
+        super().__init__(
+            manifest_path,
+            subject_filter=subject_filter,
+            check_files_exist=check_files_exist,
+        )
         self.degrade_fn = degrade_fn
         self.source_voxel_mm = source_voxel_mm
         self.target_voxel_mm = target_voxel_mm
@@ -218,36 +335,38 @@ class SpatialSRDataset(BaseFMRIDataset):
         )
 
         # Cache LR masks separately (derived from HR masks).
-        self._lr_mask_cache: dict[str, np.ndarray] = {}
+        self._lr_mask_cache: dict[str, torch.Tensor] = {}
 
-    def _get_lr_mask(self, run_idx: int) -> np.ndarray:
-        """Derive (and cache) the LR brain mask from the HR mask."""
+    def _get_lr_mask(self, run_idx: int) -> torch.Tensor:
+        """Return a CLONED LR brain mask tensor (float32, lr_shape)."""
         run = self.runs[run_idx]
         run_id = run["run_id"]
-        if run_id not in self._lr_mask_cache:
-            hr_mask = self._get_hr_mask(run_idx)
-            lr_mask = downsample_mask_to_lr(hr_mask, self.lr_shape)
-            self._lr_mask_cache[run_id] = lr_mask
-        return self._lr_mask_cache[run_id]
+        cached = self._lr_mask_cache.get(run_id)
+        if cached is None:
+            mask_path = self.derivatives_dir / run["mask_path"]
+            hr_bool = np.asarray(nib.load(str(mask_path)).dataobj).astype(bool)
+            lr_bool = downsample_mask_to_lr(hr_bool, self.lr_shape)
+            arr = np.ascontiguousarray(lr_bool.astype(np.float32))
+            cached = torch.from_numpy(arr)
+            self._lr_mask_cache[run_id] = cached
+        return cached.clone()
 
     def __getitem__(self, idx: int) -> dict:
         run_idx, t = self.samples[idx]
-        hr = self._read_and_normalize(run_idx, t)   # padded (X, Y, Z)
-        hr_mask = self._get_hr_mask(run_idx)        # padded (X, Y, Z)
+        hr = self._read_volume(run_idx, t)          # (X, Y, target_z)
         lr = self.degrade_fn(hr)                    # (kx, ky, kz)
-        lr_mask = self._get_lr_mask(run_idx)        # (kx, ky, kz)
 
-        # Sanity check: LR shape from degrade_fn must match what the Dataset expects.
-        # If this fails, the degrade_fn config is inconsistent with the Dataset config.
-        assert lr.shape == self.lr_shape, (
-            f"degrade_fn returned shape {lr.shape}, expected {self.lr_shape}"
-        )
+        if lr.shape != self.lr_shape:
+            raise RuntimeError(
+                f"degrade_fn returned shape {lr.shape}, expected {self.lr_shape}. "
+                f"degrade_fn config inconsistent with Dataset (source/target voxel size)."
+            )
 
         return {
-            "input": torch.from_numpy(lr).unsqueeze(0),
-            "target": torch.from_numpy(hr).unsqueeze(0),
-            "mask_hr": torch.from_numpy(hr_mask).unsqueeze(0),
-            "mask_lr": torch.from_numpy(lr_mask).unsqueeze(0),
+            "input": _to_tensor(lr).unsqueeze(0),
+            "target": _to_tensor(hr).unsqueeze(0),
+            "mask_hr": self._get_hr_mask(run_idx).unsqueeze(0),
+            "mask_lr": self._get_lr_mask(run_idx).unsqueeze(0),
             "run_id": self.runs[run_idx]["run_id"],
             "t": t,
         }
@@ -256,14 +375,14 @@ class SpatialSRDataset(BaseFMRIDataset):
 class TemporalSRDataset(BaseFMRIDataset):
     """Samples for the temporal SR model.
 
-    The "degradation" for this task is implicit: by sampling neighbors at t-gap
-    and t+gap and predicting the middle volume at t, we simulate a half-rate
-    acquisition where t was never measured. There is no separate degrade_fn.
+    The "degradation" is implicit: by sampling t-gap and t+gap and predicting
+    the volume at t, we simulate a half-rate acquisition where t was never
+    measured. There is no separate degrade_fn.
 
     Returns dict with:
-        input:  two neighbors stacked along channel, shape (2, X, Y, Z)
-        target: middle volume,                       shape (1, X, Y, Z)
-        mask:   HR brain mask,                       shape (1, X, Y, Z)
+        input:  two neighbors stacked along channel, shape (2, X, Y, target_z)
+        target: middle volume,                       shape (1, X, Y, target_z)
+        mask:   HR brain mask,                       shape (1, X, Y, target_z)
     """
 
     def __init__(
@@ -271,38 +390,52 @@ class TemporalSRDataset(BaseFMRIDataset):
         manifest_path,
         subject_filter=None,
         gap: int = 1,
+        check_files_exist: bool = True,
     ):
-        """
-        Args:
-            gap: distance in timepoints between target and each neighbor input.
-                gap=1 means use t-1 and t+1 to predict t (simulates 2x
-                temporal downsampling).
-        """
+        if gap < 1:
+            raise ValueError(f"gap must be >= 1, got {gap}")
         self.gap = gap
-        super().__init__(manifest_path, subject_filter=subject_filter)
+        super().__init__(
+            manifest_path,
+            subject_filter=subject_filter,
+            check_files_exist=check_files_exist,
+        )
 
     def _build_sample_index(self) -> list:
         """Only valid samples where both neighbors exist inside the run."""
         samples = []
+        too_short: list[str] = []
         for run_idx, run in enumerate(self.runs):
             n = run["n_volumes"]
+            if n < 2 * self.gap + 1:
+                too_short.append(f"{run['run_id']} (n={n})")
+                continue
             for t in range(self.gap, n - self.gap):
                 samples.append((run_idx, t))
+        if too_short:
+            logger.warning(
+                "TemporalSRDataset(gap=%d): dropped %d run(s) too short for any sample: %s",
+                self.gap, len(too_short),
+                ", ".join(too_short[:5]) + ("..." if len(too_short) > 5 else ""),
+            )
         return samples
 
     def __getitem__(self, idx: int) -> dict:
         run_idx, t = self.samples[idx]
-        target = self._read_and_normalize(run_idx, t)
-        before = self._read_and_normalize(run_idx, t - self.gap)
-        after = self._read_and_normalize(run_idx, t + self.gap)
-        mask = self._get_hr_mask(run_idx)
+        if self.gap == 1:
+            block = self._read_range(run_idx, t - 1, t + 2)  # (3, X, Y, target_z)
+            before, target, after = block[0], block[1], block[2]
+        else:
+            before = self._read_volume(run_idx, t - self.gap)
+            target = self._read_volume(run_idx, t)
+            after = self._read_volume(run_idx, t + self.gap)
 
-        input_tensor = np.stack([before, after], axis=0)  # (2, X, Y, Z)
+        input_arr = np.stack([before, after], axis=0)  # (2, X, Y, target_z)
 
         return {
-            "input": torch.from_numpy(input_tensor),
-            "target": torch.from_numpy(target).unsqueeze(0),
-            "mask": torch.from_numpy(mask).unsqueeze(0),
+            "input": _to_tensor(input_arr),
+            "target": _to_tensor(target).unsqueeze(0),
+            "mask": self._get_hr_mask(run_idx).unsqueeze(0),
             "run_id": self.runs[run_idx]["run_id"],
             "t": t,
         }
