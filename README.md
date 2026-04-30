@@ -13,14 +13,18 @@ This repo currently contains the **data pipeline** only. Models will follow.
 
 ```
 src/data/
+  build.py                # Wrapper: runs manifest + metadata in one go
   manifest.py             # Walk BIDS tree, parse filenames, build a JSON manifest
   compute_metadata.py     # Compute brain mask + norm_ref + tSNR per run
   reader.py               # Lazy 3D-volume access to 4D NIfTI files
-  masks.py                # Brain mask via percentile + morphology (TO BE REPLACED)
+  masks.py                # Brain masking: SynthStrip (preferred) or percentile fallback
   normalize.py            # Per-run scalar normalization (volume / norm_ref)
   padding.py              # Center-pad volumes/masks to a fixed target shape
   datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR)
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
+
+notebooks/
+  compare_masks.py        # Visualize percentile vs SynthStrip masks side by side
 
 tests/
   test_data_local.py      # End-to-end smoke test on real data
@@ -28,41 +32,134 @@ tests/
 
 ## How it works
 
-**Stage 1 — manifest** (one-time, fast):
-```
-python -m src.data.manifest --bids-root /path/to/ibc_raw --out manifest.json
-```
-Walks the BIDS tree, lists every BOLD run with shape and metadata. Outputs JSON.
+### Where things live
 
-**Stage 2 — per-run metadata** (one-time, slower; reads each file fully twice):
-```
-python -m src.data.compute_metadata --manifest manifest.json \
-    --derivatives-dir /path/to/derivatives --target-z 93
-```
-Computes brain mask (saved as `.nii.gz`), normalization reference (98th percentile
-of in-brain voxels), and tSNR. Pads everything to `target_shape`. Updates manifest
-in place.
+Three kinds of paths the pipeline cares about:
 
-`--target-z 93` is the configured padding height. If any run is taller, the script
-crashes with a clear error; bump `--target-z` and rerun.
+- **Raw IBC data** — `--bids-root`. On the VM: `/srv/fMRI-data/`.
+- **Derivatives** (manifest, masks) — `--out-dir`. Pick a writable path.
+- **Code** — this repo, wherever you clone it.
 
-**Stage 3 — training** (every epoch, on the fly):
-```python
+The manifest is not committed to git. It has absolute paths to data and is
+regenerated whenever the dataset changes. Treat it as a derivative that lives
+next to the masks.
+
+### Build the manifest + derivatives (one-time, slower)
+
+Single command that runs both data-prep stages in order:
+
+```
+python -m src.data.build \
+    --bids-root /srv/fMRI-data \
+    --out-dir <out> \
+    --target-z 93 \
+    --mask-method auto
+```
+
+This produces:
+- `<out>/manifest.json` — one entry per BOLD run with shape + metadata
+- `<out>/masks/*_mask.nii.gz` — per-run brain masks, padded to target_shape
+
+Stage 1 (manifest build) runs in seconds. Stage 2 (metadata) reads each 4D file
+fully twice and is the slow part — expect ~10-30s per run.
+
+`--target-z 93` is the padding height. If any run is taller, the script logs
+an error per-run and continues; bump `--target-z` and rerun (with `--overwrite`
+to redo the previously-OK runs).
+
+`--mask-method`:
+- `auto` (default): uses SynthStrip if available on PATH; falls back to
+  percentile with a warning.
+- `synthstrip`: requires `mri_synthstrip`, `synthstrip-docker`, or
+  `synthstrip-singularity` on PATH; raises if missing.
+- `percentile`: pure-Python intensity threshold + morphology. Works without
+  any external tools but produces imperfect masks (includes some skull/scalp).
+
+### Or run the two stages separately
+
+If you want to inspect the manifest before committing to the slow metadata
+step, or only redo one stage:
+
+```
+python -m src.data.manifest \
+    --bids-root /srv/fMRI-data \
+    --out <out>/manifest.json
+
+python -m src.data.compute_metadata \
+    --manifest <out>/manifest.json \
+    --derivatives-dir <out> \
+    --target-z 93 \
+    --mask-method auto
+```
+
+`build.py` just calls these two in order.
+
+### Stage 3 — training (every epoch, on the fly)
+Once you’ve run the build step and have:
+
+<out>/manifest.json
+<out>/masks/
+
+you do not run any more data pipeline scripts.
+All data loading and preprocessing happens automatically inside the Dataset.
+
+```
 from src.data.datasets import SpatialSRDataset
 from src.data.degradation_spatial import make_spatial_degradation
 from torch.utils.data import DataLoader
 
-degrade = make_spatial_degradation(source_voxel_mm=1.5, target_voxel_mm=3.0)
-ds = SpatialSRDataset(
-    "manifest.json",
-    subject_filter=["01", "04"],     # train subjects
+# Define LR ← HR degradation
+degrade = make_spatial_degradation(
+    source_voxel_mm=1.5,
+    target_voxel_mm=3.0,
+)
+
+train_ds = SpatialSRDataset(
+    "<out>/manifest.json",
+    subject_filter=["01", "04", "07"],  # training subjects
     degrade_fn=degrade,
 )
-loader = DataLoader(ds, batch_size=8, num_workers=2, shuffle=True)
+
+val_ds = SpatialSRDataset(
+    "<out>/manifest.json",
+    subject_filter=["11"],              # validation subject(s)
+    degrade_fn=degrade,
+)
+
+train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=4, num_workers=2, shuffle=False)
 ```
+What each batch contains
 
-Each sample comes back as a dict with input/target/mask tensors.
+Each batch is a dictionary:
 
+input → low-resolution volume (LR)
+
+target → high-resolution volume (HR)
+
+mask_hr → brain mask at HR resolution
+
+mask_lr → downsampled mask
+
+Typical shapes:
+
+input: (B, 1, 64, 64, 46)
+target: (B, 1, 128, 128, 93)
+```
+for batch in train_loader:
+    lr = batch["input"].to("cuda")
+    hr_target = batch["target"].to("cuda")
+    mask = batch["mask_hr"].to("cuda")
+
+    hr_pred = model(lr)  # your model upsamples LR → HR
+
+    # masked MSE (only brain voxels contribute)
+    loss = ((hr_pred - hr_target) ** 2 * mask).sum() / mask.sum()
+
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
 ## Design decisions worth knowing
 
 - **Raw data only**, no preprocessing pipeline yet (no motion correction, no
@@ -81,12 +178,17 @@ Each sample comes back as a dict with input/target/mask tensors.
 
 ## Open issues / things to be aware of
 
-### Mask quality is imperfect
-The current masking uses percentile thresholding + morphology. Empirically it
-includes some skull/scalp and may carve into the cerebellum on some runs.
-**Plan**: replace with [SynthStrip](https://github.com/freesurfer/freesurfer/tree/dev/mri_synthstrip)
-or FSL `bet` when running on the VM. Function signature stays the same so no
-downstream code change is needed.
+### Mask quality depends on which method runs
+Two backends, dispatched by `--mask-method`:
+- **SynthStrip** (preferred, default `auto`): DL-based, designed for cross-modality
+  EPI. Robust. Requires `mri_synthstrip`, `synthstrip-docker`, or
+  `synthstrip-singularity` on PATH.
+- **Percentile fallback**: pure Python, no external tools, but produces imperfect
+  masks. Tends to include some skull/scalp; may carve cerebellum at high
+  thresholds. Acceptable for code-correctness testing, not for final results.
+
+When SynthStrip isn't installed, `auto` mode falls back to percentile and prints
+a warning.
 
 ### Stub degradations
 - `DenoisingDataset` requires you to pass a `degrade_fn`. None implemented yet —
@@ -105,18 +207,15 @@ Some IBC files are stored as int16, others as float32 (with ~20× larger raw
 intensities). This is not preprocessing — it's a storage-format difference
 across releases. Per-run normalization handles it cleanly.
 
-### Local test artifacts
-Running `tests/test_data_local.py` creates `_local_test_workdir/` with a
-manifest and derivatives. That dir is gitignored.
+## Smoke test
 
-## Local testing
+Optional end-to-end test on a small data subset, useful before running the full
+pipeline:
 
-Requires Python 3.12 and the deps in `requirements.txt`:
 ```
 pip install -r requirements.txt
-python tests/test_data_local.py --bids-root path/to/local/test/data --target-z 93
+python tests/test_data_local.py --bids-root <path/to/test/data> --target-z 93
 ```
 
-The test exercises manifest building, metadata computation, all three Datasets,
-and DataLoader batching across runs of different native shapes. Takes 10-15 min
-on a laptop with 9 IBC runs.
+Exercises manifest, metadata, all three Datasets, and DataLoader batching
+across runs of different native shapes.
