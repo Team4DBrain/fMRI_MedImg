@@ -15,18 +15,20 @@ This repo currently contains the **data pipeline** only. Models will follow.
 src/data/
   build.py                # Wrapper: runs manifest + metadata in one go
   manifest.py             # Walk BIDS tree, parse filenames, build a JSON manifest
-  compute_metadata.py     # Compute brain mask + norm_ref + tSNR per run
+  compute_metadata.py     # Compute brain mask + z_start + norm_ref + tSNR per run
   reader.py               # Lazy 3D-volume access to 4D NIfTI files (with per-process cache)
   masks.py                # Brain masking: SynthStrip (preferred) or percentile fallback
   normalize.py            # Per-run scalar normalization (volume / norm_ref)
-  padding.py              # Center-pad / crop volumes and masks to a fixed target shape
+  cropping.py             # Z-axis bbox-centered crop (option B)
+  padding.py              # (legacy utilities — pad/crop, kept for tests & callers)
   datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR)
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
   compare_masks.py        # Visualize percentile vs SynthStrip masks side by side
 
 tests/
+  test_cropping.py              # Z-bbox crop, affine update
   test_degradation_spatial.py   # Unit tests incl. k-space scale regression
-  test_padding.py               # Pad-then-crop round-trip
+  test_padding.py               # Pad-then-crop round-trip (legacy utility)
   test_reader.py                # VolumeReader and per-process cache
   test_datasets_synthetic.py    # End-to-end Datasets on a synthetic BIDS layout
 ```
@@ -55,20 +57,22 @@ Single command that runs both data-prep stages in order:
 python -m src.data.build \
     --bids-root /srv/fMRI-data \
     --out-dir <out> \
-    --target-z 93 \
     --mask-method auto
 ```
 
 This produces:
 - `<out>/manifest.json` — one entry per BOLD run with shape + metadata
-- `<out>/masks/*_mask.nii.gz` — per-run brain masks, padded to target_shape
+  (including per-run `z_start` and top-level `target_z`)
+- `<out>/masks/*_mask.nii.gz` — per-run brain masks at `(X, Y, target_z)`,
+  with affine corrected for the z-shift
 
 Stage 1 (manifest build) runs in seconds. Stage 2 (metadata) reads each 4D file
 fully twice and is the slow part — expect ~10-30s per run.
 
-`--target-z 93` is the padding height. If any run is taller, the script logs
-an error per-run and continues; bump `--target-z` and rerun (with `--overwrite`
-to redo the previously-OK runs).
+`--target-z` is optional. By default it auto-detects to `min(native_z)` across
+runs (so no run ever needs padding — this is the "option B" cropping pipeline).
+You can pass an explicit value to be smaller; the script raises if you ask for
+a target_z larger than the smallest native run.
 
 `--mask-method`:
 - `auto` (default): uses SynthStrip if available on PATH; falls back to
@@ -91,7 +95,6 @@ python -m src.data.manifest \
 python -m src.data.compute_metadata \
     --manifest <out>/manifest.json \
     --derivatives-dir <out> \
-    --target-z 93 \
     --mask-method auto
 ```
 
@@ -134,10 +137,14 @@ Each batch is a dict with:
 
 | key       | shape                  | meaning                                   |
 |-----------|------------------------|-------------------------------------------|
-| `input`   | `(B, 1, 64, 64, 46)`   | LR volume (3mm simulated acquisition)     |
-| `target`  | `(B, 1, 128, 128, 93)` | HR volume (1.5mm ground truth)            |
-| `mask_hr` | `(B, 1, 128, 128, 93)` | brain mask at HR — for HR-domain loss     |
-| `mask_lr` | `(B, 1, 64, 64, 46)`   | brain mask at LR — derived from `mask_hr` |
+| `input`   | `(B, 1, 64, 64, 42)`   | LR volume (3mm simulated acquisition)     |
+| `target`  | `(B, 1, 128, 128, 84)` | HR volume (1.5mm ground truth)            |
+| `mask_hr` | `(B, 1, 128, 128, 84)` | brain mask at HR — for HR-domain loss     |
+| `mask_lr` | `(B, 1, 64, 64, 42)`   | brain mask at LR — derived from `mask_hr` |
+
+(Z dimension shown is for `target_z=84`, the IBC default. If you set a
+different `--target-z`, all the z values above scale accordingly. xy is
+always 128×128 / 64×64.)
 
 Your model takes `input` (LR) and must produce something the shape of `target`
 (HR) — it has to upsample internally. Compute loss in HR space, weighted by
@@ -180,9 +187,9 @@ Each batch:
 
 | key      | shape                  | meaning                              |
 |----------|------------------------|--------------------------------------|
-| `input`  | `(B, 1, 128, 128, 93)` | noisy volume (output of degrade_fn)  |
-| `target` | `(B, 1, 128, 128, 93)` | clean volume                         |
-| `mask`   | `(B, 1, 128, 128, 93)` | brain mask                           |
+| `input`  | `(B, 1, 128, 128, 84)` | noisy volume (output of degrade_fn)  |
+| `target` | `(B, 1, 128, 128, 84)` | clean volume                         |
+| `mask`   | `(B, 1, 128, 128, 84)` | brain mask                           |
 
 Both input and target are full-resolution. If you go noise2noise (where both
 sides are noisy and there's no "clean" target), the current API doesn't fit out
@@ -222,9 +229,9 @@ Each batch:
 
 | key      | shape                  | meaning                                     |
 |----------|------------------------|---------------------------------------------|
-| `input`  | `(B, 2, 128, 128, 93)` | two neighbors stacked: [t-gap, t+gap]       |
-| `target` | `(B, 1, 128, 128, 93)` | the "missing" middle volume at time t       |
-| `mask`   | `(B, 1, 128, 128, 93)` | brain mask                                  |
+| `input`  | `(B, 2, 128, 128, 84)` | two neighbors stacked: [t-gap, t+gap]       |
+| `target` | `(B, 1, 128, 128, 84)` | the "missing" middle volume at time t       |
+| `mask`   | `(B, 1, 128, 128, 84)` | brain mask                                  |
 
 ```python
 for batch in train_loader:
@@ -247,8 +254,12 @@ the group decides who's in which.
 
 - **Raw data only**, no preprocessing pipeline yet (no motion correction, no
   distortion correction). May add later.
-- **Center-padding** to a fixed `target_shape` for batching across runs of
-  different native shapes.
+- **Z-only crop, no padding** (option B). xy is left at IBC's native 128×128.
+  z is cropped per-run to a dataset-wide `target_z` (default: smallest observed
+  native z), with the crop window centered on the brain's z-bbox. The brain
+  mask must be reasonable for the bbox to land on the brain — get SynthStrip
+  working before trusting any crop. The cropped mask's affine is updated so
+  external viewers (FSLeyes, ITK-SNAP) place it in world space correctly.
 - **Per-run scalar normalization** (`volume / norm_ref`). Brain voxels end up
   near 1.0, background near 0. Reversible. Not z-scored — preserves spatial
   contrast and BOLD temporal dynamics.
