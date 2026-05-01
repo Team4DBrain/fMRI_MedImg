@@ -73,3 +73,20 @@ def center_pad_mask(
         raise ValueError(f"Expected 3D mask, got shape {mask.shape}")
     pad_widths = compute_pad_widths(mask.shape, target_shape)
     return np.pad(mask, pad_widths, mode="constant", constant_values=False)
+
+
+def crop_from_padded(
+    padded: np.ndarray,
+    native_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """Inverse of center_pad_*: crop a padded array back to native_shape.
+
+    Uses the same convention as compute_pad_widths (extra voxel on high side
+    for odd diffs), so center_pad_volume followed by crop_from_padded with
+    the original shape is identity.
+    """
+    if padded.ndim != 3:
+        raise ValueError(f"Expected 3D padded array, got shape {padded.shape}")
+    pad_widths = compute_pad_widths(native_shape, padded.shape)
+    slices = tuple(slice(b, b + n) for (b, _), n in zip(pad_widths, native_shape))
+    return padded[slices]

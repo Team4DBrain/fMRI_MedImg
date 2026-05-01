@@ -8,11 +8,23 @@ debugging or when you only need to redo one stage.
 Usage:
     python -m src.data.build \\
         --bids-root /path/to/ibc_raw \\
+        --out-dir /path/to/derivatives
+
+    # Override z target (default: auto = smallest observed native z)
+    python -m src.data.build \\
+        --bids-root /path/to/ibc_raw \\
         --out-dir /path/to/derivatives \\
-        --target-z 93
+        --target-z 84
 
 The manifest goes to `<out-dir>/manifest.json` and the masks go to
 `<out-dir>/masks/`.
+
+Pipeline notes (option B, z-only crop):
+  - xy is left at native (IBC: 128×128). Not configurable; the underlying
+    compute_metadata raises if any run has a different xy.
+  - z is cropped per-run to a fixed `target_z`, centered on the brain's
+    z-bbox. target_z auto-detects to min(native_z) across the manifest's
+    runs unless --target-z is passed explicitly.
 """
 
 from __future__ import annotations
@@ -22,7 +34,7 @@ import logging
 import sys
 from pathlib import Path
 
-from .compute_metadata import DEFAULT_TARGET_XY, DEFAULT_TARGET_Z, compute_all
+from .compute_metadata import compute_all
 from .manifest import build_manifest, write_manifest
 
 logger = logging.getLogger(__name__)
@@ -31,7 +43,7 @@ logger = logging.getLogger(__name__)
 def build_pipeline(
     bids_root: Path,
     out_dir: Path,
-    target_shape: tuple[int, int, int],
+    target_z: int | None = None,
     mask_method: str = "auto",
     overwrite: bool = False,
 ) -> None:
@@ -40,7 +52,8 @@ def build_pipeline(
     Args:
         bids_root: where the raw data lives (read-only).
         out_dir: where to write manifest.json and the masks/ subdir.
-        target_shape: (X, Y, Z) padding target. Crashes per-run if exceeded.
+        target_z: z-axis crop target. If None, auto-detect as the smallest
+            observed native z across runs.
         mask_method: "auto", "synthstrip", or "percentile".
         overwrite: passed through to compute_metadata; recompute existing masks.
     """
@@ -66,12 +79,12 @@ def build_pipeline(
     # Stage 2
     logger.info("")
     logger.info("=" * 60)
-    logger.info("Stage 2: computing metadata (mask, norm_ref, tSNR)")
+    logger.info("Stage 2: computing metadata (mask, z_start, norm_ref, tSNR)")
     logger.info("=" * 60)
     compute_all(
         manifest_path,
         derivatives_dir=out_dir,
-        target_shape=target_shape,
+        target_z=target_z,
         overwrite=overwrite,
         mask_method=mask_method,
     )
@@ -93,17 +106,10 @@ def _cli() -> None:
         help="Where to write manifest.json and masks/ subdir.",
     )
     parser.add_argument(
-        "--target-x", type=int, default=DEFAULT_TARGET_XY,
-        help=f"Target X dimension after padding (default: {DEFAULT_TARGET_XY})",
-    )
-    parser.add_argument(
-        "--target-y", type=int, default=DEFAULT_TARGET_XY,
-        help=f"Target Y dimension after padding (default: {DEFAULT_TARGET_XY})",
-    )
-    parser.add_argument(
-        "--target-z", type=int, default=DEFAULT_TARGET_Z,
-        help=f"Target Z dimension after padding (default: {DEFAULT_TARGET_Z}). "
-             f"Increase if any run exceeds this.",
+        "--target-z", type=int, default=None,
+        help="Target z dimension after cropping. Default: auto (smallest "
+             "observed native z across runs). Must be <= the smallest native z; "
+             "cannot grow.",
     )
     parser.add_argument(
         "--mask-method",
@@ -126,7 +132,7 @@ def _cli() -> None:
     build_pipeline(
         bids_root=args.bids_root,
         out_dir=args.out_dir,
-        target_shape=(args.target_x, args.target_y, args.target_z),
+        target_z=args.target_z,
         mask_method=args.mask_method,
         overwrite=args.overwrite,
     )

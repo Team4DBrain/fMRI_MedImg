@@ -14,3 +14,9 @@ scikit-learn
 nibabel>=5.0
 numpy>=1.26
 scipy>=1.11
+
+# indexed_gzip enables random-access reads of compressed .nii.gz. Without it,
+# nibabel decompresses sequentially from byte 0 on every dataobj[..., t] read,
+# which is catastrophic for shuffled DataLoader sampling. nibabel auto-detects
+# and uses it when installed — no code change needed.
+indexed_gzip>=1.7

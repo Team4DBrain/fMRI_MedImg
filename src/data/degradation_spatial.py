@@ -97,12 +97,14 @@ def kspace_downsample_3d(
     # Inverse FFT, take magnitude.
     image = np.fft.ifftn(np.fft.ifftshift(kspace_cropped))
 
-    # Scale compensation: np.fft.ifftn divides by output array size, so a
-    # smaller output array yields proportionally smaller magnitudes than
-    # the original. Compensate so LR has roughly the same intensity scale
-    # as the HR source — important for normalization consistency.
+    # Scale compensation. np.fft.ifftn divides by the output size M, but the
+    # cropped DC equals N * mean(volume) (carried over from the unnormalized
+    # forward FFT on the source of size N). So image[0] = (N/M) * mean(volume),
+    # and we must MULTIPLY by M/N to recover the original intensity scale.
+    # (A constant volume in must yield a near-constant volume out at the same
+    # magnitude — see tests/test_degradation_spatial.py.)
     scale = np.prod(target_shape) / np.prod(full_shape)
-    return (np.abs(image) / scale).astype(np.float32)
+    return (np.abs(image) * scale).astype(np.float32)
 
 
 def voxel_size_to_target_shape(
