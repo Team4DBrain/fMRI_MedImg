@@ -7,7 +7,7 @@ We're training three models that take "imperfect" fMRI scans and produce cleaner
 2. **Spatial SR model** — low-res (3mm) → high-res (1.5mm)
 3. **Temporal SR model** — interpolate a missing volume from neighbors
 
-This repo currently contains the **data pipeline** only. Models will follow.
+This repo contains the **data pipeline** and a baseline **3D SR training stack** in `src/sr`.
 
 ## What's in this repo
 
@@ -28,6 +28,7 @@ notebooks/
 
 tests/
   test_data_local.py      # End-to-end smoke test on real data
+  sr/                     # Unit tests for SR model/config/training safety
 ```
 
 ## How it works
@@ -217,5 +218,36 @@ pip install -r requirements.txt
 python tests/test_data_local.py --bids-root <path/to/test/data> --target-z 93
 ```
 
+
 Exercises manifest, metadata, all three Datasets, and DataLoader batching
 across runs of different native shapes.
+
+The test exercises manifest building, metadata computation, all three Datasets,
+and DataLoader batching across runs of different native shapes. Takes 10-15 min
+on a laptop with 9 IBC runs.
+
+## SR training and checks (current behavior)
+
+The SR entrypoint is `run.py` and supports four commands:
+
+```bash
+python run.py sanity --manifest-path ./manifest.json
+python run.py overfit --overfit-steps 20 --manifest-path ./manifest.json
+python run.py checks --overfit-steps 20 --manifest-path ./manifest.json
+python run.py train --epochs 20 --model-name srcnn3d --manifest-path ./manifest.json
+```
+
+Key SR defaults now include:
+
+- Config-driven model factory (`--model-name` with `srcnn3d` or `rcan3d`)
+- Deterministic policy enabled by default (`--no-deterministic` to disable)
+- Seeded dataset split and DataLoader generators for stable ordering
+- Finite-loss fail-fast guard (`--no-strict-finite-loss` to disable)
+- Atomic checkpoint writes (`*.pt.tmp` swap to final checkpoint path)
+
+Run SR unit tests:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+

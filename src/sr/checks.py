@@ -4,7 +4,7 @@ import torch
 
 from .config import get_device
 from .data import create_dataloaders
-from .model import SRCNN3D
+from .model import build_model_from_config
 from .training import build_training_components
 
 
@@ -15,8 +15,8 @@ def run_sanity_checks(config: dict, model=None, device: str | None = None) -> No
     print("[sanity] Starting sanity check...")
     print(f"[sanity] Using device: {device}")
     if model is None:
-        print("[sanity] Building SRCNN3D model from config output patch shape.")
-        model = SRCNN3D(output_patch_shape=config["output_patch_shape"]).to(device)
+        print(f"[sanity] Building model '{config['model_name']}' from config.")
+        model = build_model_from_config(config).to(device)
 
     loss_fn, optimizer, _ = build_training_components(model, config)
     print("[sanity] Creating dataloader and fetching one batch...")
@@ -55,7 +55,7 @@ def run_tiny_overfit_check(config: dict, steps: int = 20, device: str | None = N
     labels = labels[:1].to(device)
     print(f"[overfit] Single-sample shapes - inputs: {tuple(inputs.shape)}, labels: {tuple(labels.shape)}")
 
-    tiny_model = SRCNN3D(output_patch_shape=config["output_patch_shape"]).to(device)
+    tiny_model = build_model_from_config(config).to(device)
     loss_fn = torch.nn.MSELoss()
     tiny_optimizer = torch.optim.Adam(tiny_model.parameters(), lr=config["learning_rate"])
 

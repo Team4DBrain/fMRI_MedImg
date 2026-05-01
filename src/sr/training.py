@@ -1,6 +1,7 @@
 """Training and checkpoint orchestration for 3D SR."""
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .config import get_device
 from .data import create_dataloaders
-from .model import SRCNN3D
+from .model import build_model_from_config
 
 
 def psnr_from_mse(mse_value: float, data_range: float = 1.0) -> float:
@@ -35,7 +36,17 @@ def validate_one_epoch(model, val_loader, loss_fn, device):
     return running_loss / max(1, len(val_loader))
 
 
-def train_one_epoch(epoch_index, model, train_loader, optimizer, loss_fn, device, tb_writer, log_interval=10):
+def train_one_epoch(
+    epoch_index,
+    model,
+    train_loader,
+    optimizer,
+    loss_fn,
+    device,
+    tb_writer,
+    log_interval=10,
+    strict_finite_loss: bool = True,
+):
     """Execute one optimization epoch."""
     model.train()
     running_loss = 0.0
@@ -46,6 +57,8 @@ def train_one_epoch(epoch_index, model, train_loader, optimizer, loss_fn, device
         optimizer.zero_grad(set_to_none=True)
         outputs = model(inputs)
         loss = loss_fn(outputs, labels)
+        if strict_finite_loss:
+            ensure_finite_loss(loss, epoch_index=epoch_index, batch_idx=batch_idx)
         loss.backward()
         optimizer.step()
 
@@ -62,16 +75,25 @@ def train_one_epoch(epoch_index, model, train_loader, optimizer, loss_fn, device
 def save_checkpoint(path: Path, epoch: int, model, optimizer, best_val_loss: float, config: dict):
     """Save model, optimizer, and metadata checkpoint."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "best_val_loss": best_val_loss,
-            "config": {k: str(v) if isinstance(v, Path) else v for k, v in config.items()},
-        },
-        path,
-    )
+    payload = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_loss": best_val_loss,
+        "config": {k: str(v) if isinstance(v, Path) else v for k, v in config.items()},
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
+
+def ensure_finite_loss(loss: torch.Tensor, epoch_index: int, batch_idx: int) -> None:
+    """Raise when training loss is non-finite."""
+    loss_value = float(loss.detach().item())
+    if not math.isfinite(loss_value):
+        raise FloatingPointError(
+            f"Non-finite loss detected at epoch={epoch_index + 1}, batch={batch_idx + 1}: {loss_value}"
+        )
 
 
 def maybe_resume_training(model, optimizer, checkpoint_path, device):
@@ -104,15 +126,16 @@ def run_training(config: dict, model=None, device: str | None = None):
     if device is None:
         device = get_device()
     if model is None:
-        model = SRCNN3D(output_patch_shape=config["output_patch_shape"]).to(device)
+        model = build_model_from_config(config).to(device)
 
     loss_fn, optimizer, scheduler = build_training_components(model, config)
 
-    run_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_bs{config['batch_size']}_lr{config['learning_rate']}"
-    run_dir = config["run_root"] / run_name
-    ckpt_dir = config["checkpoint_root"] / run_name
+    model_name = str(config["model_name"]).strip().lower()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = config["run_root"] / model_name / timestamp
+    epochs_dir = run_dir / "epochs"
     run_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    epochs_dir.mkdir(parents=True, exist_ok=True)
 
     with open(run_dir / "config.json", "w", encoding="utf-8") as file_obj:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in config.items()}, file_obj, indent=2)
@@ -123,9 +146,10 @@ def run_training(config: dict, model=None, device: str | None = None):
         print(f"Validation batches: {len(val_loader)}")
 
     writer = SummaryWriter(log_dir=str(run_dir / "tb"))
-    writer.add_text("run/name", run_name)
+    writer.add_text("run/model_name", model_name)
+    writer.add_text("run/timestamp", timestamp)
     writer.add_text("run/device", device)
-    writer.add_text("run/dataset", str(config["data_file"]))
+    writer.add_text("run/manifest", str(config["manifest_path"]))
 
     start_epoch, best_val_loss = maybe_resume_training(
         model,
@@ -144,6 +168,7 @@ def run_training(config: dict, model=None, device: str | None = None):
             device,
             writer,
             log_interval=config["log_interval"],
+            strict_finite_loss=bool(config.get("strict_finite_loss", True)),
         )
 
         val_loss = None
@@ -175,13 +200,14 @@ def run_training(config: dict, model=None, device: str | None = None):
             )
 
         if (epoch + 1) % config["checkpoint_interval"] == 0:
-            save_checkpoint(ckpt_dir / f"epoch_{epoch + 1:03d}.pt", epoch, model, optimizer, best_val_loss, config)
+            epoch_dir = epochs_dir / f"epoch_{epoch + 1:03d}"
+            save_checkpoint(epoch_dir / "checkpoint.pt", epoch, model, optimizer, best_val_loss, config)
 
         metric_for_best = val_loss if val_loss is not None else train_loss
         if metric_for_best < best_val_loss:
             best_val_loss = metric_for_best
-            save_checkpoint(ckpt_dir / "best.pt", epoch, model, optimizer, best_val_loss, config)
+            save_checkpoint(run_dir / "best.pt", epoch, model, optimizer, best_val_loss, config)
 
-    save_checkpoint(ckpt_dir / "final.pt", config["num_epochs"] - 1, model, optimizer, best_val_loss, config)
+    save_checkpoint(run_dir / "final.pt", config["num_epochs"] - 1, model, optimizer, best_val_loss, config)
     writer.close()
-    print(f"Training complete. Logs: {run_dir / 'tb'} | Checkpoints: {ckpt_dir}")
+    print(f"Training complete. Run dir: {run_dir}")

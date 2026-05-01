@@ -201,6 +201,8 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+.vscode
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
@@ -212,4 +214,8 @@ __marimo__/
 
 data/
 
+manifest.json
+
+# Primarily added for src/sr/runs (can be changed if needed)
+src/*/runs/*
 

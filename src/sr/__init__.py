@@ -1,11 +1,20 @@
 """SR training package split from legacy notebook."""
 
 from .checks import run_sanity_checks, run_tiny_overfit_check
-from .config import DEFAULT_CONFIG, INPUT_DIM, OUTPUT_DIM, get_device, set_seed, validate_config
-from .data import SRVolumeDataset, center_crop_3d, create_dataloaders, normalize_minmax, resize_3d_numpy
-from .model import SRCNN3D
+from .config import (
+    DEFAULT_CONFIG,
+    INPUT_DIM,
+    OUTPUT_DIM,
+    apply_deterministic_policy,
+    get_device,
+    set_seed,
+    validate_config,
+)
+from .data import SRSpatialDatasetAdapter, create_dataloaders
+from .model import RCAN3D, SRCNN3D, build_model_from_config, select_model
 from .training import (
     build_training_components,
+    ensure_finite_loss,
     maybe_resume_training,
     psnr_from_mse,
     run_training,
@@ -19,15 +28,17 @@ __all__ = [
     "OUTPUT_DIM",
     "DEFAULT_CONFIG",
     "set_seed",
+    "apply_deterministic_policy",
     "get_device",
     "validate_config",
     "SRCNN3D",
-    "center_crop_3d",
-    "normalize_minmax",
-    "resize_3d_numpy",
-    "SRVolumeDataset",
+    "RCAN3D",
+    "select_model",
+    "build_model_from_config",
+    "SRSpatialDatasetAdapter",
     "create_dataloaders",
     "psnr_from_mse",
+    "ensure_finite_loss",
     "validate_one_epoch",
     "train_one_epoch",
     "save_checkpoint",
