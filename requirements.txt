@@ -1,0 +1,13 @@
+# Minimum dependencies for the data pipeline.
+# Tested with Python 3.12.
+
+nibabel>=5.0
+numpy>=1.26
+scipy>=1.11
+torch>=2.1
+
+# indexed_gzip enables random-access reads of compressed .nii.gz. Without it,
+# nibabel decompresses sequentially from byte 0 on every dataobj[..., t] read,
+# which is catastrophic for shuffled DataLoader sampling. nibabel auto-detects
+# and uses it when installed — no code change needed.
+indexed_gzip>=1.7

@@ -1,1 +1,311 @@
-# CAI-MedImg
+# fMRI Restoration Project — Data Pipeline
+
+CS/AI student project on the [IBC dataset](https://openneuro.org/datasets/ds002685/versions/2.0.0).
+We're training three models that take "imperfect" fMRI scans and produce cleaner versions:
+
+1. **Denoising model** — noisy → clean, same resolution
+2. **Spatial SR model** — low-res (3mm) → high-res (1.5mm)
+3. **Temporal SR model** — interpolate a missing volume from neighbors
+
+This repo currently contains the **data pipeline** only. Models will follow.
+
+## What's in this repo
+
+```
+src/data/
+  build.py                # Wrapper: runs manifest + metadata in one go
+  manifest.py             # Walk BIDS tree, parse filenames, build a JSON manifest
+  compute_metadata.py     # Compute brain mask + z_start + norm_ref + tSNR per run
+  reader.py               # Lazy 3D-volume access to 4D NIfTI files (with per-process cache)
+  masks.py                # Brain masking: SynthStrip (preferred) or percentile fallback
+  normalize.py            # Per-run scalar normalization (volume / norm_ref)
+  cropping.py             # Z-axis bbox-centered crop (option B)
+  padding.py              # (legacy utilities — pad/crop, kept for tests & callers)
+  datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR)
+  degradation_spatial.py  # k-space truncation for spatial SR (Option A)
+  compare_masks.py        # Visualize percentile vs SynthStrip masks side by side
+
+tests/
+  test_cropping.py              # Z-bbox crop, affine update
+  test_degradation_spatial.py   # Unit tests incl. k-space scale regression
+  test_padding.py               # Pad-then-crop round-trip (legacy utility)
+  test_reader.py                # VolumeReader and per-process cache
+  test_datasets_synthetic.py    # End-to-end Datasets on a synthetic BIDS layout
+```
+
+Run the tests with `python -m pytest tests/ -v`.
+
+## How it works
+
+### Where things live
+
+Three kinds of paths the pipeline cares about:
+
+- **Raw IBC data** — `--bids-root`. On the VM: `/srv/fMRI-data/`.
+- **Derivatives** (manifest, masks) — `--out-dir`. Pick a writable path.
+- **Code** — this repo, wherever you clone it.
+
+The manifest is not committed to git. It has absolute paths to data and is
+regenerated whenever the dataset changes. Treat it as a derivative that lives
+next to the masks.
+
+### Build the manifest + derivatives (one-time, slower)
+
+Single command that runs both data-prep stages in order:
+
+```
+python -m src.data.build \
+    --bids-root /srv/fMRI-data \
+    --out-dir <out> \
+    --mask-method auto
+```
+
+This produces:
+- `<out>/manifest.json` — one entry per BOLD run with shape + metadata
+  (including per-run `z_start` and top-level `target_z`)
+- `<out>/masks/*_mask.nii.gz` — per-run brain masks at `(X, Y, target_z)`,
+  with affine corrected for the z-shift
+
+Stage 1 (manifest build) runs in seconds. Stage 2 (metadata) reads each 4D file
+fully twice and is the slow part — expect ~10-30s per run.
+
+`--target-z` is optional. By default it auto-detects to `min(native_z)` across
+runs (so no run ever needs padding — this is the "option B" cropping pipeline).
+You can pass an explicit value to be smaller; the script raises if you ask for
+a target_z larger than the smallest native run.
+
+`--mask-method`:
+- `auto` (default): uses SynthStrip if available on PATH; falls back to
+  percentile with a warning.
+- `synthstrip`: requires `mri_synthstrip`, `synthstrip-docker`, or
+  `synthstrip-singularity` on PATH; raises if missing.
+- `percentile`: pure-Python intensity threshold + morphology. Works without
+  any external tools but produces imperfect masks (includes some skull/scalp).
+
+### Or run the two stages separately
+
+If you want to inspect the manifest before committing to the slow metadata
+step, or only redo one stage:
+
+```
+python -m src.data.manifest \
+    --bids-root /srv/fMRI-data \
+    --out <out>/manifest.json
+
+python -m src.data.compute_metadata \
+    --manifest <out>/manifest.json \
+    --derivatives-dir <out> \
+    --mask-method auto
+```
+
+`build.py` just calls these two in order.
+
+### Using the data in your training code
+
+Once `build.py` has produced `<out>/manifest.json` and `<out>/masks/`, you do
+not run any more data pipeline scripts. All loading and preprocessing happens
+inside the Dataset, per-sample.
+
+The three Datasets share the same construction pattern. Pick the one for your
+model, instantiate it, hand it to a DataLoader. Each sample comes back as a
+dict; the keys differ slightly per task — see below.
+
+#### Spatial SR — `SpatialSRDataset`
+
+```python
+from src.data.datasets import SpatialSRDataset
+from src.data.degradation_spatial import make_spatial_degradation
+from torch.utils.data import DataLoader
+
+degrade = make_spatial_degradation(source_voxel_mm=1.5, target_voxel_mm=3.0)
+
+train_ds = SpatialSRDataset(
+    "<out>/manifest.json",
+    subject_filter=["01", "04", "07"],
+    degrade_fn=degrade,
+)
+val_ds = SpatialSRDataset(
+    "<out>/manifest.json",
+    subject_filter=["11"],
+    degrade_fn=degrade,
+)
+train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
+val_loader   = DataLoader(val_ds,   batch_size=4, num_workers=2, shuffle=False)
+```
+
+Each batch is a dict with:
+
+| key       | shape                  | meaning                                   |
+|-----------|------------------------|-------------------------------------------|
+| `input`   | `(B, 1, 64, 64, 42)`   | LR volume (3mm simulated acquisition)     |
+| `target`  | `(B, 1, 128, 128, 84)` | HR volume (1.5mm ground truth)            |
+| `mask_hr` | `(B, 1, 128, 128, 84)` | brain mask at HR — for HR-domain loss     |
+| `mask_lr` | `(B, 1, 64, 64, 42)`   | brain mask at LR — derived from `mask_hr` |
+
+(Z dimension shown is for `target_z=84`, the IBC default. If you set a
+different `--target-z`, all the z values above scale accordingly. xy is
+always 128×128 / 64×64.)
+
+Your model takes `input` (LR) and must produce something the shape of `target`
+(HR) — it has to upsample internally. Compute loss in HR space, weighted by
+`mask_hr`:
+
+```python
+for batch in train_loader:
+    lr        = batch["input"].to("cuda")
+    hr_target = batch["target"].to("cuda")
+    mask      = batch["mask_hr"].to("cuda")
+
+    hr_pred = model(lr)
+    loss = ((hr_pred - hr_target) ** 2 * mask).sum() / mask.sum()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+#### Denoising — `DenoisingDataset`
+
+```python
+from src.data.datasets import DenoisingDataset
+from torch.utils.data import DataLoader
+
+# You decide what counts as "noisy". Pass a function that takes a clean
+# numpy volume and returns a noisy one. Stub example:
+def add_gaussian_noise(clean, sigma=0.05):
+    import numpy as np
+    return clean + np.random.normal(0, sigma, clean.shape).astype(np.float32)
+
+train_ds = DenoisingDataset(
+    "<out>/manifest.json",
+    subject_filter=["01", "04", "07"],
+    degrade_fn=add_gaussian_noise,
+)
+train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
+```
+
+Each batch:
+
+| key      | shape                  | meaning                              |
+|----------|------------------------|--------------------------------------|
+| `input`  | `(B, 1, 128, 128, 84)` | noisy volume (output of degrade_fn)  |
+| `target` | `(B, 1, 128, 128, 84)` | clean volume                         |
+| `mask`   | `(B, 1, 128, 128, 84)` | brain mask                           |
+
+Both input and target are full-resolution. If you go noise2noise (where both
+sides are noisy and there's no "clean" target), the current API doesn't fit out
+of the box — talk to the data pipeline owner before going down that path.
+
+```python
+for batch in train_loader:
+    noisy = batch["input"].to("cuda")
+    clean = batch["target"].to("cuda")
+    mask  = batch["mask"].to("cuda")
+
+    pred = model(noisy)
+    loss = ((pred - clean) ** 2 * mask).sum() / mask.sum()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+#### Temporal SR — `TemporalSRDataset`
+
+No `degrade_fn` here. The sampler skips a timepoint and gives you its two
+neighbors as input — that's the degradation.
+
+```python
+from src.data.datasets import TemporalSRDataset
+from torch.utils.data import DataLoader
+
+train_ds = TemporalSRDataset(
+    "<out>/manifest.json",
+    subject_filter=["01", "04", "07"],
+    gap=1,    # use t-1 and t+1 to predict t. Bump to simulate larger TR multipliers.
+)
+train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
+```
+
+Each batch:
+
+| key      | shape                  | meaning                                     |
+|----------|------------------------|---------------------------------------------|
+| `input`  | `(B, 2, 128, 128, 84)` | two neighbors stacked: [t-gap, t+gap]       |
+| `target` | `(B, 1, 128, 128, 84)` | the "missing" middle volume at time t       |
+| `mask`   | `(B, 1, 128, 128, 84)` | brain mask                                  |
+
+```python
+for batch in train_loader:
+    neighbors = batch["input"].to("cuda")   # 2 channels: before, after
+    middle    = batch["target"].to("cuda")
+    mask      = batch["mask"].to("cuda")
+
+    pred = model(neighbors)
+    loss = ((pred - middle) ** 2 * mask).sum() / mask.sum()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+The loss formulas above are illustrative — masked L1, SSIM, or other choices
+are all viable. Train/val/test splits in `subject_filter` are placeholders too;
+the group decides who's in which.
+
+## Design decisions worth knowing
+
+- **Raw data only**, no preprocessing pipeline yet (no motion correction, no
+  distortion correction). May add later.
+- **Z-only crop, no padding** (option B). xy is left at IBC's native 128×128.
+  z is cropped per-run to a dataset-wide `target_z` (default: smallest observed
+  native z), with the crop window centered on the brain's z-bbox. The brain
+  mask must be reasonable for the bbox to land on the brain — get SynthStrip
+  working before trusting any crop. The cropped mask's affine is updated so
+  external viewers (FSLeyes, ITK-SNAP) place it in world space correctly.
+- **Per-run scalar normalization** (`volume / norm_ref`). Brain voxels end up
+  near 1.0, background near 0. Reversible. Not z-scored — preserves spatial
+  contrast and BOLD temporal dynamics.
+- **CPU degradation in the DataLoader workers**, not GPU. Cleaner training loop,
+  CPU is otherwise idle during training.
+- **Spatial SR is "Option A"**: model input is at LR shape, target at HR shape.
+  Model is responsible for upsampling.
+- **Temporal SR has no separate degradation**. Sampling at gap=1 (predict t from
+  t-1, t+1) IS the degradation — equivalent to half-rate acquisition.
+- **k-space LR scale**: `kspace_downsample_3d` scales the magnitude image by
+  `M/N` (output size / input size) to preserve mean intensity. There's a
+  regression test for this in `tests/test_degradation_spatial.py`; if you
+  touch the scale logic, run the tests.
+- **`indexed_gzip` is required** (pinned in `requirements.txt`). Without it,
+  every random-access volume read decompresses the gzip stream from byte 0.
+  nibabel picks it up automatically when present — no code change needed.
+- **VolumeReader caching**. `reader.get_reader(path)` is a per-process cache.
+  Each DataLoader worker keeps one open handle per run instead of reopening
+  on every `__getitem__`. Cache is keyed by `(pid, resolved_path)` so it's
+  fork-safe.
+
+## Open issues / things to be aware of
+
+### Mask quality depends on which method runs
+Two backends, dispatched by `--mask-method`:
+- **SynthStrip** (preferred, default `auto`): DL-based, designed for cross-modality
+  EPI. Robust. Requires `mri_synthstrip`, `synthstrip-docker`, or
+  `synthstrip-singularity` on PATH.
+- **Percentile fallback**: pure Python, no external tools, but produces imperfect
+  masks. Tends to include some skull/scalp; may carve cerebellum at high
+  thresholds. Acceptable for code-correctness testing, not for final results.
+
+When SynthStrip isn't installed, `auto` mode falls back to percentile and prints
+a warning. `compute_metadata` also logs a per-run warning when `mask_fraction`
+exceeds 0.55 (a rough sanity floor — whole-brain BOLD masks should be ~0.2-0.4
+of the native volume, so anything above 0.55 almost certainly contains
+non-brain tissue).
+
+### Stub degradations
+- `DenoisingDataset` requires you to pass a `degrade_fn`. None implemented yet —
+  the noise model is the denoising owner's call. (Group decided on a noise2noise
+  approach, so noise modeling may not be needed at all — TBD.)
+- `SpatialSRDataset` has a working degradation in `degradation_spatial.py`.
+- `TemporalSRDataset` has no degradation by design (see above).
+
+### Dtype heterogeneity in IBC
+Some IBC files are stored as int16, others as float32 (with ~20× larger raw
+intensities). This is not preprocessing — it's a storage-format difference
+across releases. Per-run normalization handles it cleanly.
