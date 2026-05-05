@@ -7,7 +7,7 @@ We're training three models that take "imperfect" fMRI scans and produce cleaner
 2. **Spatial SR model** — low-res (3mm) → high-res (1.5mm)
 3. **Temporal SR model** — interpolate a missing volume from neighbors
 
-This repo currently contains the **data pipeline** only. Models will follow.
+This repo contains the **data pipeline** (`src/data`) and a **spatial SR trainer** (`src/sr`): LR brain volumes → HR super-resolution with `srcnn3d` or `rcan3d`. Denoising and temporal SR are dataset-ready; training stacks for those are not included here yet.
 
 ## What's in this repo
 
@@ -23,11 +23,19 @@ src/data/
   datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR)
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
 
+src/sr/
+  run.py          # CLI: train, eval, infer
+  training.py     # masked MSE / SSIM metrics, checkpoints, TensorBoard
+  data.py         # train/val DataLoaders (subject split, SpatialSRDataset)
+  model.py        # SRCNN3D, RCAN3D registry
+  config.py       # defaults and validation
+
 tests/
   test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
   test_degradation_spatial.py   # Unit tests incl. k-space scale regression
   test_reader.py                # VolumeReader and per-process cache
   test_datasets_synthetic.py    # End-to-end Datasets on a synthetic BIDS layout
+  sr/                           # SR models, metrics, reproducibility helpers
 ```
 
 Run the tests with `python -m pytest tests/ -v`.
@@ -100,6 +108,36 @@ python -m src.data.compute_metadata \
 ```
 
 `build.py` just calls these two in order.
+
+### Spatial SR training (CLI, `src/sr`)
+
+With an enriched `manifest.json` (from `compute_metadata`) and masks on disk, you can train and evaluate **3mm → 1.5mm** spatial super-resolution from the repo root. Training uses **mask-weighted MSE** on HR voxels; validation logs **masked MSE, PSNR, and local 3D SSIM**. Checkpoints and TensorBoard logs go under `src/sr/runs/<model_name>/<timestamp>/` (`config.json`, `split.json`, `metrics_summary.json`, `best.pt`, `final.pt`, etc.).
+
+**Train/val split:** the default split needs **at least two subjects** in the manifest (subjects are shuffled with `train_split`). For a single-subject manifest, configure explicit subject lists in code via `DEFAULT_CONFIG` / a small script, or extend the CLI when you add more subjects.
+
+```bash
+# Train (example)
+python -m src.sr.run train --manifest-path ./manifest.json --model-name srcnn3d
+python -m src.sr.run train --manifest-path ./manifest.json --model-name rcan3d --epochs 20 --batch-size 4
+
+# Evaluate on the held-out val split; writes eval_report.json in cwd unless overridden
+python -m src.sr.run eval \
+  --manifest-path ./manifest.json \
+  --checkpoint-path ./src/sr/runs/srcnn3d/<timestamp>/best.pt
+python -m src.sr.run eval \
+  --manifest-path ./manifest.json \
+  --checkpoint-path ./src/sr/runs/srcnn3d/<timestamp>/best.pt \
+  --eval-report ./runs/eval_val.json
+
+# Single-sample inference + optional numpy export
+python -m src.sr.run infer \
+  --manifest-path ./manifest.json \
+  --checkpoint-path ./src/sr/runs/srcnn3d/<timestamp>/best.pt \
+  --inference-index 0 \
+  --save-output-npy ./pred_hr.npy
+```
+
+Useful flags: `--device cpu|cuda`, `--train-split`, `--output-shape D H W`, `--lr`, `--seed`, `--run-root`. Full module reference: [src/sr/README.md](src/sr/README.md).
 
 ### Using the data in your training code
 

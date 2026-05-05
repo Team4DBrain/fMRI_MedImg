@@ -1,4 +1,4 @@
-"""Configuration and reproducibility utilities for SR training."""
+"""Configuration and reproducibility utilities for spatial SR."""
 
 import random
 from pathlib import Path
@@ -20,10 +20,10 @@ OUTPUT_DIM = (OUTPUT_DIM_X, OUTPUT_DIM_Y, OUTPUT_DIM_Z)
 DEFAULT_CONFIG = {
     "seed": 42,
     "deterministic": True,
-    "batch_size": 8,
+    "batch_size": 4,
     "num_epochs": 20,
     "learning_rate": 1e-3,
-    "train_split": 0.9,
+    "train_split": 0.8,
     "num_workers": 0,
     "log_interval": 10,
     "checkpoint_interval": 1,
@@ -35,9 +35,9 @@ DEFAULT_CONFIG = {
     "target_voxel_mm": 3.0,
     "train_subjects": None,
     "val_subjects": None,
+    "enable_subject_split": False,
     "model_name": "srcnn3d",
     "model_kwargs": {},
-    "samples_per_timepoint": 2,
     "resume_checkpoint": None,
     "strict_finite_loss": True,
 }
@@ -74,16 +74,15 @@ def get_device() -> str:
 
 def validate_config(config: dict) -> None:
     """Validate configuration constraints for SR setup."""
-    if not 0.0 < float(config["train_split"]) <= 1.0:
-        raise ValueError("train_split must be in (0, 1].")
+    if bool(config.get("enable_subject_split", False)):
+        if not 0.0 < float(config["train_split"]) <= 1.0:
+            raise ValueError("train_split must be in (0, 1]. when subject split is enabled.")
     if int(config["batch_size"]) < 1:
         raise ValueError("batch_size must be >= 1.")
     if int(config["num_epochs"]) < 1:
         raise ValueError("num_epochs must be >= 1.")
     if int(config["num_workers"]) < 0:
         raise ValueError("num_workers must be >= 0.")
-    if int(config["samples_per_timepoint"]) < 1:
-        raise ValueError("samples_per_timepoint must be >= 1.")
     if int(config["checkpoint_interval"]) < 1:
         raise ValueError("checkpoint_interval must be >= 1.")
     if float(config["learning_rate"]) <= 0:
@@ -98,16 +97,6 @@ def validate_config(config: dict) -> None:
     if not isinstance(config.get("model_kwargs", {}), dict):
         raise ValueError("model_kwargs must be a dictionary.")
 
-    if any(
-        o <= i
-        for i, o in zip(
-            config["input_patch_shape"],
-            config["output_patch_shape"],
-        )
-    ):
-        raise ValueError(
-            "For super-resolution, output_patch_shape must be larger than input_patch_shape in every dimension"
-        )
     manifest_path = Path(config["manifest_path"])
     if not manifest_path.exists():
         raise ValueError(f"manifest_path does not exist: {manifest_path}")

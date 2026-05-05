@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from .config import get_device
@@ -22,18 +22,82 @@ def psnr_from_mse(mse_value: float, data_range: float = 1.0) -> float:
     return 10.0 * np.log10((data_range**2) / mse_value)
 
 
-def validate_one_epoch(model, val_loader, loss_fn, device):
-    """Run one validation pass without gradients."""
+def masked_mse_loss(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Mask-aware MSE over in-brain voxels."""
+    sq_err = (outputs - targets) ** 2
+    weighted = sq_err * mask
+    denom = torch.clamp(mask.sum(), min=eps)
+    return weighted.sum() / denom
+
+
+def _ssim_window_size(spatial: tuple[int, int, int]) -> int:
+    m = min(spatial)
+    w = min(7, m)
+    if w % 2 == 0:
+        w -= 1
+    return max(1, w)
+
+
+def masked_local_ssim_3d(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    data_range: float = 1.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Masked mean of a local 3D SSIM map (sliding average window)."""
+    _b, c, d, h, w = pred.shape
+    if c != 1:
+        raise ValueError("masked_local_ssim_3d expects a single channel (B,1,D,H,W)")
+    win = _ssim_window_size((d, h, w))
+    pad = win // 2
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+
+    def pool(x: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool3d(x, kernel_size=win, stride=1, padding=pad)
+
+    mu_x = pool(pred)
+    mu_y = pool(target)
+    var_x = (pool(pred * pred) - mu_x * mu_x).clamp(min=0.0)
+    var_y = (pool(target * target) - mu_y * mu_y).clamp(min=0.0)
+    cov = pool(pred * target) - mu_x * mu_y
+
+    num = (2 * mu_x * mu_y + c1) * (2 * cov + c2)
+    den = (mu_x * mu_x + mu_y * mu_y + c1) * (var_x + var_y + c2).clamp(min=eps)
+    ssim_map = num / den
+
+    mask_w = pool(mask)
+    weighted = (ssim_map * mask_w).sum()
+    denom = mask_w.sum().clamp(min=eps)
+    return weighted / denom
+
+
+def validate_one_epoch(model, val_loader, device):
+    """Run one validation pass without gradients; return masked MSE and masked SSIM.
+
+    When val_loader is None (no validation set), returns NaNs.
+    """
+    if val_loader is None:
+        return {"mse": float("nan"), "ssim": float("nan")}
     model.eval()
-    running_loss = 0.0
+    running_mse = 0.0
+    running_ssim = 0.0
+    n_batches = max(1, len(val_loader))
     with torch.no_grad():
-        for inputs, labels in val_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+        for batch in val_loader:
+            inputs = batch["input"].to(device)
+            labels = batch["target"].to(device)
+            mask = batch["mask_hr"].to(device)
             outputs = model(inputs)
-            loss = loss_fn(outputs, labels)
-            running_loss += loss.item()
-    return running_loss / max(1, len(val_loader))
+            running_mse += masked_mse_loss(outputs, labels, mask).item()
+            running_ssim += masked_local_ssim_3d(outputs, labels, mask).item()
+    return {"mse": running_mse / n_batches, "ssim": running_ssim / n_batches}
 
 
 def train_one_epoch(
@@ -41,7 +105,6 @@ def train_one_epoch(
     model,
     train_loader,
     optimizer,
-    loss_fn,
     device,
     tb_writer,
     log_interval=10,
@@ -50,13 +113,14 @@ def train_one_epoch(
     """Execute one optimization epoch."""
     model.train()
     running_loss = 0.0
-    for batch_idx, (inputs, labels) in enumerate(train_loader):
-        inputs = inputs.to(device)
-        labels = labels.to(device)
+    for batch_idx, batch in enumerate(train_loader):
+        inputs = batch["input"].to(device)
+        labels = batch["target"].to(device)
+        mask = batch["mask_hr"].to(device)
 
         optimizer.zero_grad(set_to_none=True)
         outputs = model(inputs)
-        loss = loss_fn(outputs, labels)
+        loss = masked_mse_loss(outputs, labels, mask)
         if strict_finite_loss:
             ensure_finite_loss(loss, epoch_index=epoch_index, batch_idx=batch_idx)
         loss.backward()
@@ -115,10 +179,9 @@ def maybe_resume_training(model, optimizer, checkpoint_path, device):
 
 def build_training_components(model, config: dict):
     """Create default loss, optimizer, and scheduler."""
-    loss_fn = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
-    return loss_fn, optimizer, scheduler
+    return optimizer, scheduler
 
 
 def run_training(config: dict, model=None, device: str | None = None):
@@ -128,7 +191,7 @@ def run_training(config: dict, model=None, device: str | None = None):
     if model is None:
         model = build_model_from_config(config).to(device)
 
-    loss_fn, optimizer, scheduler = build_training_components(model, config)
+    optimizer, scheduler = build_training_components(model, config)
 
     model_name = str(config["model_name"]).strip().lower()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -140,10 +203,15 @@ def run_training(config: dict, model=None, device: str | None = None):
     with open(run_dir / "config.json", "w", encoding="utf-8") as file_obj:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in config.items()}, file_obj, indent=2)
 
-    train_loader, val_loader, dataset_size = create_dataloaders(config)
+    train_loader, val_loader, dataset_size, split_info = create_dataloaders(config)
     print(f"Dataset size: {dataset_size}, train batches: {len(train_loader)}")
     if val_loader is not None:
         print(f"Validation batches: {len(val_loader)}")
+    else:
+        print("No validation set (subject split disabled and no explicit val_subjects).")
+
+    with open(run_dir / "split.json", "w", encoding="utf-8") as file_obj:
+        json.dump(split_info, file_obj, indent=2)
 
     writer = SummaryWriter(log_dir=str(run_dir / "tb"))
     writer.add_text("run/model_name", model_name)
@@ -158,25 +226,23 @@ def run_training(config: dict, model=None, device: str | None = None):
         device,
     )
 
+    last_val_metrics: dict[str, float] = {"mse": float("nan"), "ssim": float("nan")}
     for epoch in range(start_epoch, config["num_epochs"]):
         train_loss = train_one_epoch(
             epoch,
             model,
             train_loader,
             optimizer,
-            loss_fn,
             device,
             writer,
             log_interval=config["log_interval"],
             strict_finite_loss=bool(config.get("strict_finite_loss", True)),
         )
 
-        val_loss = None
-        if val_loader is not None:
-            val_loss = validate_one_epoch(model, val_loader, loss_fn, device)
-            scheduler.step(val_loss)
-        else:
-            scheduler.step(train_loss)
+        val_metrics = validate_one_epoch(model, val_loader, device)
+        val_loss = val_metrics["mse"]
+        scheduler.step(val_loss)
+        last_val_metrics = val_metrics
 
         current_lr = optimizer.param_groups[0]["lr"]
         writer.add_scalar("epoch/loss_train", train_loss, epoch)
@@ -184,14 +250,16 @@ def run_training(config: dict, model=None, device: str | None = None):
         train_psnr = psnr_from_mse(train_loss)
         writer.add_scalar("epoch/psnr_train", train_psnr, epoch)
 
-        if val_loss is not None:
+        if val_loader is not None:
             writer.add_scalar("epoch/loss_val", val_loss, epoch)
             val_psnr = psnr_from_mse(val_loss)
             writer.add_scalar("epoch/psnr_val", val_psnr, epoch)
+            writer.add_scalar("epoch/ssim_val", val_metrics["ssim"], epoch)
             print(
                 f"Epoch {epoch + 1}/{config['num_epochs']} "
-                f"train={train_loss:.6f} val={val_loss:.6f} "
-                f"psnr_train={train_psnr:.2f} psnr_val={val_psnr:.2f} lr={current_lr:.2e}"
+                f"train={train_loss:.6f} val_mse={val_loss:.6f} "
+                f"psnr_train={train_psnr:.2f} psnr_val={val_psnr:.2f} "
+                f"ssim_val={val_metrics['ssim']:.4f} lr={current_lr:.2e}"
             )
         else:
             print(
@@ -203,11 +271,22 @@ def run_training(config: dict, model=None, device: str | None = None):
             epoch_dir = epochs_dir / f"epoch_{epoch + 1:03d}"
             save_checkpoint(epoch_dir / "checkpoint.pt", epoch, model, optimizer, best_val_loss, config)
 
-        metric_for_best = val_loss if val_loss is not None else train_loss
-        if metric_for_best < best_val_loss:
-            best_val_loss = metric_for_best
+        if val_loader is not None and val_loss < best_val_loss:
+            best_val_loss = val_loss
             save_checkpoint(run_dir / "best.pt", epoch, model, optimizer, best_val_loss, config)
 
     save_checkpoint(run_dir / "final.pt", config["num_epochs"] - 1, model, optimizer, best_val_loss, config)
     writer.close()
+    summary = {
+        "best_val_mse": best_val_loss if val_loader is not None else float("nan"),
+        "final_train_mse": train_loss,
+        "final_val_mse": last_val_metrics["mse"],
+        "final_val_psnr": psnr_from_mse(last_val_metrics["mse"]),
+        "final_val_ssim": last_val_metrics["ssim"],
+        "num_epochs": int(config["num_epochs"]),
+        "manifest_path": str(config["manifest_path"]),
+        "model_name": model_name,
+    }
+    with open(run_dir / "metrics_summary.json", "w", encoding="utf-8") as file_obj:
+        json.dump(summary, file_obj, indent=2)
     print(f"Training complete. Run dir: {run_dir}")

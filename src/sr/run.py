@@ -1,8 +1,9 @@
-"""CLI entrypoint to run SR checks, training, and inference."""
+"""CLI entrypoint for spatial SR train/eval/infer."""
 
 from __future__ import annotations
 
 import argparse
+import json
 from copy import deepcopy
 from pathlib import Path
 import sys
@@ -15,7 +16,6 @@ if __package__ is None or __package__ == "":
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -24,20 +24,19 @@ from src.sr import (
     DEFAULT_CONFIG,
     build_model_from_config,
     get_device,
-    run_sanity_checks,
-    run_tiny_overfit_check,
     run_training,
     set_seed,
     validate_config,
 )
-from src.sr.data import SRSpatialManifestDataset
+from src.sr.data import create_dataloaders
+from src.sr.training import masked_local_ssim_3d, masked_mse_loss, psnr_from_mse
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run SR checks, training, and inference.")
+    parser = argparse.ArgumentParser(description="Run SR training/evaluation/inference.")
     parser.add_argument(
         "command",
-        choices=["device", "sanity", "overfit", "train", "checks", "inference"],
+        choices=["train", "eval", "infer"],
         help="What to run.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
@@ -52,7 +51,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--train-split", type=float, default=None, help="Train split in [0,1].")
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader workers.")
-    parser.add_argument("--samples-per-timepoint", type=int, default=None, help="Samples per timepoint.")
     parser.add_argument("--log-interval", type=int, default=None, help="Batch log frequency.")
     parser.add_argument("--checkpoint-interval", type=int, default=None, help="Epoch checkpoint frequency.")
     parser.add_argument(
@@ -67,15 +65,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--checkpoint-path",
         type=Path,
         default=None,
-        help="Model checkpoint path to load for inference.",
-    )
-    parser.add_argument(
-        "--input-shape",
-        type=int,
-        nargs=3,
-        metavar=("D", "H", "W"),
-        default=None,
-        help="Input patch shape, e.g. --input-shape 64 64 64",
+        help="Model checkpoint path to load for eval/infer.",
     )
     parser.add_argument(
         "--output-shape",
@@ -84,12 +74,6 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar=("D", "H", "W"),
         default=None,
         help="Output patch shape, e.g. --output-shape 128 128 128",
-    )
-    parser.add_argument(
-        "--overfit-steps",
-        type=int,
-        default=20,
-        help="Number of steps for tiny overfit check.",
     )
     parser.add_argument(
         "--inference-index",
@@ -104,31 +88,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional path to save predicted output volume as .npy.",
     )
     parser.add_argument(
-        "--save-input-npy",
+        "--eval-report",
         type=Path,
         default=None,
-        help="Optional path to save input volume as .npy.",
-    )
-    parser.add_argument(
-        "--save-target-npy",
-        type=Path,
-        default=None,
-        help="Optional path to save target volume as .npy.",
-    )
-    parser.add_argument(
-        "--visualize",
-        action="store_true",
-        help="Visualize output (and optionally input/target) slices for inference.",
-    )
-    parser.add_argument(
-        "--visualize-input",
-        action="store_true",
-        help="Include input in visualization.",
-    )
-    parser.add_argument(
-        "--visualize-target",
-        action="store_true",
-        help="Include target in visualization.",
+        help="Optional JSON path for eval metrics (default: eval_report.json in cwd).",
     )
     parser.add_argument(
         "--device",
@@ -182,8 +145,6 @@ def _apply_overrides(args: argparse.Namespace) -> dict:
         config["train_split"] = args.train_split
     if args.num_workers is not None:
         config["num_workers"] = args.num_workers
-    if args.samples_per_timepoint is not None:
-        config["samples_per_timepoint"] = args.samples_per_timepoint
     if args.log_interval is not None:
         config["log_interval"] = args.log_interval
     if args.checkpoint_interval is not None:
@@ -194,8 +155,6 @@ def _apply_overrides(args: argparse.Namespace) -> dict:
         config["run_root"] = args.run_root
     if args.resume_checkpoint is not None:
         config["resume_checkpoint"] = args.resume_checkpoint
-    if args.input_shape is not None:
-        config["input_patch_shape"] = tuple(args.input_shape)
     if args.output_shape is not None:
         config["output_patch_shape"] = tuple(args.output_shape)
     if args.deterministic is not None:
@@ -214,7 +173,7 @@ def _print_effective_config(config: dict, command: str, device: str) -> None:
         f"seed={config['seed']} batch_size={config['batch_size']} epochs={config['num_epochs']} "
         f"lr={config['learning_rate']} train_split={config['train_split']} "
         f"model={config['model_name']} deterministic={config['deterministic']} "
-        f"input_shape={config['input_patch_shape']} output_shape={config['output_patch_shape']}"
+        f"output_shape={config['output_patch_shape']}"
     )
     print(f"[run] Manifest: {config['manifest_path']}")
 
@@ -229,7 +188,7 @@ def _load_checkpoint_config(checkpoint_path: Path, device: str) -> dict:
 
 def _merge_inference_config(config: dict, args: argparse.Namespace, device: str) -> dict:
     if args.checkpoint_path is None:
-        raise ValueError("--checkpoint-path is required for command 'inference'.")
+        raise ValueError("--checkpoint-path is required for commands 'eval' and 'infer'.")
     checkpoint_path = Path(args.checkpoint_path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -240,7 +199,6 @@ def _merge_inference_config(config: dict, args: argparse.Namespace, device: str)
     for key in (
         "model_name",
         "model_kwargs",
-        "input_patch_shape",
         "output_patch_shape",
         "source_voxel_mm",
         "target_voxel_mm",
@@ -256,41 +214,55 @@ def _merge_inference_config(config: dict, args: argparse.Namespace, device: str)
             merged[key] = value
 
     merged["manifest_path"] = Path(merged["manifest_path"])
-    merged["input_patch_shape"] = tuple(merged["input_patch_shape"])
     merged["output_patch_shape"] = tuple(merged["output_patch_shape"])
     merged["checkpoint_path"] = checkpoint_path
     return merged
 
 
-def _extract_center_slice(volume: np.ndarray) -> np.ndarray:
-    return volume[volume.shape[0] // 2, :, :]
+def _build_eval_loader(config: dict):
+    _, val_loader, _, _ = create_dataloaders(config)
+    return val_loader
 
 
-def _visualize_inference(
-    prediction: np.ndarray,
-    input_volume: np.ndarray | None,
-    target_volume: np.ndarray | None,
-    include_input: bool,
-    include_target: bool,
-) -> None:
-    panels: list[tuple[str, np.ndarray]] = [("Prediction", prediction)]
-    if include_input and input_volume is not None:
-        panels.insert(0, ("Input", input_volume))
-    if include_target and target_volume is not None:
-        panels.append(("Target", target_volume))
+def _run_eval(config: dict, device: str, eval_report: Path | None) -> None:
+    model = build_model_from_config(config).to(device)
+    ckpt_path = config["checkpoint_path"]
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
 
-    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 5))
-    if len(panels) == 1:
-        axes = [axes]
-    for axis, (title, volume) in zip(axes, panels):
-        axis.imshow(_extract_center_slice(volume), cmap="gray")
-        axis.set_title(f"{title} (center slice)")
-        axis.axis("off")
-    fig.tight_layout()
-    plt.show()
+    val_loader = _build_eval_loader(config)
+    running_mse = 0.0
+    running_ssim = 0.0
+    n_batches = max(1, len(val_loader))
+    with torch.no_grad():
+        for batch in val_loader:
+            input_tensor = batch["input"].to(device)
+            target_tensor = batch["target"].to(device)
+            mask_hr = batch["mask_hr"].to(device)
+            pred = model(input_tensor)
+            running_mse += masked_mse_loss(pred, target_tensor, mask_hr).item()
+            running_ssim += masked_local_ssim_3d(pred, target_tensor, mask_hr).item()
+    mean_mse = running_mse / n_batches
+    mean_ssim = running_ssim / n_batches
+    print(f"[eval] checkpoint={ckpt_path}")
+    print(f"[eval] masked_mse={mean_mse:.6f}")
+    print(f"[eval] masked_psnr={psnr_from_mse(mean_mse):.2f}")
+    print(f"[eval] masked_ssim={mean_ssim:.4f}")
+    report_path = eval_report if eval_report is not None else Path("eval_report.json")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "checkpoint": str(ckpt_path),
+        "manifest_path": str(config["manifest_path"]),
+        "masked_mse": mean_mse,
+        "masked_psnr": psnr_from_mse(mean_mse),
+        "masked_ssim": mean_ssim,
+    }
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[eval] wrote {report_path}")
 
 
-def _run_inference(config: dict, args: argparse.Namespace, device: str) -> None:
+def _run_infer(config: dict, args: argparse.Namespace, device: str) -> None:
     checkpoint_path = config["checkpoint_path"]
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -302,19 +274,17 @@ def _run_inference(config: dict, args: argparse.Namespace, device: str) -> None:
         source_voxel_mm=float(config["source_voxel_mm"]),
         target_voxel_mm=float(config["target_voxel_mm"]),
     )
-    dataset = SRSpatialManifestDataset(
-        manifest_path=Path(config["manifest_path"]),
-        subject_filter=None,
-        degrade_fn=degrade_fn,
-    )
+    from src.data.datasets import SpatialSRDataset
+
+    dataset = SpatialSRDataset(manifest_path=Path(config["manifest_path"]), subject_filter=None, degrade_fn=degrade_fn)
     if len(dataset) == 0:
         raise RuntimeError("No samples available for inference.")
     if args.inference_index < 0 or args.inference_index >= len(dataset):
         raise IndexError(f"--inference-index out of range: {args.inference_index} (dataset size: {len(dataset)})")
 
-    input_sample, target_sample = dataset[args.inference_index]
-    input_tensor = input_sample.unsqueeze(0).to(device)
-    target_tensor = target_sample
+    sample = dataset[args.inference_index]
+    input_tensor = sample["input"].unsqueeze(0).to(device)
+    target_tensor = sample["target"]
 
     with torch.no_grad():
         prediction_tensor = model(input_tensor).squeeze(0).cpu()
@@ -334,23 +304,12 @@ def _run_inference(config: dict, args: argparse.Namespace, device: str) -> None:
         args.save_output_npy.parent.mkdir(parents=True, exist_ok=True)
         np.save(args.save_output_npy, prediction)
         print(f"[inference] Saved output to: {args.save_output_npy}")
-    if args.save_input_npy is not None:
-        args.save_input_npy.parent.mkdir(parents=True, exist_ok=True)
-        np.save(args.save_input_npy, input_volume)
-        print(f"[inference] Saved input to: {args.save_input_npy}")
-    if args.save_target_npy is not None:
-        args.save_target_npy.parent.mkdir(parents=True, exist_ok=True)
-        np.save(args.save_target_npy, target_volume)
-        print(f"[inference] Saved target to: {args.save_target_npy}")
-
-    if args.visualize:
-        _visualize_inference(
-            prediction=prediction,
-            input_volume=input_volume,
-            target_volume=target_volume,
-            include_input=bool(args.visualize_input),
-            include_target=bool(args.visualize_target),
-        )
+    m = sample["mask_hr"].unsqueeze(0)
+    pred_b = prediction_tensor.unsqueeze(0)
+    tgt_b = target_tensor.unsqueeze(0)
+    mse = float(masked_mse_loss(pred_b, tgt_b, m).item())
+    ssim = float(masked_local_ssim_3d(pred_b, tgt_b, m).item())
+    print(f"[infer] masked_mse={mse:.6f} masked_psnr={psnr_from_mse(mse):.2f} masked_ssim={ssim:.4f}")
 
 
 def main() -> None:
@@ -359,34 +318,20 @@ def main() -> None:
     config = _apply_overrides(args)
     device = args.device or get_device()
 
-    if args.command == "device":
-        print(f"[run] Device: {device}")
-        return
-
-    if args.command == "inference":
+    if args.command in {"infer", "eval"}:
         config = _merge_inference_config(config, args, device=device)
         validate_config(config)
         set_seed(config["seed"], deterministic=config["deterministic"])
         _print_effective_config(config, args.command, device)
-        _run_inference(config, args, device=device)
+        if args.command == "eval":
+            _run_eval(config, device=device, eval_report=args.eval_report)
+        else:
+            _run_infer(config, args, device=device)
         return
 
     validate_config(config)
     set_seed(config["seed"], deterministic=config["deterministic"])
     _print_effective_config(config, args.command, device)
-
-    if args.command == "sanity":
-        run_sanity_checks(config, device=device)
-        return
-
-    if args.command == "overfit":
-        run_tiny_overfit_check(config, steps=args.overfit_steps, device=device)
-        return
-
-    if args.command == "checks":
-        run_sanity_checks(config, device=device)
-        run_tiny_overfit_check(config, steps=args.overfit_steps, device=device)
-        return
 
     if args.command == "train":
         run_training(config, device=device)

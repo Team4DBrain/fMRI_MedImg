@@ -18,7 +18,7 @@ class TestReproducibilityAndSafety(unittest.TestCase):
     def _make_config_and_data(self, root: Path) -> dict:
         rng = np.random.default_rng(7)
         bids_root = root / "bids"
-        derivatives_dir = bids_root / "masks"
+        derivatives_dir = root / "derivatives" / "masks"
         bids_root.mkdir(parents=True, exist_ok=True)
         derivatives_dir.mkdir(parents=True, exist_ok=True)
 
@@ -45,9 +45,11 @@ class TestReproducibilityAndSafety(unittest.TestCase):
 
         manifest_path = root / "manifest.json"
         manifest = {
+            "pipeline": "no_crop_v1",
             "bids_root": str(bids_root),
-            "derivatives_dir": str(bids_root),
+            "derivatives_dir": str(root / "derivatives"),
             "target_shape": [10, 10, 10],
+            "target_z": 10,
             "runs": runs,
         }
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -56,11 +58,11 @@ class TestReproducibilityAndSafety(unittest.TestCase):
         config.update(
             {
                 "manifest_path": manifest_path,
-                "input_patch_shape": (5, 5, 5),
                 "output_patch_shape": (10, 10, 10),
                 "batch_size": 2,
                 "num_workers": 0,
-                "train_split": 0.75,
+                "train_subjects": ["01"],
+                "val_subjects": ["02"],
                 "deterministic": True,
                 "source_voxel_mm": 1.5,
                 "target_voxel_mm": 3.0,
@@ -73,11 +75,11 @@ class TestReproducibilityAndSafety(unittest.TestCase):
             root = Path(tmpdir)
             config = self._make_config_and_data(root)
 
-            train_loader_a, _, _ = create_dataloaders(config)
-            train_loader_b, _, _ = create_dataloaders(config)
+            train_loader_a, _, _, _ = create_dataloaders(config)
+            train_loader_b, _, _, _ = create_dataloaders(config)
 
-            batch_a = next(iter(train_loader_a))[0]
-            batch_b = next(iter(train_loader_b))[0]
+            batch_a = next(iter(train_loader_a))["input"]
+            batch_b = next(iter(train_loader_b))["input"]
             self.assertTrue(torch.allclose(batch_a, batch_b))
 
     def test_finite_loss_guard_raises_on_nan(self):
@@ -106,8 +108,7 @@ class TestReproducibilityAndSafety(unittest.TestCase):
             config = self._make_config_and_data(root)
             model = build_model_from_config(config)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-            loss_fn = torch.nn.MSELoss()
-            train_loader, _, _ = create_dataloaders(config)
+            train_loader, _, _, _ = create_dataloaders(config)
             writer = SummaryWriter(log_dir=str(root / "tb"))
             try:
                 loss_value = train_one_epoch(
@@ -115,7 +116,6 @@ class TestReproducibilityAndSafety(unittest.TestCase):
                     model,
                     train_loader,
                     optimizer,
-                    loss_fn,
                     "cpu",
                     writer,
                     strict_finite_loss=False,
