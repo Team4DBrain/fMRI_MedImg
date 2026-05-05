@@ -1,33 +1,27 @@
-"""Compute per-run metadata from a manifest: brain mask, norm reference, tSNR,
-and the per-run z-axis crop offset.
+"""Compute per-run metadata from a manifest: brain mask, norm reference, tSNR.
 
 For each run:
-  1. Read the full 4D once. Compute the temporal mean from the same buffer.
-  2. Compute a brain mask at NATIVE shape (X, Y, Z_native).
-  3. Compute a z-axis crop offset (`z_start`) that centers the brain's z-bbox
-     in a target_z window. xy is unchanged (IBC has uniform xy=128×128).
-  4. Crop the mask to (X, Y, target_z) using z_start. Update its affine.
-     Save to disk.
-  5. Compute norm_ref and tSNR on the in-brain voxels (cropping doesn't change
-     these values since the bbox is fully contained in the crop window).
-  6. Update the manifest entry with mask_path, z_start, norm_ref, tsnr,
-     mask_fraction.
+  1. If a mask + complete metadata already exist on disk and --overwrite is not
+     passed, skip the entire run (no I/O, no compute). Idempotent fast path.
+  2. Otherwise read the full 4D once. Compute the temporal mean from the same
+     buffer.
+  3. Compute a brain mask at native shape (X, Y, Z). For this pipeline we
+     require all runs to have the same shape — manifest stage drops outliers.
+  4. Save the mask as-is (no cropping). Update the manifest entry with
+     mask_path, norm_ref, tsnr, mask_fraction.
 
 Pipeline shape:
-  - target_shape on disk for masks is (X_native, Y_native, target_z) where
-    X_native = Y_native = 128 for IBC.
-  - Datasets read native data and crop z using the stored z_start.
-  - target_z defaults to the smallest observed Z across runs (auto). Override
-    with --target-z if needed.
+  - target_shape on disk equals native shape: (128, 128, 93) for IBC.
+  - Datasets read native data and serve it without cropping.
+  - target_z is fixed at the manifest's require_z. Mismatch is a hard error.
 
 Run from the command line:
     python -m src.data.compute_metadata --manifest manifest.json \
-        --derivatives-dir /path/to/derivatives \
-        --target-z 84
+        --derivatives-dir /path/to/derivatives
 
-Idempotent: if a mask already exists and --overwrite is not passed, it is
-reused. Existing-mask shape MUST match (X, Y, target_z) or we abort with a
-clear error (re-run with --overwrite to regenerate stale masks).
+Idempotent: if a mask already exists with the right shape AND norm_ref/tSNR are
+already in the manifest entry AND --overwrite is not passed, the run is skipped
+entirely (no 4D read). To force a recompute, pass --overwrite.
 """
 
 from __future__ import annotations
@@ -42,7 +36,6 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 
-from .cropping import compute_z_start, crop_z, update_affine_for_z_crop
 from .manifest import load_manifest
 from .masks import compute_brain_mask, mask_fraction
 from .normalize import compute_norm_ref
@@ -50,9 +43,12 @@ from .reader import VolumeReader
 
 logger = logging.getLogger(__name__)
 
-# IBC has uniform xy. We don't crop or pad xy at all in option B.
+# IBC has uniform xy. We don't crop or pad anything in this pipeline.
 DEFAULT_TARGET_XY = 128
-# target_z is per-dataset: defaults to min observed native_z if not specified.
+
+# Pipeline marker stored in the manifest so Datasets can detect old manifests
+# (z_crop, padding) and refuse to load with a clear message.
+PIPELINE_MARKER = "no_crop_v1"
 
 
 @dataclass
@@ -60,24 +56,21 @@ class RunMetadata:
     """Extra fields we attach to each manifest entry after this stage."""
 
     mask_path: str  # relative to derivatives_dir
-    z_start: int    # offset into native z where the crop window begins
     norm_ref: float
     tsnr_mean_in_brain: float
     mask_fraction: float
 
 
-def compute_tsnr_from_data(data_cropped: np.ndarray, mask: np.ndarray) -> float:
-    """Compute mean tSNR over brain voxels from already-cropped 4D data.
+def compute_tsnr_from_data(data: np.ndarray, mask: np.ndarray) -> float:
+    """Compute mean tSNR over brain voxels.
 
     tSNR = mean(voxel_timecourse) / std(voxel_timecourse), per voxel.
 
-    Pure: no I/O, no reader. Caller is responsible for passing the 4D run
-    already cropped to (X, Y, target_z, T) so statistics match what the
-    Dataset serves. Float64 accumulators on the temporal reduction —
+    Pure: no I/O, no reader. Float64 accumulators on the temporal reduction —
     float32 sum over 300 timepoints accumulates enough drift to bias tSNR.
     """
-    mean_tc = data_cropped.mean(axis=-1, dtype=np.float64)
-    std_tc = data_cropped.std(axis=-1, dtype=np.float64)
+    mean_tc = data.mean(axis=-1, dtype=np.float64)
+    std_tc = data.std(axis=-1, dtype=np.float64)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         tsnr_map = np.where(std_tc > 0, mean_tc / std_tc, 0.0)
@@ -89,6 +82,30 @@ def compute_tsnr_from_data(data_cropped: np.ndarray, mask: np.ndarray) -> float:
     return float(brain_tsnr.mean())
 
 
+def _entry_metadata_complete(
+    entry: dict, derivatives_dir: Path, expected_shape: tuple,
+) -> bool:
+    """Return True if this entry already has all fields and a valid mask on disk.
+
+    Resolves the mask path from the entry itself (`entry["mask_path"]`) rather
+    than reconstructing it from the run_id. A hand-edited or relocated entry
+    that points elsewhere is checked against where it actually points, not
+    against a hardcoded path.
+    """
+    required_fields = ("mask_path", "norm_ref", "tsnr_mean_in_brain", "mask_fraction")
+    if not all(f in entry for f in required_fields):
+        return False
+    mask_abs = derivatives_dir / entry["mask_path"]
+    if not mask_abs.is_file():
+        return False
+    # Verify mask shape matches what the pipeline expects. Header read only.
+    try:
+        cached_shape = tuple(int(s) for s in nib.load(str(mask_abs)).shape)
+    except Exception:
+        return False
+    return cached_shape == expected_shape
+
+
 def process_run(
     run_entry: dict,
     bids_root: Path,
@@ -97,87 +114,85 @@ def process_run(
     overwrite: bool = False,
     mask_method: str = "auto",
 ) -> RunMetadata:
-    """Compute mask, z_start, norm_ref, tSNR for one run. Save cropped mask.
+    """Compute mask, norm_ref, tSNR for one run. Save mask at native shape.
 
-    The mask saved to disk is at (X, Y, target_z). xy is NOT modified —
-    IBC's xy is uniform 128×128 across the dataset and there is nothing
-    to gain by cropping or padding it.
+    No cropping. The run's native shape MUST be (X, Y, target_z); this is
+    enforced upstream by the manifest's require_z filter, and we double-check
+    here for safety.
 
-    Args:
-        target_z: the dataset-wide z target. The crop window is centered on
-            the brain's z-bbox in this run.
-        mask_method: "auto", "synthstrip", or "percentile". See masks.py.
+    Fast path: if mask exists on disk AND every metadata field is already in
+    the entry AND --overwrite is not set, return cached values without
+    touching the 4D file (saves ~5–10s per run on typical hardware).
     """
     run_path = bids_root / run_entry["path"]
     run_id = run_entry["run_id"]
     mask_rel = f"masks/{run_id}_mask.nii.gz"
     mask_abs = derivatives_dir / mask_rel
 
+    # Validate manifest-recorded shape matches target_z. Manifest filtering
+    # should already have enforced this, but defend in depth in case the user
+    # crafted a manifest by hand or a bug slips through.
+    manifest_shape = tuple(run_entry["shape"][:3])
+    if manifest_shape[2] != target_z:
+        raise ValueError(
+            f"Run {run_id} has manifest z={manifest_shape[2]}, expected target_z={target_z}. "
+            "Re-run the manifest stage with --require-z matching your target."
+        )
+    expected_shape = manifest_shape  # (X, Y, target_z)
+
+    # Fast path — every cache check is a few stat()s, no 4D read.
+    if not overwrite and _entry_metadata_complete(run_entry, derivatives_dir, expected_shape):
+        logger.info(f"  Cached metadata complete for {run_id}; skipping recompute")
+        return RunMetadata(
+            mask_path=run_entry["mask_path"],
+            norm_ref=float(run_entry["norm_ref"]),
+            tsnr_mean_in_brain=float(run_entry["tsnr_mean_in_brain"]),
+            mask_fraction=float(run_entry["mask_fraction"]),
+        )
+
+    # Slow path: read once, derive everything from one buffer.
     reader = VolumeReader(run_path)
     native_shape = reader.shape3d
-    expected_cropped_shape = (native_shape[0], native_shape[1], target_z)
-
-    if native_shape[2] < target_z:
+    if native_shape != expected_shape:
         raise ValueError(
-            f"Run {run_id} has native z={native_shape[2]} which is smaller "
-            f"than target_z={target_z}. The crop pipeline cannot grow volumes; "
-            "lower --target-z so it fits the shortest run."
+            f"Run {run_id}: NIfTI native shape {native_shape} disagrees with "
+            f"manifest shape {expected_shape}. Manifest stale; rebuild it."
         )
 
-    logger.info(f"  Reading {run_id} (native shape {native_shape})...")
-    # Read the full 4D ONCE. Mean for masking + norm_ref, full for tSNR.
-    # Previous version read the file twice — once for read_mean(), once
-    # inside compute_tsnr(). For a 1.6 GB run that doubled the I/O cost
-    # of the offline build. Holding the buffer for the duration of one
-    # process_run is ~1.6 GB peak, released between runs.
-    full = reader.read_full(dtype=np.float32)              # (X, Y, Z_native, T)
+    logger.info(f"  Reading {run_id} (shape {native_shape})...")
+    full = reader.read_full(dtype=np.float32)              # (X, Y, Z, T)
     mean_vol = full.mean(axis=-1, dtype=np.float64).astype(np.float32)
 
-    # Mask + z_start: compute fresh or load from disk.
-    if mask_abs.exists() and not overwrite and "z_start" in run_entry:
+    # Compute mask, or load existing one if shape-compatible.
+    if mask_abs.exists() and not overwrite:
         logger.info(f"  Loading existing mask: {mask_rel}")
-        mask_cropped = np.asarray(nib.load(str(mask_abs)).dataobj).astype(bool)
-        if mask_cropped.shape != expected_cropped_shape:
+        mask = np.asarray(nib.load(str(mask_abs)).dataobj).astype(bool)
+        if mask.shape != expected_shape:
             raise RuntimeError(
-                f"Cached mask shape {mask_cropped.shape} != expected "
-                f"{expected_cropped_shape} for {run_id}. The mask was likely "
-                "built under a different target_z (or under the old padding "
-                "pipeline). Re-run with --overwrite to regenerate."
+                f"Cached mask shape {mask.shape} != expected {expected_shape} "
+                f"for {run_id}. The mask was built under a different pipeline. "
+                "Re-run with --overwrite to regenerate."
             )
-        z_start = int(run_entry["z_start"])
     else:
         logger.info(f"  Computing mask for {run_id} (method={mask_method})")
-        mask_native = compute_brain_mask(
+        mask = compute_brain_mask(
             mean_vol, affine=reader.img.affine, method=mask_method,
         )
-        # Center the crop window on the brain's z-bbox.
-        z_start = compute_z_start(mask_native, target_z)
-        mask_cropped = crop_z(mask_native, z_start, target_z)
-
-        # Save the cropped mask with an affine that reflects the z-shift,
-        # so external viewers (FSLeyes, ITK-SNAP) place it in world space
-        # consistently with the underlying anatomy.
-        cropped_affine = update_affine_for_z_crop(reader.img.affine, z_start)
-        mask_img = nib.Nifti1Image(mask_cropped.astype(np.uint8), affine=cropped_affine)
+        if mask.shape != expected_shape:
+            raise RuntimeError(
+                f"compute_brain_mask returned shape {mask.shape}, expected {expected_shape}. "
+                "Bug in masks.compute_brain_mask."
+            )
+        mask_img = nib.Nifti1Image(mask.astype(np.uint8), affine=reader.img.affine)
         mask_abs.parent.mkdir(parents=True, exist_ok=True)
         nib.save(mask_img, str(mask_abs))
-        logger.info(
-            f"  Wrote mask {mask_rel} (shape {expected_cropped_shape}, z_start={z_start})"
-        )
+        logger.info(f"  Wrote mask {mask_rel} (shape {expected_shape})")
 
-    # norm_ref: same brain voxels whether we use native+native or cropped+cropped,
-    # because the mask's brain bbox is fully inside the crop window. Use
-    # cropped versions for consistency with what the Dataset will serve.
-    mean_cropped = crop_z(mean_vol, z_start, target_z)
-    norm_ref = compute_norm_ref(mean_cropped, mask_cropped)
-    # tSNR from the same already-loaded 4D buffer; one disk read total.
-    data_cropped = crop_z(full, z_start, target_z)
-    tsnr = compute_tsnr_from_data(data_cropped, mask_cropped)
-    frac = mask_fraction(mask_cropped)
+    # norm_ref + tSNR over the in-brain voxels at native shape (no crop).
+    norm_ref = compute_norm_ref(mean_vol, mask)
+    tsnr = compute_tsnr_from_data(full, mask)
+    frac = mask_fraction(mask)
 
-    # Sanity warning. With z-only cropping the denominator changes slightly
-    # (we removed non-brain z-slices), but ~0.2-0.4 is still the expected
-    # range for whole-brain BOLD masks. >0.55 still indicates contamination.
     if frac > 0.55:
         logger.warning(
             f"  mask_fraction={frac:.3f} for {run_id} is suspiciously high "
@@ -187,7 +202,6 @@ def process_run(
 
     return RunMetadata(
         mask_path=mask_rel,
-        z_start=z_start,
         norm_ref=norm_ref,
         tsnr_mean_in_brain=tsnr,
         mask_fraction=frac,
@@ -206,10 +220,9 @@ def compute_all(
     Args:
         manifest_path: path to manifest JSON to read and update.
         derivatives_dir: where to write brain masks.
-        target_z: z-axis target. If None (default), auto-detect as the smallest
-            observed native z across runs (so no run needs padding). xy is not
-            cropped or padded.
-        overwrite: recompute masks even if they already exist.
+        target_z: required uniform z dimension. If None, read from manifest's
+            `require_z` field. Mismatch with the manifest's value is an error.
+        overwrite: recompute masks/metadata even if already complete on disk.
         mask_method: "auto", "synthstrip", or "percentile". See masks.py.
     """
     manifest = load_manifest(manifest_path)
@@ -217,38 +230,54 @@ def compute_all(
     derivatives_dir = Path(derivatives_dir).resolve()
     derivatives_dir.mkdir(parents=True, exist_ok=True)
 
-    # Native shapes from the manifest. (build_manifest stores 4D shape; first 3
-    # are spatial.)
+    if not manifest["runs"]:
+        raise RuntimeError(
+            "Manifest contains zero runs. Stage 1 may have dropped everything "
+            "due to require_z; check the bids root and the require-z value."
+        )
+
+    # Reconcile target_z with manifest's require_z (set at stage 1).
+    manifest_require_z = manifest.get("require_z")
+    if target_z is None:
+        if manifest_require_z is None:
+            # Old or hand-crafted manifest with no require_z. Infer from runs.
+            zs = sorted({tuple(r["shape"][:3])[2] for r in manifest["runs"]})
+            if len(zs) != 1:
+                raise ValueError(
+                    f"Manifest has runs with mixed z values {zs} and no require_z field. "
+                    "Re-run the manifest stage with --require-z, or pass --target-z explicitly."
+                )
+            target_z = zs[0]
+        else:
+            target_z = manifest_require_z
+    elif manifest_require_z is not None and manifest_require_z != target_z:
+        raise ValueError(
+            f"--target-z={target_z} disagrees with manifest's require_z={manifest_require_z}. "
+            "These must match. Re-run the manifest stage if you want a different z."
+        )
+
+    # Validate every run conforms.
     native_shapes = [tuple(r["shape"][:3]) for r in manifest["runs"]]
+    bad = [(r["run_id"], s) for r, s in zip(manifest["runs"], native_shapes) if s[2] != target_z]
+    if bad:
+        preview = ", ".join(f"{rid}(z={s[2]})" for rid, s in bad[:3])
+        raise ValueError(
+            f"{len(bad)} run(s) in the manifest don't match target_z={target_z}: {preview}"
+            f"{'...' if len(bad) > 3 else ''}. Manifest stage failed to filter."
+        )
     xs = {s[0] for s in native_shapes}
     ys = {s[1] for s in native_shapes}
-    zs = sorted({s[2] for s in native_shapes})
     if len(xs) > 1 or len(ys) > 1:
         raise ValueError(
-            f"Non-uniform xy across runs (x={xs}, y={ys}). The current "
-            "z-only crop pipeline assumes uniform xy. xy-cropping is not "
-            "implemented; talk to the data pipeline owner before adding it."
+            f"Non-uniform xy across runs (x={xs}, y={ys}). "
+            "This pipeline assumes uniform spatial shape."
         )
     native_x, native_y = next(iter(xs)), next(iter(ys))
-
-    if target_z is None:
-        target_z = min(zs)
-        logger.info(
-            f"target_z auto-detected as {target_z} (min z across {len(native_shapes)} runs)"
-        )
-    else:
-        if target_z > min(zs):
-            raise ValueError(
-                f"--target-z={target_z} exceeds the smallest native z "
-                f"({min(zs)} for at least one run). Cropping cannot grow "
-                "volumes. Lower target_z or remove the offending run."
-            )
-
     target_shape = (native_x, native_y, target_z)
+
     logger.info(f"Processing {manifest['n_runs']} runs from {bids_root}")
     logger.info(f"Writing derivatives to {derivatives_dir}")
-    logger.info(f"Target shape (X, Y, Z_target): {target_shape}")
-    logger.info(f"Native z values seen: {zs}")
+    logger.info(f"Target shape (X, Y, Z): {target_shape}")
     logger.info(f"Mask method: {mask_method}")
 
     for i, entry in enumerate(manifest["runs"], start=1):
@@ -264,14 +293,15 @@ def compute_all(
             continue
 
         entry["mask_path"] = metadata.mask_path
-        entry["z_start"] = metadata.z_start
         entry["norm_ref"] = metadata.norm_ref
         entry["tsnr_mean_in_brain"] = metadata.tsnr_mean_in_brain
         entry["mask_fraction"] = metadata.mask_fraction
         # Clear any old error key from a prior failed run.
         entry.pop("metadata_error", None)
+        # Drop any z_start left over from old z_crop manifests.
+        entry.pop("z_start", None)
         logger.info(
-            f"  z_start={metadata.z_start}  norm_ref={metadata.norm_ref:.1f}  "
+            f"  norm_ref={metadata.norm_ref:.1f}  "
             f"tSNR={metadata.tsnr_mean_in_brain:.1f}  "
             f"mask_frac={metadata.mask_fraction:.3f}"
         )
@@ -279,7 +309,7 @@ def compute_all(
     manifest["derivatives_dir"] = str(derivatives_dir)
     manifest["target_shape"] = list(target_shape)
     manifest["target_z"] = int(target_z)
-    manifest["pipeline"] = "z_crop"  # marker so Datasets can detect old manifests
+    manifest["pipeline"] = PIPELINE_MARKER
 
     # Atomic write: a SIGKILL or disk-full mid-write must not corrupt the
     # existing manifest (which may have hours of mask computation behind it).
@@ -296,31 +326,23 @@ def _cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True, help="Path to manifest JSON")
     parser.add_argument(
-        "--derivatives-dir",
-        type=Path,
-        required=True,
+        "--derivatives-dir", type=Path, required=True,
         help="Directory to write brain masks and other derivatives into",
     )
     parser.add_argument(
-        "--target-z",
-        type=int,
-        default=None,
-        help="Target z dimension after cropping. Default: auto (smallest observed "
-             "native z across runs). Must be <= the smallest native z; cannot grow.",
+        "--target-z", type=int, default=None,
+        help="Expected uniform z dimension. Default: read from manifest's "
+             "`require_z` field. Must match the manifest if both are set.",
     )
     parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Recompute masks even if they already exist on disk",
+        "--overwrite", action="store_true",
+        help="Recompute masks/metadata even if already complete on disk.",
     )
     parser.add_argument(
-        "--mask-method",
-        choices=["auto", "synthstrip", "percentile"],
-        default="auto",
+        "--mask-method", choices=["auto", "synthstrip", "percentile"], default="auto",
         help="Brain masking method. 'auto' (default) prefers synthstrip if "
              "installed and falls back to percentile with a warning. "
-             "'synthstrip' requires mri_synthstrip / synthstrip-docker / "
-             "synthstrip-singularity on PATH; raises if missing. "
+             "'synthstrip' raises if no synthstrip executable is found. "
              "'percentile' uses pure-Python intensity thresholding (imperfect).",
     )
     parser.add_argument("--verbose", action="store_true")

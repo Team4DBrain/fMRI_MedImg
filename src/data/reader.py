@@ -53,7 +53,14 @@ class VolumeReader:
         self.n_volumes: int = shape[-1]
 
     def read_volume(self, t: int) -> np.ndarray:
-        """Read a single 3D volume at timepoint t. Returns array in native dtype (usually int16)."""
+        """Read a single 3D volume at timepoint t.
+
+        Returns the array as nibabel produces it. That is usually the file's
+        on-disk dtype (e.g., int16 for IBC), but if the NIfTI header has
+        scl_slope != 1 or scl_inter != 0 nibabel applies the rescaling and
+        returns float64. The dataset path explicitly casts to float32 before
+        normalization, so the dtype variability does not propagate downstream.
+        """
         if not (0 <= t < self.n_volumes):
             raise IndexError(f"t={t} out of range [0, {self.n_volumes})")
         # .dataobj supports numpy-style slicing without decompressing the full file
@@ -65,6 +72,9 @@ class VolumeReader:
 
         Use this for any contiguous span instead of looping read_volume — even
         with indexed_gzip, one range read is faster than N independent reads.
+
+        Dtype follows the same rule as `read_volume`: native on-disk dtype
+        normally, float64 if NIfTI rescaling slopes are set.
         """
         if not (0 <= t_start < t_end <= self.n_volumes):
             raise IndexError(

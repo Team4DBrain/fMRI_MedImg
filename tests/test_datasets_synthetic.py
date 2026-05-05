@@ -1,11 +1,12 @@
-"""End-to-end Dataset tests on synthetic data, z_crop pipeline.
+"""End-to-end Dataset tests on synthetic data, no_crop_v1 pipeline.
 
-Synthetic IBC-shaped runs with NON-uniform z (some 24, some 28). We expect:
-  - target_z auto-detected to min (24)
-  - per-run z_start computed and stored in manifest
-  - all served samples at (X, Y, 24)
+Synthetic IBC-shaped runs with uniform z (require_z screens out non-conforming
+runs at the manifest stage). We expect:
+  - all served samples at the manifest's target_shape
+  - manifest pipeline marker == 'no_crop_v1'
   - SR scale sanity (regression for the inverted-scale bug)
   - mask cache returns clones, missing files fail fast, etc.
+  - non-conforming z runs are dropped at manifest build with a warning
 """
 
 from __future__ import annotations
@@ -26,7 +27,10 @@ from src.data.datasets import (
     SpatialSRDataset,
     TemporalSRDataset,
 )
-from src.data.degradation_spatial import make_spatial_degradation
+from src.data.degradation_spatial import (
+    SpatialDegradation,
+    make_spatial_degradation,
+)
 from src.data.manifest import build_manifest, write_manifest
 
 
@@ -46,7 +50,6 @@ def _make_synthetic_bids(root, subject="01", session="00", task="Synth",
     name = f"sub-{subject}_ses-{session}_task-{task}_dir-{direction}_bold.nii.gz"
     path = func_dir / name
 
-    # Smooth blob at run-specific z-position so different runs need different z_start.
     seed = _stable_seed(name)
     rng = np.random.default_rng(seed)
     data = np.zeros(shape + (n_vols,), dtype=np.int16)
@@ -64,54 +67,116 @@ def _make_synthetic_bids(root, subject="01", session="00", task="Synth",
     return path
 
 
+# ---------------------------------------------------------------------------
+# Fixture: uniform z=24, three subjects. The shared "happy-path" pipeline.
+# ---------------------------------------------------------------------------
+
+UNIFORM_Z = 24
+TARGET_SHAPE = (32, 32, UNIFORM_Z)
+
+
 @pytest.fixture
 def synthetic_pipeline(tmp_path):
-    """Synthetic dataset with NON-uniform z. Returns (manifest_path, target_z)."""
+    """Synthetic dataset with uniform z=24. Returns (manifest_path, target_z)."""
     bids_root = tmp_path / "bids"
     out_dir = tmp_path / "out"
     bids_root.mkdir()
     out_dir.mkdir()
 
-    # 3 subjects: two with z=28, one with z=24. target_z should auto = 24.
-    _make_synthetic_bids(bids_root, subject="01", n_vols=10, shape=(32, 32, 28))
-    _make_synthetic_bids(bids_root, subject="02", n_vols=10, shape=(32, 32, 28))
-    _make_synthetic_bids(bids_root, subject="03", n_vols=10, shape=(32, 32, 24))
+    _make_synthetic_bids(bids_root, subject="01", n_vols=10, shape=TARGET_SHAPE)
+    _make_synthetic_bids(bids_root, subject="02", n_vols=10, shape=TARGET_SHAPE)
+    _make_synthetic_bids(bids_root, subject="03", n_vols=10, shape=TARGET_SHAPE)
 
-    entries = build_manifest(bids_root)
+    entries = build_manifest(bids_root, require_z=UNIFORM_Z)
     manifest_path = out_dir / "manifest.json"
-    write_manifest(entries, bids_root, manifest_path)
+    write_manifest(entries, bids_root, manifest_path, require_z=UNIFORM_Z)
 
     compute_all(
         manifest_path,
         derivatives_dir=out_dir,
-        target_z=None,            # auto -> 24
+        target_z=UNIFORM_Z,
         mask_method="percentile",
     )
 
-    return manifest_path, 24
+    return manifest_path, UNIFORM_Z
 
 
-def test_target_z_auto_detected_to_min(synthetic_pipeline):
-    manifest_path, target_z = synthetic_pipeline
+# ---------------------------------------------------------------------------
+# Manifest / pipeline marker
+# ---------------------------------------------------------------------------
+
+def test_manifest_marker_is_no_crop_v1(synthetic_pipeline):
+    manifest_path, _ = synthetic_pipeline
     with open(manifest_path) as f:
         m = json.load(f)
-    assert m["target_z"] == target_z
-    assert m["target_shape"] == [32, 32, 24]
-    assert m["pipeline"] == "z_crop"
+    assert m["pipeline"] == "no_crop_v1"
+    assert m["target_z"] == UNIFORM_Z
+    assert m["target_shape"] == list(TARGET_SHAPE)
+    assert m["require_z"] == UNIFORM_Z
 
 
-def test_per_run_z_start_in_manifest(synthetic_pipeline):
+def test_runs_have_no_z_start(synthetic_pipeline):
+    """no_crop_v1 manifest entries must NOT carry z_start (legacy field)."""
     manifest_path, _ = synthetic_pipeline
     with open(manifest_path) as f:
         m = json.load(f)
     for r in m["runs"]:
-        assert "z_start" in r
-        # Run with native z=24 must have z_start=0 (no cropping possible)
-        if r["shape"][2] == 24:
-            assert r["z_start"] == 0
+        assert "z_start" not in r, f"{r['run_id']} unexpectedly carries z_start"
 
 
-def test_denoising_serves_target_z_shape(synthetic_pipeline):
+# ---------------------------------------------------------------------------
+# Manifest filtering: non-conforming z runs are dropped
+# ---------------------------------------------------------------------------
+
+def test_manifest_drops_nonconforming_z(tmp_path, caplog):
+    """Mix of z=24 and z=28 runs. require_z=24 should drop the z=28 ones."""
+    bids_root = tmp_path / "bids"
+    bids_root.mkdir()
+    _make_synthetic_bids(bids_root, subject="01", shape=(32, 32, 24))
+    _make_synthetic_bids(bids_root, subject="02", shape=(32, 32, 24))
+    _make_synthetic_bids(bids_root, subject="03", shape=(32, 32, 28))
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        entries = build_manifest(bids_root, require_z=24)
+
+    assert len(entries) == 2
+    assert all(e.shape[2] == 24 for e in entries)
+    assert any("Dropping" in r.message and "z=28" in r.message for r in caplog.records)
+
+
+def test_manifest_no_filter_keeps_all_z(tmp_path):
+    """require_z=None disables filtering — all runs survive."""
+    bids_root = tmp_path / "bids"
+    bids_root.mkdir()
+    _make_synthetic_bids(bids_root, subject="01", shape=(32, 32, 24))
+    _make_synthetic_bids(bids_root, subject="02", shape=(32, 32, 28))
+
+    entries = build_manifest(bids_root, require_z=None)
+    assert len(entries) == 2
+
+
+def test_compute_all_rejects_target_z_mismatch(tmp_path):
+    """If manifest's require_z disagrees with the explicit target_z, raise."""
+    bids_root = tmp_path / "bids"
+    out_dir = tmp_path / "out"
+    bids_root.mkdir()
+    out_dir.mkdir()
+    _make_synthetic_bids(bids_root, subject="01", shape=(32, 32, 24))
+    entries = build_manifest(bids_root, require_z=24)
+    manifest_path = out_dir / "manifest.json"
+    write_manifest(entries, bids_root, manifest_path, require_z=24)
+
+    with pytest.raises(ValueError, match="disagrees"):
+        compute_all(manifest_path, derivatives_dir=out_dir, target_z=28,
+                    mask_method="percentile")
+
+
+# ---------------------------------------------------------------------------
+# Dataset behavior
+# ---------------------------------------------------------------------------
+
+def test_denoising_serves_target_shape(synthetic_pipeline):
     manifest_path, target_z = synthetic_pipeline
 
     def add_noise(clean):
@@ -124,14 +189,39 @@ def test_denoising_serves_target_z_shape(synthetic_pipeline):
     assert sample["target"].shape == expected
     assert sample["mask"].shape == expected
     assert sample["mask"].dtype == torch.float32
-    # Mask values should be 0 or 1
     mvals = set(sample["mask"].unique().tolist())
     assert mvals.issubset({0.0, 1.0})
 
 
+def test_denoising_validates_degrade_fn_output(synthetic_pipeline):
+    """A buggy degrade_fn that returns the wrong shape must raise."""
+    manifest_path, _ = synthetic_pipeline
+
+    def bad_degrade(clean):
+        # Drop a slice — wrong shape
+        return clean[..., :-1]
+
+    ds = DenoisingDataset(manifest_path, degrade_fn=bad_degrade)
+    with pytest.raises(RuntimeError, match="DenoisingDataset.*shape"):
+        ds[0]
+
+
+def test_denoising_rejects_nonfinite_degrade_fn(synthetic_pipeline):
+    """A degrade_fn that produces NaN/Inf must raise (not silently propagate)."""
+    manifest_path, _ = synthetic_pipeline
+
+    def nan_degrade(clean):
+        out = clean.copy()
+        out.flat[0] = np.nan
+        return out
+
+    ds = DenoisingDataset(manifest_path, degrade_fn=nan_degrade)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        ds[0]
+
+
 def test_spatial_sr_scale_sanity(synthetic_pipeline):
-    """Regression test for the inverted-scale bug. After normalize, brain
-    voxel mean should be near 1.0 in both LR and HR."""
+    """Regression for the inverted-scale bug: LR brain mean ≈ HR brain mean."""
     manifest_path, _ = synthetic_pipeline
 
     degrade = make_spatial_degradation(source_voxel_mm=1.5, target_voxel_mm=3.0)
@@ -147,6 +237,35 @@ def test_spatial_sr_scale_sanity(synthetic_pipeline):
     )
 
 
+def test_spatial_sr_default_degradation_picklable(synthetic_pipeline):
+    """SpatialDegradation must be picklable so multiprocessing spawn workers
+    can transfer it. Closures from a factory cannot. This is a regression
+    test for the closure-vs-class refactor."""
+    import pickle
+    manifest_path, _ = synthetic_pipeline
+    ds = SpatialSRDataset(manifest_path)
+    assert isinstance(ds.degrade_fn, SpatialDegradation)
+    # Round-trip through pickle.
+    roundtrip = pickle.loads(pickle.dumps(ds.degrade_fn))
+    assert isinstance(roundtrip, SpatialDegradation)
+    # Behaves identically.
+    sample_arr = np.full(TARGET_SHAPE, 100.0, dtype=np.float32)
+    out_a = ds.degrade_fn(sample_arr)
+    out_b = roundtrip(sample_arr)
+    np.testing.assert_array_equal(out_a, out_b)
+
+
+def test_spatial_sr_no_voxel_mm_attrs(synthetic_pipeline):
+    """SpatialSRDataset should NOT expose source_voxel_mm/target_voxel_mm as
+    attrs — they would silently lie when a custom degrade_fn is passed.
+    lr_shape is the canonical attr."""
+    manifest_path, _ = synthetic_pipeline
+    ds = SpatialSRDataset(manifest_path)
+    assert hasattr(ds, "lr_shape")
+    assert not hasattr(ds, "source_voxel_mm")
+    assert not hasattr(ds, "target_voxel_mm")
+
+
 def test_temporal_sr_basic(synthetic_pipeline):
     manifest_path, target_z = synthetic_pipeline
     ds = TemporalSRDataset(manifest_path, gap=1)
@@ -154,6 +273,36 @@ def test_temporal_sr_basic(synthetic_pipeline):
     assert sample["input"].shape == (2, 32, 32, target_z)
     assert sample["target"].shape == (1, 32, 32, target_z)
     assert sample["mask"].shape == (1, 32, 32, target_z)
+
+
+def test_temporal_sr_gap2_uses_single_read(synthetic_pipeline, monkeypatch):
+    """For gap>=2, TemporalSR should issue a single _read_range call, not
+    three separate _read_volume calls."""
+    manifest_path, _ = synthetic_pipeline
+    ds = TemporalSRDataset(manifest_path, gap=2)
+
+    range_calls = []
+    volume_calls = []
+    orig_range = ds._read_range
+    orig_volume = ds._read_volume
+
+    def spy_range(run_idx, t_start, t_end):
+        range_calls.append((run_idx, t_start, t_end))
+        return orig_range(run_idx, t_start, t_end)
+
+    def spy_volume(run_idx, t):
+        volume_calls.append((run_idx, t))
+        return orig_volume(run_idx, t)
+
+    monkeypatch.setattr(ds, "_read_range", spy_range)
+    monkeypatch.setattr(ds, "_read_volume", spy_volume)
+
+    _ = ds[0]
+    assert len(range_calls) == 1, f"expected 1 range read, got {len(range_calls)}"
+    assert len(volume_calls) == 0, (
+        f"expected 0 per-volume reads with single-range optimization, "
+        f"got {len(volume_calls)}"
+    )
 
 
 def test_temporal_sr_drops_runs_too_short(synthetic_pipeline):
@@ -193,6 +342,27 @@ def test_mask_cache_returns_clones(synthetic_pipeline):
     assert s2["mask"].sum().item() == original_sum
 
 
+def test_mask_cache_is_bounded(synthetic_pipeline):
+    """The bounded cache caps memory: with cache_size=1 and >1 runs, the cache
+    should evict between accesses but still serve consistent values."""
+    manifest_path, _ = synthetic_pipeline
+    ds = DenoisingDataset(manifest_path, degrade_fn=lambda x: x, mask_cache_size=1)
+
+    # Touch every run to force eviction churn.
+    seen_sums = {}
+    for run_idx, run in enumerate(ds.runs):
+        m = ds._get_hr_mask(run_idx)
+        seen_sums[run["run_id"]] = m.sum().item()
+
+    # Cache should hold AT MOST one entry, despite touching 3 runs.
+    assert len(ds._mask_cache._d) == 1
+
+    # Repeat access — values must still be correct (not stale clones).
+    for run_idx, run in enumerate(ds.runs):
+        m = ds._get_hr_mask(run_idx)
+        assert m.sum().item() == seen_sums[run["run_id"]]
+
+
 def test_check_files_exist_catches_missing(synthetic_pipeline):
     manifest_path, _ = synthetic_pipeline
     with open(manifest_path) as f:
@@ -204,49 +374,69 @@ def test_check_files_exist_catches_missing(synthetic_pipeline):
         DenoisingDataset(manifest_path, degrade_fn=lambda x: x)
 
 
-def test_old_padding_manifest_rejected(tmp_path, synthetic_pipeline):
-    """A manifest without pipeline=z_crop should be rejected."""
+def test_old_z_crop_manifest_rejected(synthetic_pipeline):
+    """A manifest from the old z_crop pipeline must be rejected with a clear
+    message that points at re-running the build."""
     manifest_path, _ = synthetic_pipeline
     with open(manifest_path) as f:
         m = json.load(f)
-    del m["pipeline"]
+    m["pipeline"] = "z_crop"
     with open(manifest_path, "w") as f:
         json.dump(m, f)
-    with pytest.raises(RuntimeError, match="z_crop"):
+    with pytest.raises(RuntimeError, match="no_crop_v1"):
         DenoisingDataset(manifest_path, degrade_fn=lambda x: x)
 
 
-def test_target_z_too_large_rejected(tmp_path):
-    """Asking for target_z > min native z must fail loudly."""
-    bids_root = tmp_path / "bids"
-    out_dir = tmp_path / "out"
-    bids_root.mkdir()
-    out_dir.mkdir()
-    _make_synthetic_bids(bids_root, subject="01", shape=(32, 32, 24))
-    _make_synthetic_bids(bids_root, subject="02", shape=(32, 32, 28))
-    entries = build_manifest(bids_root)
-    manifest_path = out_dir / "manifest.json"
-    write_manifest(entries, bids_root, manifest_path)
-    with pytest.raises(ValueError, match="exceeds the smallest native z"):
-        compute_all(manifest_path, derivatives_dir=out_dir, target_z=26,
-                    mask_method="percentile")
-
-
-def test_mask_z_bbox_centered_per_run(synthetic_pipeline):
-    """The cropped mask should contain the brain. We synthesized blobs at
-    slightly different z-centers per run, so z_start should differ."""
+def test_inconsistent_run_shape_rejected(synthetic_pipeline):
+    """A manifest where some run's shape disagrees with target_shape is
+    rejected at Dataset construction (defends against hand-edited manifests)."""
     manifest_path, _ = synthetic_pipeline
     with open(manifest_path) as f:
         m = json.load(f)
-    z_starts = [r["z_start"] for r in m["runs"]]
-    # All runs that need cropping (native z=28, target=24) should have z_start
-    # somewhere reasonable. Run with native=24 should have z_start=0.
-    # We don't assert exact values — synthetic seeded blobs vary.
-    for r in m["runs"]:
-        if r["shape"][2] == 24:
-            assert r["z_start"] == 0
-        else:
-            assert 0 <= r["z_start"] <= r["shape"][2] - 24
+    # Tamper: claim run 0 has a different z than target_shape.
+    bad_shape = list(m["runs"][0]["shape"])
+    bad_shape[2] = 99
+    m["runs"][0]["shape"] = bad_shape
+    with open(manifest_path, "w") as f:
+        json.dump(m, f)
+    with pytest.raises(RuntimeError, match="target_shape"):
+        DenoisingDataset(manifest_path, degrade_fn=lambda x: x)
+
+
+# ---------------------------------------------------------------------------
+# Idempotent fast path: re-running compute_all without --overwrite should not
+# re-read the 4D files.
+# ---------------------------------------------------------------------------
+
+def test_compute_all_skips_when_metadata_complete(synthetic_pipeline, monkeypatch):
+    """Second call to compute_all (without overwrite) must not call read_full."""
+    from src.data import compute_metadata as cm
+    from src.data import reader as reader_mod
+
+    manifest_path, _ = synthetic_pipeline
+    derivatives_dir = manifest_path.parent
+
+    # Sanity: first pass already populated metadata.
+    with open(manifest_path) as f:
+        m = json.load(f)
+    assert all("norm_ref" in r for r in m["runs"])
+
+    read_full_calls = {"n": 0}
+    orig = reader_mod.VolumeReader.read_full
+
+    def counting_read_full(self, *a, **kw):
+        read_full_calls["n"] += 1
+        return orig(self, *a, **kw)
+
+    monkeypatch.setattr(reader_mod.VolumeReader, "read_full", counting_read_full)
+
+    cm.compute_all(manifest_path, derivatives_dir=derivatives_dir,
+                   target_z=UNIFORM_Z, mask_method="percentile")
+
+    assert read_full_calls["n"] == 0, (
+        f"compute_all re-read {read_full_calls['n']} 4D files even though "
+        "metadata was complete and --overwrite was False"
+    )
 
 
 if __name__ == "__main__":
