@@ -10,21 +10,21 @@ Usage:
         --bids-root /path/to/ibc_raw \\
         --out-dir /path/to/derivatives
 
-    # Override z target (default: auto = smallest observed native z)
+    # Override expected z (default 93 — drops the IBC z=84 ses-00/01 anomaly)
     python -m src.data.build \\
         --bids-root /path/to/ibc_raw \\
         --out-dir /path/to/derivatives \\
-        --target-z 84
+        --target-z 93
 
 The manifest goes to `<out-dir>/manifest.json` and the masks go to
 `<out-dir>/masks/`.
 
-Pipeline notes (option B, z-only crop):
-  - xy is left at native (IBC: 128×128). Not configurable; the underlying
-    compute_metadata raises if any run has a different xy.
-  - z is cropped per-run to a fixed `target_z`, centered on the brain's
-    z-bbox. target_z auto-detects to min(native_z) across the manifest's
-    runs unless --target-z is passed explicitly.
+Pipeline notes (no_crop_v1):
+  - target_z is fixed across the dataset; runs with non-conforming z are
+    dropped at the manifest stage (with a logged warning).
+  - xy is left at native (IBC: 128×128). compute_metadata raises if any
+    surviving run has different xy.
+  - No cropping. The mask saved on disk is at native (= target) shape.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ import sys
 from pathlib import Path
 
 from .compute_metadata import compute_all
-from .manifest import build_manifest, write_manifest
+from .manifest import DEFAULT_REQUIRE_Z, build_manifest, write_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -43,19 +43,20 @@ logger = logging.getLogger(__name__)
 def build_pipeline(
     bids_root: Path,
     out_dir: Path,
-    target_z: int | None = None,
+    target_z: int = DEFAULT_REQUIRE_Z,
     mask_method: str = "auto",
     overwrite: bool = False,
 ) -> None:
-    """Run both stages: manifest build, then metadata compute.
+    """Run both stages: manifest build (filtering by target_z), then metadata compute.
 
     Args:
         bids_root: where the raw data lives (read-only).
         out_dir: where to write manifest.json and the masks/ subdir.
-        target_z: z-axis crop target. If None, auto-detect as the smallest
-            observed native z across runs.
+        target_z: required uniform z dimension. Runs that don't match are
+            dropped at the manifest stage. Default 93 (IBC standard).
         mask_method: "auto", "synthstrip", or "percentile".
-        overwrite: passed through to compute_metadata; recompute existing masks.
+        overwrite: passed through to compute_metadata; recompute existing
+            masks/metadata.
     """
     bids_root = Path(bids_root).resolve()
     out_dir = Path(out_dir).resolve()
@@ -64,22 +65,24 @@ def build_pipeline(
 
     # Stage 1
     logger.info("=" * 60)
-    logger.info("Stage 1: building manifest")
+    logger.info("Stage 1: building manifest (require_z=%d)", target_z)
     logger.info("=" * 60)
-    entries = build_manifest(bids_root)
+    entries = build_manifest(bids_root, require_z=target_z)
     if not entries:
         logger.error(
-            f"No BOLD files found under {bids_root}. "
-            f"Check the path and that files match the BIDS naming pattern."
+            "No conforming BOLD files found under %s. Either nothing matched "
+            "the BIDS naming pattern, or every file was filtered out by "
+            "require_z=%d. Check the path and the z dimension of your data.",
+            bids_root, target_z,
         )
         sys.exit(1)
-    write_manifest(entries, bids_root, manifest_path)
+    write_manifest(entries, bids_root, manifest_path, require_z=target_z)
     logger.info(f"Manifest written: {manifest_path} ({len(entries)} runs)")
 
     # Stage 2
     logger.info("")
     logger.info("=" * 60)
-    logger.info("Stage 2: computing metadata (mask, z_start, norm_ref, tSNR)")
+    logger.info("Stage 2: computing metadata (mask, norm_ref, tSNR)")
     logger.info("=" * 60)
     compute_all(
         manifest_path,
@@ -106,10 +109,10 @@ def _cli() -> None:
         help="Where to write manifest.json and masks/ subdir.",
     )
     parser.add_argument(
-        "--target-z", type=int, default=None,
-        help="Target z dimension after cropping. Default: auto (smallest "
-             "observed native z across runs). Must be <= the smallest native z; "
-             "cannot grow.",
+        "--target-z", type=int, default=DEFAULT_REQUIRE_Z,
+        help=f"Required uniform z dimension. Default: {DEFAULT_REQUIRE_Z} "
+             "(IBC standard; drops the z=84 ses-00/01 anomaly). "
+             "Runs not matching this z are logged and dropped at stage 1.",
     )
     parser.add_argument(
         "--mask-method",
@@ -119,7 +122,7 @@ def _cli() -> None:
     )
     parser.add_argument(
         "--overwrite", action="store_true",
-        help="Recompute masks even if they already exist on disk.",
+        help="Recompute masks/metadata even if already complete on disk.",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

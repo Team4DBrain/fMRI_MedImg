@@ -25,9 +25,18 @@ Mask derivation:
   from the HR mask at runtime via spatial downsampling. We don't k-space-
   truncate the mask itself — masks are metadata, not signal, and we want a
   clean boolean mask without ringing artifacts.
+
+Picklability note:
+  `make_spatial_degradation` returns a SpatialDegradation INSTANCE, not a
+  closure. Closures from factory functions cannot be pickled by stock
+  `pickle`, which breaks `multiprocessing` `spawn` start method (used on
+  macOS/Windows or whenever `mp.set_start_method('spawn')` is invoked).
+  Top-level callable classes pickle cleanly.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 from scipy import ndimage
@@ -53,10 +62,20 @@ def kspace_downsample_3d(
       2. fftshift to put DC at the center.
       3. Crop the central target_shape region of k-space.
       4. Apply a Hamming apodization within the cropped region (if apodize=True).
-      5. ifftshift, IFFT, take magnitude. Scale to compensate for size change.
+      5. ifftshift, IFFT, take REAL part. Scale to compensate for size change.
 
     The output has shape `target_shape`, NOT the input shape. The model is
     responsible for upsampling.
+
+    Real part vs. magnitude:
+      For an even target M on any input N, the natural central crop spans
+      frequencies [-M/2, M/2 - 1] — asymmetric about DC, missing +M/2. On
+      real-valued input this breaks Hermitian symmetry and the IFFT picks up
+      nonzero imaginary parts (energy folded in from the missing Nyquist bin).
+      `np.abs` would inflate the magnitude on non-DC content; `.real` cleanly
+      drops that fold-back and matches the band-limited downsample of a
+      Hermitian-symmetric crop. Apodization-induced sinc ringing can produce
+      small negative values, which `.real` honours and `np.abs` would lie about.
 
     Args:
         volume: 3D real-valued array (X, Y, Z).
@@ -94,7 +113,7 @@ def kspace_downsample_3d(
         window = _hamming_window_3d(target_shape)
         kspace_cropped = kspace_cropped * window
 
-    # Inverse FFT, take magnitude.
+    # Inverse FFT, take REAL part. See docstring for why .real (not np.abs).
     image = np.fft.ifftn(np.fft.ifftshift(kspace_cropped))
 
     # Scale compensation. np.fft.ifftn divides by the output size M, but the
@@ -104,7 +123,7 @@ def kspace_downsample_3d(
     # (A constant volume in must yield a near-constant volume out at the same
     # magnitude — see tests/test_degradation_spatial.py.)
     scale = np.prod(target_shape) / np.prod(full_shape)
-    return (np.abs(image) * scale).astype(np.float32)
+    return (image.real * scale).astype(np.float32)
 
 
 def voxel_size_to_target_shape(
@@ -160,20 +179,47 @@ def downsample_mask_to_lr(
     return soft >= threshold
 
 
+@dataclass
+class SpatialDegradation:
+    """Picklable callable that applies k-space-truncation degradation.
+
+    Stored as a top-level dataclass (not a closure) so that
+    multiprocessing's `spawn` start method, which requires every transferred
+    object to be picklable by name, can serialize it. Closures from a factory
+    function fail this requirement.
+
+    Use `make_spatial_degradation(...)` to construct one with the project's
+    standard defaults.
+
+    Attributes:
+        source_voxel_mm: source voxel size (e.g., 1.5 for IBC).
+        target_voxel_mm: simulated LR voxel size (must be > source).
+        apodize: if True, apply Hamming apodization in k-space (standard).
+    """
+
+    source_voxel_mm: float = 1.5
+    target_voxel_mm: float = 3.0
+    apodize: bool = True
+
+    def __call__(self, volume: np.ndarray) -> np.ndarray:
+        target_shape = voxel_size_to_target_shape(
+            volume.shape, self.source_voxel_mm, self.target_voxel_mm,
+        )
+        return kspace_downsample_3d(volume, target_shape, apodize=self.apodize)
+
+
 def make_spatial_degradation(
     source_voxel_mm: float = 1.5,
     target_voxel_mm: float = 3.0,
     apodize: bool = True,
-):
+) -> SpatialDegradation:
     """Build a degradation function compatible with SpatialSRDataset.
 
-    Returns a function that takes an HR 3D volume and returns the LR version
-    at the truncated shape.
+    Returns a SpatialDegradation instance (a picklable callable). Pass it as
+    the `degrade_fn=` arg to SpatialSRDataset.
     """
-    def degrade(volume: np.ndarray) -> np.ndarray:
-        target_shape = voxel_size_to_target_shape(
-            volume.shape, source_voxel_mm, target_voxel_mm
-        )
-        return kspace_downsample_3d(volume, target_shape, apodize=apodize)
-
-    return degrade
+    return SpatialDegradation(
+        source_voxel_mm=source_voxel_mm,
+        target_voxel_mm=target_voxel_mm,
+        apodize=apodize,
+    )

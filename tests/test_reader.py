@@ -69,7 +69,11 @@ def test_read_full_dtype(tmp_nii):
 def test_read_mean_matches_manual(tmp_nii):
     path, data = tmp_nii
     r = VolumeReader(path)
-    np.testing.assert_allclose(r.read_mean(), data.astype(np.float32).mean(axis=-1))
+    # Reference: float64 accumulator, then cast to float32 — matches the
+    # implementation. Using float32 throughout would diverge by ~1 ULP * N
+    # which slips past assert_allclose default rtol.
+    expected = data.astype(np.float64).mean(axis=-1).astype(np.float32)
+    np.testing.assert_allclose(r.read_mean(), expected)
 
 
 def test_get_reader_returns_same_instance(tmp_nii):

@@ -7,7 +7,7 @@ We're training three models that take "imperfect" fMRI scans and produce cleaner
 2. **Spatial SR model** — low-res (3mm) → high-res (1.5mm)
 3. **Temporal SR model** — interpolate a missing volume from neighbors
 
-This repo contains the **data pipeline** and a baseline **3D SR training stack** in `src/sr`.
+This repo currently contains the **data pipeline** only. Models will follow.
 
 ## What's in this repo
 
@@ -15,20 +15,17 @@ This repo contains the **data pipeline** and a baseline **3D SR training stack**
 src/data/
   build.py                # Wrapper: runs manifest + metadata in one go
   manifest.py             # Walk BIDS tree, parse filenames, build a JSON manifest
-  compute_metadata.py     # Compute brain mask + z_start + norm_ref + tSNR per run
+  compute_metadata.py     # Compute brain mask + norm_ref + tSNR per run
   reader.py               # Lazy 3D-volume access to 4D NIfTI files (with per-process cache)
   masks.py                # Brain masking: SynthStrip (preferred) or percentile fallback
   normalize.py            # Per-run scalar normalization (volume / norm_ref)
-  cropping.py             # Z-axis bbox-centered crop (option B)
-  padding.py              # (legacy utilities — pad/crop, kept for tests & callers)
+  cropping.py             # Z-axis bbox-centered crop — UNUSED in no_crop_v1, kept for tests
   datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR)
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
-  compare_masks.py        # Visualize percentile vs SynthStrip masks side by side
 
 tests/
-  test_cropping.py              # Z-bbox crop, affine update
+  test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
   test_degradation_spatial.py   # Unit tests incl. k-space scale regression
-  test_padding.py               # Pad-then-crop round-trip (legacy utility)
   test_reader.py                # VolumeReader and per-process cache
   test_datasets_synthetic.py    # End-to-end Datasets on a synthetic BIDS layout
 ```
@@ -62,23 +59,27 @@ python -m src.data.build \
 
 This produces:
 - `<out>/manifest.json` — one entry per BOLD run with shape + metadata
-  (including per-run `z_start` and top-level `target_z`)
-- `<out>/masks/*_mask.nii.gz` — per-run brain masks at `(X, Y, target_z)`,
-  with affine corrected for the z-shift
+  (top-level `target_shape`, `target_z`, `pipeline: "no_crop_v1"`, `require_z`)
+- `<out>/masks/*_mask.nii.gz` — per-run brain masks at `(X, Y, target_z)` =
+  the run's native shape (no cropping in this pipeline)
 
-Stage 1 (manifest build) runs in seconds. Stage 2 (metadata) reads each 4D file
-fully twice and is the slow part — expect ~10-30s per run.
+Stage 1 (manifest build) runs in seconds. Stage 2 (metadata) reads each 4D
+file fully once — typically ~5-15s per run, dominated by SynthStrip.
 
-`--target-z` is optional. By default it auto-detects to `min(native_z)` across
-runs (so no run ever needs padding — this is the "option B" cropping pipeline).
-You can pass an explicit value to be smaller; the script raises if you ask for
-a target_z larger than the smallest native run.
+`--target-z` is optional. By default it's `93` (IBC's standard slab) and any
+run whose native z differs is dropped at the manifest stage with a logged
+warning — this screens out the documented `z=84` anomaly in some IBC ses-00
+/ ses-01 sessions. Pass an explicit value if you want a different slab.
+Pass `--require-z 0` to the manifest stage if you want to keep every run
+regardless of z (and accept that compute_metadata will then refuse to run on
+a mixed-z manifest).
 
 `--mask-method`:
-- `auto` (default): uses SynthStrip if available on PATH; falls back to
-  percentile with a warning.
-- `synthstrip`: requires `mri_synthstrip`, `synthstrip-docker`, or
-  `synthstrip-singularity` on PATH; raises if missing.
+- `auto` (default): uses SynthStrip if any of `nipreps-synthstrip`,
+  `mri_synthstrip`, `synthstrip-docker`, or `synthstrip-singularity` is on
+  PATH; falls back to percentile with a warning.
+- `synthstrip`: requires one of those executables on PATH; raises if none
+  is found.
 - `percentile`: pure-Python intensity threshold + morphology. Works without
   any external tools but produces imperfect masks (includes some skull/scalp).
 
@@ -137,12 +138,12 @@ Each batch is a dict with:
 
 | key       | shape                  | meaning                                   |
 |-----------|------------------------|-------------------------------------------|
-| `input`   | `(B, 1, 64, 64, 42)`   | LR volume (3mm simulated acquisition)     |
-| `target`  | `(B, 1, 128, 128, 84)` | HR volume (1.5mm ground truth)            |
-| `mask_hr` | `(B, 1, 128, 128, 84)` | brain mask at HR — for HR-domain loss     |
-| `mask_lr` | `(B, 1, 64, 64, 42)`   | brain mask at LR — derived from `mask_hr` |
+| `input`   | `(B, 1, 64, 64, 46)`   | LR volume (3mm simulated acquisition)     |
+| `target`  | `(B, 1, 128, 128, 93)` | HR volume (1.5mm ground truth)            |
+| `mask_hr` | `(B, 1, 128, 128, 93)` | brain mask at HR — for HR-domain loss     |
+| `mask_lr` | `(B, 1, 64, 64, 46)`   | brain mask at LR — derived from `mask_hr` |
 
-(Z dimension shown is for `target_z=84`, the IBC default. If you set a
+(Z dimensions shown are for `target_z=93`, the IBC default. If you set a
 different `--target-z`, all the z values above scale accordingly. xy is
 always 128×128 / 64×64.)
 
@@ -187,9 +188,9 @@ Each batch:
 
 | key      | shape                  | meaning                              |
 |----------|------------------------|--------------------------------------|
-| `input`  | `(B, 1, 128, 128, 84)` | noisy volume (output of degrade_fn)  |
-| `target` | `(B, 1, 128, 128, 84)` | clean volume                         |
-| `mask`   | `(B, 1, 128, 128, 84)` | brain mask                           |
+| `input`  | `(B, 1, 128, 128, 93)` | noisy volume (output of degrade_fn)  |
+| `target` | `(B, 1, 128, 128, 93)` | clean volume                         |
+| `mask`   | `(B, 1, 128, 128, 93)` | brain mask                           |
 
 Both input and target are full-resolution. If you go noise2noise (where both
 sides are noisy and there's no "clean" target), the current API doesn't fit out
@@ -229,9 +230,9 @@ Each batch:
 
 | key      | shape                  | meaning                                     |
 |----------|------------------------|---------------------------------------------|
-| `input`  | `(B, 2, 128, 128, 84)` | two neighbors stacked: [t-gap, t+gap]       |
-| `target` | `(B, 1, 128, 128, 84)` | the "missing" middle volume at time t       |
-| `mask`   | `(B, 1, 128, 128, 84)` | brain mask                                  |
+| `input`  | `(B, 2, 128, 128, 93)` | two neighbors stacked: [t-gap, t+gap]       |
+| `target` | `(B, 1, 128, 128, 93)` | the "missing" middle volume at time t       |
+| `mask`   | `(B, 1, 128, 128, 93)` | brain mask                                  |
 
 ```python
 for batch in train_loader:
@@ -254,12 +255,12 @@ the group decides who's in which.
 
 - **Raw data only**, no preprocessing pipeline yet (no motion correction, no
   distortion correction). May add later.
-- **Z-only crop, no padding** (option B). xy is left at IBC's native 128×128.
-  z is cropped per-run to a dataset-wide `target_z` (default: smallest observed
-  native z), with the crop window centered on the brain's z-bbox. The brain
-  mask must be reasonable for the bbox to land on the brain — get SynthStrip
-  working before trusting any crop. The cropped mask's affine is updated so
-  external viewers (FSLeyes, ITK-SNAP) place it in world space correctly.
+- **No cropping, no padding** (the `no_crop_v1` pipeline). Every run is served
+  at its native shape (`128×128×93` for IBC). Runs whose native z differs from
+  `--target-z` are dropped at the manifest stage rather than reshaped — this
+  screens out the documented IBC `z=84` anomaly in some early sessions. The
+  `cropping.py` module is kept in the repo for tests but is not imported by
+  the live data path.
 - **Per-run scalar normalization** (`volume / norm_ref`). Brain voxels end up
   near 1.0, background near 0. Reversible. Not z-scored — preserves spatial
   contrast and BOLD temporal dynamics.
@@ -269,10 +270,11 @@ the group decides who's in which.
   Model is responsible for upsampling.
 - **Temporal SR has no separate degradation**. Sampling at gap=1 (predict t from
   t-1, t+1) IS the degradation — equivalent to half-rate acquisition.
-- **k-space LR scale**: `kspace_downsample_3d` scales the magnitude image by
-  `M/N` (output size / input size) to preserve mean intensity. There's a
-  regression test for this in `tests/test_degradation_spatial.py`; if you
-  touch the scale logic, run the tests.
+- **k-space LR scale**: `kspace_downsample_3d` takes the real part of the IFFT
+  (not magnitude — see the function's docstring for why) and scales by `M/N`
+  (output size / input size) to preserve mean intensity. There's a regression
+  test for this in `tests/test_degradation_spatial.py`; if you touch the scale
+  logic or the .real/.abs choice, run the tests.
 - **`indexed_gzip` is required** (pinned in `requirements.txt`). Without it,
   every random-access volume read decompresses the gzip stream from byte 0.
   nibabel picks it up automatically when present — no code change needed.
@@ -286,8 +288,9 @@ the group decides who's in which.
 ### Mask quality depends on which method runs
 Two backends, dispatched by `--mask-method`:
 - **SynthStrip** (preferred, default `auto`): DL-based, designed for cross-modality
-  EPI. Robust. Requires `mri_synthstrip`, `synthstrip-docker`, or
-  `synthstrip-singularity` on PATH.
+  EPI. Robust. Requires one of `nipreps-synthstrip` (pip-installable, lightest
+  — also needs the model weights file; see below), `mri_synthstrip` (full
+  FreeSurfer install), `synthstrip-docker`, or `synthstrip-singularity` on PATH.
 - **Percentile fallback**: pure Python, no external tools, but produces imperfect
   masks. Tends to include some skull/scalp; may carve cerebellum at high
   thresholds. Acceptable for code-correctness testing, not for final results.
@@ -309,47 +312,3 @@ non-brain tissue).
 Some IBC files are stored as int16, others as float32 (with ~20× larger raw
 intensities). This is not preprocessing — it's a storage-format difference
 across releases. Per-run normalization handles it cleanly.
-
-## Smoke test
-
-Optional end-to-end test on a small data subset, useful before running the full
-pipeline:
-
-```
-pip install -r requirements.txt
-python tests/test_data_local.py --bids-root <path/to/test/data> --target-z 93
-```
-
-
-Exercises manifest, metadata, all three Datasets, and DataLoader batching
-across runs of different native shapes.
-
-The test exercises manifest building, metadata computation, all three Datasets,
-and DataLoader batching across runs of different native shapes. Takes 10-15 min
-on a laptop with 9 IBC runs.
-
-## SR training and checks (current behavior)
-
-The SR entrypoint is `src/sr/run.py` (invoke with `python -m src.sr.run`) and supports checks, training, and inference:
-
-```bash
-python -m src.sr.run sanity --manifest-path ./manifest.json
-python -m src.sr.run overfit --overfit-steps 20 --manifest-path ./manifest.json
-python -m src.sr.run checks --overfit-steps 20 --manifest-path ./manifest.json
-python -m src.sr.run train --epochs 20 --model-name srcnn3d --manifest-path ./manifest.json
-python -m src.sr.run inference --checkpoint-path ./src/sr/runs/srcnn3d/20260501_145500/final.pt --visualize --visualize-input
-```
-
-Key SR defaults now include:
-
-- Config-driven model factory (`--model-name` with `srcnn3d` or `rcan3d`)
-- Deterministic policy enabled by default (`--no-deterministic` to disable)
-- Seeded dataset split and DataLoader generators for stable ordering
-- Finite-loss fail-fast guard (`--no-strict-finite-loss` to disable)
-- Atomic checkpoint writes (`*.pt.tmp` swap to final checkpoint path)
-
-Run SR unit tests:
-
-```bash
-python -m unittest discover -s tests -p "test_*.py"
-```

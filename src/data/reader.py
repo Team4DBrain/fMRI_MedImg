@@ -26,6 +26,7 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+from numpy.typing import DTypeLike
 
 
 class VolumeReader:
@@ -52,7 +53,14 @@ class VolumeReader:
         self.n_volumes: int = shape[-1]
 
     def read_volume(self, t: int) -> np.ndarray:
-        """Read a single 3D volume at timepoint t. Returns array in native dtype (usually int16)."""
+        """Read a single 3D volume at timepoint t.
+
+        Returns the array as nibabel produces it. That is usually the file's
+        on-disk dtype (e.g., int16 for IBC), but if the NIfTI header has
+        scl_slope != 1 or scl_inter != 0 nibabel applies the rescaling and
+        returns float64. The dataset path explicitly casts to float32 before
+        normalization, so the dtype variability does not propagate downstream.
+        """
         if not (0 <= t < self.n_volumes):
             raise IndexError(f"t={t} out of range [0, {self.n_volumes})")
         # .dataobj supports numpy-style slicing without decompressing the full file
@@ -64,6 +72,9 @@ class VolumeReader:
 
         Use this for any contiguous span instead of looping read_volume — even
         with indexed_gzip, one range read is faster than N independent reads.
+
+        Dtype follows the same rule as `read_volume`: native on-disk dtype
+        normally, float64 if NIfTI rescaling slopes are set.
         """
         if not (0 <= t_start < t_end <= self.n_volumes):
             raise IndexError(
@@ -71,7 +82,7 @@ class VolumeReader:
             )
         return np.asarray(self.img.dataobj[..., t_start:t_end])
 
-    def read_full(self, dtype: type = np.float32) -> np.ndarray:
+    def read_full(self, dtype: DTypeLike = np.float32) -> np.ndarray:
         """Read the entire 4D run in one shot, cast to the given dtype.
 
         For a 128×128×93×262 run as float32 this is ~1.6 GB. Used by
@@ -84,8 +95,12 @@ class VolumeReader:
         """Compute the temporal mean of the entire run. Returns float32 (X, Y, Z).
 
         Reads everything; not free. Called once per run offline.
+
+        Accumulator is float64: a float32 sum over ~300 BOLD timepoints can
+        accumulate ~3 ULP × N drift, which the 98th-percentile norm_ref is
+        robust to but the per-voxel tSNR isn't. Result is cast back to float32.
         """
-        return self.read_full(dtype=np.float32).mean(axis=-1)
+        return self.read_full(dtype=np.float32).mean(axis=-1, dtype=np.float64).astype(np.float32)
 
     def __repr__(self) -> str:
         return f"VolumeReader(path={self.path.name}, shape={self.shape})"
