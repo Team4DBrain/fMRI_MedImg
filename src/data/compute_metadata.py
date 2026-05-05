@@ -19,6 +19,9 @@ Pipeline shape:
   - Datasets read native data and crop z using the stored z_start.
   - target_z defaults to the smallest observed Z across runs (auto). Override
     with --target-z if needed.
+  - Without SynthStrip, percentile masks on thick runs can be taller than
+    target_z when target_z equals min(native z); we then retry with a higher
+    percentile threshold so the z-bbox fits (logged as a warning).
 
 Run from the command line:
     python -m src.data.compute_metadata --manifest manifest.json \
@@ -43,7 +46,7 @@ import numpy as np
 
 from .cropping import compute_z_start, crop_z, update_affine_for_z_crop
 from .manifest import load_manifest
-from .masks import compute_brain_mask, mask_fraction
+from .masks import compute_brain_mask, find_synthstrip_executable, mask_fraction
 from .normalize import compute_norm_ref
 from .reader import VolumeReader
 
@@ -143,11 +146,55 @@ def process_run(
         z_start = int(run_entry["z_start"])
     else:
         logger.info(f"  Computing mask for {run_id} (method={mask_method})")
-        mask_native = compute_brain_mask(
-            mean_vol, affine=reader.img.affine, method=mask_method,
-        )
-        # Center the crop window on the brain's z-bbox.
-        z_start = compute_z_start(mask_native, target_z)
+        used_tighter_percentile: float | None = None
+        try:
+            mask_native = compute_brain_mask(
+                mean_vol, affine=reader.img.affine, method=mask_method,
+            )
+            z_start = compute_z_start(mask_native, target_z)
+        except ValueError as e:
+            msg = str(e)
+            if "exceeds target_z" not in msg:
+                raise
+            # Mixed native z (e.g. 84 vs 93) with target_z=min(z): percentile masks
+            # can span almost the full stack on thick runs, so z-bbox > target_z.
+            if mask_method == "synthstrip":
+                raise
+            if mask_method == "auto" and find_synthstrip_executable() is not None:
+                raise
+            last_err = e
+            mask_native = None
+            z_start = None
+            for p in (60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 93.0, 96.0, 98.0):
+                mask_native = compute_brain_mask(
+                    mean_vol,
+                    affine=reader.img.affine,
+                    method="percentile",
+                    lower_percentile=p,
+                )
+                try:
+                    z_start = compute_z_start(mask_native, target_z)
+                    used_tighter_percentile = p
+                    break
+                except ValueError as e2:
+                    last_err = e2
+                    if "exceeds target_z" not in str(e2):
+                        raise
+            if z_start is None:
+                raise ValueError(
+                    f"{run_id}: {last_err} "
+                    "Tried percentile lower_percentile up to 98; z-bbox still taller "
+                    "than target_z. Install SynthStrip (mri_synthstrip on PATH) or "
+                    "use runs with uniform native z."
+                ) from last_err
+        if used_tighter_percentile is not None:
+            logger.warning(
+                "  %s: retried percentile mask with lower_percentile=%.1f so z-bbox "
+                "fits target_z=%d (prefer SynthStrip for stable masks).",
+                run_id,
+                used_tighter_percentile,
+                target_z,
+            )
         mask_cropped = crop_z(mask_native, z_start, target_z)
 
         # Save the cropped mask with an affine that reflects the z-shift,

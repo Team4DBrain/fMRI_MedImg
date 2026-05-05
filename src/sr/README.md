@@ -32,7 +32,7 @@ This module is intentionally model-pluggable: training orchestration is shared, 
   Model implementations and model registry/factory (`MODEL_REGISTRY`, `select_model`, `build_model_from_config`).
 
 - `data.py`  
-  Adapter layer from `src.data.datasets.SpatialSRDataset` to SR trainer tensor format.
+  Manifest-backed SR dataloader construction for training/validation and inference.
 
 - `checks.py`  
   Fast correctness checks (`run_sanity_checks`, `run_tiny_overfit_check`).
@@ -49,12 +49,12 @@ This module is intentionally model-pluggable: training orchestration is shared, 
 
 1. Configuration is built from defaults + CLI overrides.
 2. Config is validated for ranges, model name, geometry, and manifest availability.
-3. Data loaders are created from manifest-backed `SpatialSRDataset`.
+3. Data loaders are created from manifest-backed SR dataset entries.
 4. Model is instantiated from the configured `model_name`.
 5. Optional checks are run (sanity and tiny overfit).
 6. Training loop runs with train/validation metrics and checkpoint persistence.
 
-The canonical runtime entrypoint is `run.py` at repository root.
+The canonical runtime entrypoint is `src/sr/run.py` (invoke via `python -m src.sr.run`).
 
 ---
 
@@ -136,8 +136,8 @@ Required input artifact:
 - `manifest.json` that already contains per-run metadata from `src.data.compute_metadata`
 
 Required manifest fields (used by SR data adapter):
-- global: `bids_root`, `derivatives_dir`, `target_shape`, `runs`
-- per run: `run_id`, `subject`, `path`, `n_volumes`, `norm_ref`, `mask_path`
+- global: `bids_root`, `target_shape`, `runs`
+- per run: `run_id`, `subject`, `path`, `n_volumes`, `norm_ref` (and usually `shape`)
 
 Splitting behavior:
 - by default, subjects are shuffled deterministically by seed and split with `train_split`
@@ -145,10 +145,10 @@ Splitting behavior:
 
 ---
 
-## CLI parameter reference (`run.py`)
+## CLI parameter reference (`src/sr/run.py`)
 
 Common arguments:
-- positional `command`: `sanity`, `overfit`, `checks`, `train`
+- positional `command`: `sanity`, `overfit`, `checks`, `train`, `inference`
 - `--manifest-path`: path to enriched manifest
 - `--model-name`: architecture key from model registry (`srcnn3d`, `rcan3d`)
 - `--device`: force `cpu` or `cuda` (otherwise auto)
@@ -162,6 +162,14 @@ Training/control:
 - `--log-interval`: print frequency (batches)
 - `--checkpoint-interval`: epochs between periodic checkpoint saves
 - `--resume-checkpoint`: checkpoint path to continue training
+
+Inference:
+- `--checkpoint-path`: checkpoint file (`*.pt`) to load for inference
+- `--inference-index`: sample index from the manifest-backed SR dataset
+- `--visualize`: show prediction slice
+- `--visualize-input`: include input slice in the visualization
+- `--visualize-target`: include target slice in the visualization
+- `--save-output-npy`, `--save-input-npy`, `--save-target-npy`: optional exports
 
 Reproducibility/safety:
 - `--seed`: global seed
@@ -178,10 +186,13 @@ Shape/degradation:
 ## Usage from repository root
 
 ```bash
-python run.py sanity --manifest-path ./manifest.json
-python run.py overfit --overfit-steps 20 --manifest-path ./manifest.json
-python run.py checks --overfit-steps 20 --manifest-path ./manifest.json
-python run.py train --epochs 20 --model-name srcnn3d --manifest-path ./manifest.json
+python -m src.sr.run sanity --manifest-path ./manifest.json
+python -m src.sr.run overfit --overfit-steps 20 --manifest-path ./manifest.json
+python -m src.sr.run checks --overfit-steps 20 --manifest-path ./manifest.json
+python -m src.sr.run train --epochs 20 --model-name srcnn3d --manifest-path ./manifest.json
+python -m src.sr.run inference --checkpoint-path ./src/sr/runs/srcnn3d/20260501_145500/final.pt --visualize --visualize-input
+# alternatively (equivalent):
+# python ./src/sr/run.py train --epochs 2 --manifest-path ./manifest.json
 ```
 
 `manifest.json` must already be enriched by `src.data.compute_metadata`.

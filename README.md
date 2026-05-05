@@ -308,7 +308,6 @@ non-brain tissue).
 ### Dtype heterogeneity in IBC
 Some IBC files are stored as int16, others as float32 (with ~20× larger raw
 intensities). This is not preprocessing — it's a storage-format difference
-<<<<<<< HEAD
 across releases. Per-run normalization handles it cleanly.
 
 ## Smoke test
@@ -331,13 +330,14 @@ on a laptop with 9 IBC runs.
 
 ## SR training and checks (current behavior)
 
-The SR entrypoint is `run.py` and supports four commands:
+The SR entrypoint is `src/sr/run.py` (invoke with `python -m src.sr.run`) and supports checks, training, and inference:
 
 ```bash
-python run.py sanity --manifest-path ./manifest.json
-python run.py overfit --overfit-steps 20 --manifest-path ./manifest.json
-python run.py checks --overfit-steps 20 --manifest-path ./manifest.json
-python run.py train --epochs 20 --model-name srcnn3d --manifest-path ./manifest.json
+python -m src.sr.run sanity --manifest-path ./manifest.json
+python -m src.sr.run overfit --overfit-steps 20 --manifest-path ./manifest.json
+python -m src.sr.run checks --overfit-steps 20 --manifest-path ./manifest.json
+python -m src.sr.run train --epochs 20 --model-name srcnn3d --manifest-path ./manifest.json
+python -m src.sr.run inference --checkpoint-path ./src/sr/runs/srcnn3d/20260501_145500/final.pt --visualize --visualize-input
 ```
 
 Key SR defaults now include:
@@ -353,7 +353,3 @@ Run SR unit tests:
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
 ```
-
-=======
-across releases. Per-run normalization handles it cleanly.
->>>>>>> Andriy_data

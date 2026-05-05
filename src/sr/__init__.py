@@ -10,7 +10,7 @@ from .config import (
     set_seed,
     validate_config,
 )
-from .data import SRSpatialDatasetAdapter, create_dataloaders
+from .data import SRSpatialManifestDataset, create_dataloaders
 from .model import RCAN3D, SRCNN3D, build_model_from_config, select_model
 from .training import (
     build_training_components,
@@ -35,7 +35,7 @@ __all__ = [
     "RCAN3D",
     "select_model",
     "build_model_from_config",
-    "SRSpatialDatasetAdapter",
+    "SRSpatialManifestDataset",
     "create_dataloaders",
     "psnr_from_mse",
     "ensure_finite_loss",
