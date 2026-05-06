@@ -1,7 +1,7 @@
 """Shared CLI helpers — default paths and argparse type validators.
 
 The defaults here are tied to the team's VM layout (raw IBC data lives at
-`/srv/fMRI-data`, team-shared derivatives live at `/srv/T4Dbrains/derivatives`).
+`/srv/fMRI-data`, team-shared derivatives live at `/srv/venvs/team4dbrain/derivatives`).
 They make `python -m src.data.build` work without arguments on the VM.
 
 Anywhere else (CI, a contributor's laptop, a different VM), the defaults
@@ -19,7 +19,7 @@ import argparse
 from pathlib import Path
 
 DEFAULT_BIDS_ROOT = Path("/srv/fMRI-data")
-DEFAULT_DERIVATIVES_DIR = Path("/srv/T4Dbrains/derivatives")
+DEFAULT_DERIVATIVES_DIR = Path("/srv/venvs/team4dbrain/derivatives")
 DEFAULT_MANIFEST_PATH = DEFAULT_DERIVATIVES_DIR / "manifest.json"
 
 # argparse gotcha: pass these as `default=str(DEFAULT_...)` (not the Path
