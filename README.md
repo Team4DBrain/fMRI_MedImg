@@ -43,7 +43,7 @@ separately (`pip install pytest`) if you want to run the suite.
 Three kinds of paths the pipeline cares about:
 
 - **Raw IBC data** — `--bids-root`. Default: `/srv/fMRI-data` (team VM).
-- **Derivatives** (manifest, masks) — `--out-dir`. Default: `/srv/T4Dbrains/derivatives` (team VM).
+- **Derivatives** (manifest, masks) — `--out-dir`. Default: `/srv/venvs/team4dbrain/derivatives` (team VM).
 - **Code** — this repo, wherever you clone it.
 
 The CLI defaults are tied to the team VM. They must exist on disk or the
