@@ -26,6 +26,13 @@ from pathlib import Path
 
 import nibabel as nib
 
+from ._cli import (
+    DEFAULT_BIDS_ROOT,
+    DEFAULT_MANIFEST_PATH,
+    existing_dir,
+    writable_file,
+)
+
 logger = logging.getLogger(__name__)
 
 # Default expected z dimension for IBC. Drops the documented 84-slice anomaly
@@ -210,8 +217,16 @@ def load_manifest(path: Path) -> dict:
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bids-root", type=Path, required=True, help="Path to BIDS root directory")
-    parser.add_argument("--out", type=Path, required=True, help="Output manifest JSON path")
+    parser.add_argument(
+        "--bids-root", type=existing_dir, default=str(DEFAULT_BIDS_ROOT),
+        help=f"Path to BIDS root directory. Default: {DEFAULT_BIDS_ROOT} "
+             "(team VM convention). Must exist.",
+    )
+    parser.add_argument(
+        "--out", type=writable_file, default=str(DEFAULT_MANIFEST_PATH),
+        help=f"Output manifest JSON path. Default: {DEFAULT_MANIFEST_PATH}. "
+             "Parent directory must exist.",
+    )
     parser.add_argument(
         "--require-z", type=int, default=DEFAULT_REQUIRE_Z,
         help=f"Drop runs whose native z != this value. Default: {DEFAULT_REQUIRE_Z} "

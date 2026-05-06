@@ -36,6 +36,12 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 
+from ._cli import (
+    DEFAULT_DERIVATIVES_DIR,
+    DEFAULT_MANIFEST_PATH,
+    existing_dir,
+    existing_file,
+)
 from .manifest import load_manifest
 from .masks import compute_brain_mask, mask_fraction
 from .normalize import compute_norm_ref
@@ -324,10 +330,15 @@ def compute_all(
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, required=True, help="Path to manifest JSON")
     parser.add_argument(
-        "--derivatives-dir", type=Path, required=True,
-        help="Directory to write brain masks and other derivatives into",
+        "--manifest", type=existing_file, default=str(DEFAULT_MANIFEST_PATH),
+        help=f"Path to manifest JSON. Default: {DEFAULT_MANIFEST_PATH} "
+             "(team VM convention). Must exist.",
+    )
+    parser.add_argument(
+        "--derivatives-dir", type=existing_dir, default=str(DEFAULT_DERIVATIVES_DIR),
+        help=f"Directory to write brain masks and other derivatives into. "
+             f"Default: {DEFAULT_DERIVATIVES_DIR} (team VM convention). Must exist.",
     )
     parser.add_argument(
         "--target-z", type=int, default=None,

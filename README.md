@@ -13,6 +13,8 @@ This repo currently contains the **data pipeline** only. Models will follow.
 
 ```
 src/data/
+  __init__.py             # Re-exports the public API (so `from src.data import …` works)
+  _cli.py                 # Shared CLI helpers: team-VM default paths + arg validators
   build.py                # Wrapper: runs manifest + metadata in one go
   manifest.py             # Walk BIDS tree, parse filenames, build a JSON manifest
   compute_metadata.py     # Compute brain mask + norm_ref + tSNR per run
@@ -30,7 +32,9 @@ tests/
   test_datasets_synthetic.py    # End-to-end Datasets on a synthetic BIDS layout
 ```
 
-Run the tests with `python -m pytest tests/ -v`.
+Run the tests with `python -m pytest tests/ -v`. `pytest` itself is a dev
+dependency only — it's not pinned in `requirements.txt`; install it
+separately (`pip install pytest`) if you want to run the suite.
 
 ## How it works
 
@@ -38,9 +42,14 @@ Run the tests with `python -m pytest tests/ -v`.
 
 Three kinds of paths the pipeline cares about:
 
-- **Raw IBC data** — `--bids-root`. On the VM: `/srv/fMRI-data/`.
-- **Derivatives** (manifest, masks) — `--out-dir`. Pick a writable path.
+- **Raw IBC data** — `--bids-root`. Default: `/srv/fMRI-data` (team VM).
+- **Derivatives** (manifest, masks) — `--out-dir`. Default: `/srv/T4Dbrains/derivatives` (team VM).
 - **Code** — this repo, wherever you clone it.
+
+The CLI defaults are tied to the team VM. They must exist on disk or the
+command fails immediately with a clear error — no silent fallback. Off-VM
+(your laptop, CI, a different cluster), pass `--bids-root` and `--out-dir`
+explicitly.
 
 The manifest is not committed to git. It has absolute paths to data and is
 regenerated whenever the dataset changes. Treat it as a derivative that lives
@@ -48,14 +57,16 @@ next to the masks.
 
 ### Build the manifest + derivatives (one-time, slower)
 
-Single command that runs both data-prep stages in order:
+Single command that runs both data-prep stages in order. On the team VM
+the defaults cover `--bids-root` and `--out-dir`, so this is the whole
+invocation:
 
 ```
-python -m src.data.build \
-    --bids-root /srv/fMRI-data \
-    --out-dir <out> \
-    --mask-method auto
+python -m src.data.build --mask-method auto
 ```
+
+Pass `--bids-root <path>` and/or `--out-dir <path>` to override the
+team-VM defaults (e.g. when running on your laptop).
 
 This produces:
 - `<out>/manifest.json` — one entry per BOLD run with shape + metadata
@@ -70,9 +81,13 @@ file fully once — typically ~5-15s per run, dominated by SynthStrip.
 run whose native z differs is dropped at the manifest stage with a logged
 warning — this screens out the documented `z=84` anomaly in some IBC ses-00
 / ses-01 sessions. Pass an explicit value if you want a different slab.
-Pass `--require-z 0` to the manifest stage if you want to keep every run
-regardless of z (and accept that compute_metadata will then refuse to run on
-a mixed-z manifest).
+
+Note that the build wrapper exposes `--target-z` (which it forwards as the
+manifest stage's `require_z` filter and the metadata stage's expected uniform
+shape). The standalone `manifest.py` instead exposes the same knob as
+`--require-z`. Pass `--target-z 0` to `build.py` (or `--require-z 0` to
+`manifest.py`) to keep every run regardless of z; downstream
+`compute_metadata` will then refuse to run on a mixed-z manifest.
 
 `--mask-method`:
 - `auto` (default): uses SynthStrip if any of `nipreps-synthstrip`,
@@ -83,21 +98,39 @@ a mixed-z manifest).
 - `percentile`: pure-Python intensity threshold + morphology. Works without
   any external tools but produces imperfect masks (includes some skull/scalp).
 
+#### SynthStrip model weights
+
+`nipreps-synthstrip` (the pip-installable variant) ships the code but **not**
+the model weights. The other variants (`mri_synthstrip`, the docker/singularity
+wrappers) bake the path in and don't need this lookup.
+
+The pipeline searches for `synthstrip.1.pt` in this order:
+
+1. `$SYNTHSTRIP_MODEL` — env var, if set. If set but the file is missing, a
+   warning is logged and the search falls through to the next entries.
+2. `/srv/synthstrip/synthstrip.1.pt` — admin-blessed shared location (this is
+   where the model lives on the team VM).
+3. `~/shared/synthstrip/synthstrip.1.pt` — per-user fallback.
+
+If none exist, `nipreps-synthstrip` raises with a pointer back to here.
+The weights live in FreeSurfer's git-annex; see the upstream
+[SynthStrip docs](https://surfer.nmr.mgh.harvard.edu/docs/synthstrip/) for
+the official download. On the team VM the file is already in place at
+`/srv/synthstrip/synthstrip.1.pt`, so nothing further is needed there.
+
 ### Or run the two stages separately
 
 If you want to inspect the manifest before committing to the slow metadata
-step, or only redo one stage:
+step, or only redo one stage. Defaults again cover the team VM paths:
 
 ```
-python -m src.data.manifest \
-    --bids-root /srv/fMRI-data \
-    --out <out>/manifest.json
+python -m src.data.manifest
 
-python -m src.data.compute_metadata \
-    --manifest <out>/manifest.json \
-    --derivatives-dir <out> \
-    --mask-method auto
+python -m src.data.compute_metadata --mask-method auto
 ```
+
+Override with `--bids-root`, `--out`, `--manifest`, `--derivatives-dir`
+when running off-VM.
 
 `build.py` just calls these two in order.
 
@@ -289,8 +322,9 @@ the group decides who's in which.
 Two backends, dispatched by `--mask-method`:
 - **SynthStrip** (preferred, default `auto`): DL-based, designed for cross-modality
   EPI. Robust. Requires one of `nipreps-synthstrip` (pip-installable, lightest
-  — also needs the model weights file; see below), `mri_synthstrip` (full
-  FreeSurfer install), `synthstrip-docker`, or `synthstrip-singularity` on PATH.
+  — also needs the model weights file; see "SynthStrip model weights" above),
+  `mri_synthstrip` (full FreeSurfer install), `synthstrip-docker`, or
+  `synthstrip-singularity` on PATH.
 - **Percentile fallback**: pure Python, no external tools, but produces imperfect
   masks. Tends to include some skull/scalp; may carve cerebellum at high
   thresholds. Acceptable for code-correctness testing, not for final results.
@@ -309,6 +343,16 @@ non-brain tissue).
 - `TemporalSRDataset` has no degradation by design (see above).
 
 ### Dtype heterogeneity in IBC
-Some IBC files are stored as int16, others as float32 (with ~20× larger raw
-intensities). This is not preprocessing — it's a storage-format difference
-across releases. Per-run normalization handles it cleanly.
+IBC's BOLD files come in three on-disk dtypes across releases: **int16**,
+**float32**, and **uint16** (yes — all three appear in the same dataset).
+This is a storage-format difference, not preprocessing. The float32 / uint16
+files have ~20-50× larger raw intensities than int16. Per-run normalization
+(divide by the 98th-percentile brain voxel) collapses all three to roughly
+the same range, so downstream training code doesn't have to care.
+
+One thing worth knowing: a few uint16 runs we've inspected have voxels
+saturated at the dtype max (65535) — real scanner clipping, not pipeline
+artifacts. The percentile-based `norm_ref` keeps these from blowing up the
+normalized scale (saturated voxels just end up at ~2-3× a typical brain
+voxel's normalized value), but if your model is sensitive to bright
+outliers, expect these to show up.

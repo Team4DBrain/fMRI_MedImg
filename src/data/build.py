@@ -34,6 +34,7 @@ import logging
 import sys
 from pathlib import Path
 
+from ._cli import DEFAULT_BIDS_ROOT, DEFAULT_DERIVATIVES_DIR, existing_dir
 from .compute_metadata import compute_all
 from .manifest import DEFAULT_REQUIRE_Z, build_manifest, write_manifest
 
@@ -101,12 +102,15 @@ def build_pipeline(
 def _cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--bids-root", type=Path, required=True,
-        help="Path to BIDS root (raw data).",
+        "--bids-root", type=existing_dir, default=str(DEFAULT_BIDS_ROOT),
+        help=f"Path to BIDS root (raw data). Default: {DEFAULT_BIDS_ROOT} "
+             "(team VM convention). Must exist.",
     )
     parser.add_argument(
-        "--out-dir", type=Path, required=True,
-        help="Where to write manifest.json and masks/ subdir.",
+        "--out-dir", type=existing_dir, default=str(DEFAULT_DERIVATIVES_DIR),
+        help=f"Where to write manifest.json and masks/ subdir. Default: "
+             f"{DEFAULT_DERIVATIVES_DIR} (team VM convention). Must exist; "
+             "create it explicitly first if it doesn't.",
     )
     parser.add_argument(
         "--target-z", type=int, default=DEFAULT_REQUIRE_Z,
