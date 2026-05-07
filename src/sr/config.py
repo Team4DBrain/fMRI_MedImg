@@ -1,4 +1,19 @@
-"""Configuration and reproducibility utilities for spatial SR."""
+"""Define and validate runtime configuration for the spatial SR pipeline.
+
+Purpose:
+    Centralize defaults and reproducibility policy so train/eval/infer resolve
+    behavior from one source of truth.
+Effects:
+    Directly affects model selection, data loading, optimization settings,
+    output geometry, and safety checks in `src.sr.run` and `src.sr.training`.
+Influences:
+    Values can be overridden by CLI flags in `src.sr.run._apply_overrides` and
+    partially replaced by checkpoint config for eval/infer.
+How to change safely:
+    Keep keys aligned with `run.py` override handling and
+    `training.py`/`data.py` consumers; update `validate_config` whenever adding
+    new config fields that can break runtime assumptions.
+"""
 
 import random
 from pathlib import Path
@@ -44,7 +59,20 @@ DEFAULT_CONFIG = {
 
 
 def set_seed(seed: int, deterministic: bool = False) -> None:
-    """Set RNG seeds across Python, NumPy, and PyTorch."""
+    """Set random seeds and backend policy for reproducible experiments.
+
+    Purpose:
+        Make data order, initialization, and stochastic ops repeatable.
+    Effects:
+        Changes Python/NumPy/PyTorch RNG streams and then applies deterministic
+        backend policy, which affects runtime speed vs reproducibility.
+    Influences:
+        Effective behavior depends on CUDA availability and the `deterministic`
+        flag passed from config/CLI.
+    How to change safely:
+        Keep this as the single place where all RNGs are seeded before training
+        or evaluation; if a new RNG source is introduced, seed it here too.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -54,7 +82,20 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
 
 
 def apply_deterministic_policy(deterministic: bool) -> None:
-    """Apply deterministic backend policy for reproducible runs."""
+    """Toggle deterministic algorithm/backends used by PyTorch.
+
+    Purpose:
+        Control the trade-off between reproducibility and throughput.
+    Effects:
+        Enables deterministic algorithms and disables cuDNN benchmarking when
+        requested; otherwise restores faster non-deterministic defaults.
+    Influences:
+        Behavior differs on CPU-only vs CUDA runs because cuDNN flags only apply
+        when available.
+    How to change safely:
+        If backend flags are updated, keep both branches explicit so users can
+        still intentionally choose reproducible or performance-oriented runs.
+    """
     if deterministic:
         torch.use_deterministic_algorithms(True, warn_only=True)
         if torch.backends.cudnn.is_available():
@@ -68,12 +109,37 @@ def apply_deterministic_policy(deterministic: bool) -> None:
 
 
 def get_device() -> str:
-    """Return preferred torch device string."""
+    """Return the default compute device for SR commands.
+
+    Purpose:
+        Provide one consistent auto-selection policy for train/eval/infer.
+    Effects:
+        Determines where tensors/models are allocated when the user does not
+        pass `--device`.
+    Influences:
+        Depends on `torch.cuda.is_available()` at runtime.
+    How to change safely:
+        Keep return values compatible with `argparse` `--device` choices and
+        with `.to(device)` calls throughout the SR module.
+    """
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def validate_config(config: dict) -> None:
-    """Validate configuration constraints for SR setup."""
+    """Fail fast when config values would produce invalid or unsafe runs.
+
+    Purpose:
+        Catch misconfiguration before expensive training/evaluation starts.
+    Effects:
+        Rejects impossible splits, invalid optimization settings, unknown model
+        names, malformed kwargs, and missing manifest path.
+    Influences:
+        Validation criteria depend on model registry contents and whether
+        subject splitting is enabled.
+    How to change safely:
+        Add checks whenever new config keys drive behavior in data/model/trainer
+        code, so errors remain early and actionable.
+    """
     if bool(config.get("enable_subject_split", False)):
         if not 0.0 < float(config["train_split"]) <= 1.0:
             raise ValueError("train_split must be in (0, 1]. when subject split is enabled.")

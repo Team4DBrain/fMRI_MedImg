@@ -1,4 +1,18 @@
-"""Training and checkpoint orchestration for 3D SR."""
+"""Run optimization, validation, logging, and checkpoint lifecycle for SR.
+
+Purpose:
+    Encapsulate the full training loop and metric computations used by the SR
+    CLI so experiments are reproducible and auditable.
+Effects:
+    Controls gradient updates, validation reporting, LR scheduling, checkpoint
+    persistence, and run summaries consumed by downstream analysis.
+Influences:
+    Runtime behavior depends on config values, model architecture, dataset
+    splits, and optional resume checkpoints.
+How to change safely:
+    Preserve metric names/file outputs expected by `run.py` and tests, and keep
+    checkpoint payload fields stable for backward compatibility.
+"""
 
 import json
 import math
@@ -16,7 +30,21 @@ from .model import build_model_from_config
 
 
 def psnr_from_mse(mse_value: float, data_range: float = 1.0) -> float:
-    """Convert MSE to PSNR."""
+    """Convert reconstruction error to a PSNR value used for reporting quality.
+
+    Purpose:
+        Express MSE on a logarithmic scale that is easier to compare across
+        runs.
+    Effects:
+        Used in training/eval summaries and logs; affects interpretation only,
+        not optimization.
+    Influences:
+        Depends on chosen `data_range` and lower-bound handling for near-zero
+        MSE values.
+    How to change safely:
+        Keep conversion formula aligned across training and eval paths so
+        historical metric comparisons remain meaningful.
+    """
     if mse_value <= 1e-12:
         return 99.0
     return 10.0 * np.log10((data_range**2) / mse_value)
@@ -28,7 +56,19 @@ def masked_mse_loss(
     mask: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Mask-aware MSE over in-brain voxels."""
+    """Compute MSE over voxels selected by a mask.
+
+    Purpose:
+        Focus optimization on in-brain regions where SR quality matters.
+    Effects:
+        Directly defines training loss and one of the core validation metrics.
+    Influences:
+        Result depends on mask coverage and `eps`, which stabilizes division for
+        sparse masks.
+    How to change safely:
+        Keep mask semantics consistent with dataset outputs (`mask_hr`), and
+        update metric interpretation/tests if weighting strategy changes.
+    """
     sq_err = (outputs - targets) ** 2
     weighted = sq_err * mask
     denom = torch.clamp(mask.sum(), min=eps)
@@ -50,7 +90,19 @@ def masked_local_ssim_3d(
     data_range: float = 1.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Masked mean of a local 3D SSIM map (sliding average window)."""
+    """Estimate structural similarity over masked 3D local neighborhoods.
+
+    Purpose:
+        Provide a perceptual-style quality signal complementary to masked MSE.
+    Effects:
+        Used for validation/eval reporting and model comparison.
+    Influences:
+        Sensitivity is controlled by window size logic, `data_range`, and mask
+        weighting; input must be single-channel.
+    How to change safely:
+        Keep channel/shape assumptions explicit and align any formula updates
+        with eval code so reported SSIM remains comparable.
+    """
     _b, c, d, h, w = pred.shape
     if c != 1:
         raise ValueError("masked_local_ssim_3d expects a single channel (B,1,D,H,W)")
@@ -79,9 +131,19 @@ def masked_local_ssim_3d(
 
 
 def validate_one_epoch(model, val_loader, device):
-    """Run one validation pass without gradients; return masked MSE and masked SSIM.
+    """Run validation metrics for one epoch without gradient updates.
 
-    When val_loader is None (no validation set), returns NaNs.
+    Purpose:
+        Quantify generalization after each training epoch.
+    Effects:
+        Produces masked MSE/SSIM used in logs, scheduler decisions, and best
+        checkpoint selection.
+    Influences:
+        Behavior depends on whether a validation loader exists; missing loader
+        returns NaNs by design.
+    How to change safely:
+        Maintain returned dictionary keys (`mse`, `ssim`) because callers and
+        summaries depend on them.
     """
     if val_loader is None:
         return {"mse": float("nan"), "ssim": float("nan")}
@@ -110,7 +172,21 @@ def train_one_epoch(
     log_interval=10,
     strict_finite_loss: bool = True,
 ):
-    """Execute one optimization epoch."""
+    """Execute one full training epoch over the training loader.
+
+    Purpose:
+        Perform forward/backward optimization steps and collect train-loss
+        statistics.
+    Effects:
+        Updates model weights, writes batch loss to TensorBoard, and returns the
+        epoch-average training loss.
+    Influences:
+        Behavior depends on optimizer state, `strict_finite_loss`, and
+        `log_interval` verbosity.
+    How to change safely:
+        Keep loss definition aligned with validation/eval metrics and preserve
+        global-step semantics used by TensorBoard comparisons.
+    """
     model.train()
     running_loss = 0.0
     for batch_idx, batch in enumerate(train_loader):
@@ -137,7 +213,19 @@ def train_one_epoch(
 
 
 def save_checkpoint(path: Path, epoch: int, model, optimizer, best_val_loss: float, config: dict):
-    """Save model, optimizer, and metadata checkpoint."""
+    """Persist model/optimizer state plus metadata for resume and eval.
+
+    Purpose:
+        Create recoverable snapshots that support interruption recovery and
+        model reuse.
+    Effects:
+        Writes checkpoint payload atomically via temporary file replacement.
+    Influences:
+        Payload content depends on current epoch, optimizer state, and config.
+    How to change safely:
+        Preserve core keys (`model_state_dict`, `optimizer_state_dict`,
+        `config`) to avoid breaking older checkpoints.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "epoch": epoch,
@@ -152,7 +240,20 @@ def save_checkpoint(path: Path, epoch: int, model, optimizer, best_val_loss: flo
 
 
 def ensure_finite_loss(loss: torch.Tensor, epoch_index: int, batch_idx: int) -> None:
-    """Raise when training loss is non-finite."""
+    """Guardrail that aborts training when loss becomes NaN/Inf.
+
+    Purpose:
+        Prevent silently continuing corrupted optimization runs.
+    Effects:
+        Raises `FloatingPointError` with epoch/batch context when non-finite
+        loss appears.
+    Influences:
+        Triggering depends on numerical stability and whether strict checking is
+        enabled by config.
+    How to change safely:
+        Keep failure message contextual so teammates can quickly debug unstable
+        settings or data issues.
+    """
     loss_value = float(loss.detach().item())
     if not math.isfinite(loss_value):
         raise FloatingPointError(
@@ -161,7 +262,19 @@ def ensure_finite_loss(loss: torch.Tensor, epoch_index: int, batch_idx: int) -> 
 
 
 def maybe_resume_training(model, optimizer, checkpoint_path, device):
-    """Restore model/optimizer from checkpoint when provided."""
+    """Restore training state from a checkpoint when resume is requested.
+
+    Purpose:
+        Continue interrupted runs without restarting optimization history.
+    Effects:
+        Loads model/optimizer states and returns start epoch with best-val
+        baseline for later checkpoint decisions.
+    Influences:
+        Behavior depends on checkpoint existence and payload integrity.
+    How to change safely:
+        Keep returned tuple contract stable because `run_training` relies on the
+        exact `(start_epoch, best_val_loss)` semantics.
+    """
     if checkpoint_path is None:
         return 0, float("inf")
 
@@ -178,14 +291,92 @@ def maybe_resume_training(model, optimizer, checkpoint_path, device):
 
 
 def build_training_components(model, config: dict):
-    """Create default loss, optimizer, and scheduler."""
+    """Build optimizer and LR scheduler used by the SR training loop.
+
+    Purpose:
+        Centralize default optimization policy for consistent experiments.
+    Effects:
+        Defines how parameters are updated and how learning rate is reduced in
+        response to validation trends.
+    Influences:
+        Depends on `learning_rate` and scheduler hyperparameters encoded here.
+    How to change safely:
+        Coordinate any scheduler policy change with README/docs so users know
+        how `--lr` may evolve during training.
+    """
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     return optimizer, scheduler
 
 
+def write_loss_curve_png(history: dict[str, list[float]], output_path: Path) -> bool:
+    """Render epoch-wise loss history to a PNG for quick run inspection.
+
+    Purpose:
+        Provide a lightweight visual summary of convergence without requiring
+        TensorBoard.
+    Effects:
+        Writes an image file when plotting dependencies and history are valid.
+    Influences:
+        Depends on matplotlib availability and presence of non-empty epoch/train
+        history.
+    How to change safely:
+        Keep input history keys consistent with `run_training` outputs or adjust
+        both producer and consumer together.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        print(f"[train] Skipping loss_curve.png (matplotlib unavailable: {exc})")
+        return False
+
+    epochs = history.get("epoch", [])
+    train_loss = history.get("train_mse", [])
+    val_loss = history.get("val_mse", [])
+    if not epochs or not train_loss:
+        return False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(epochs, train_loss, marker="o", linewidth=1.8, label="train_mse")
+    finite_val = [
+        (epoch, value)
+        for epoch, value in zip(epochs, val_loss, strict=False)
+        if math.isfinite(float(value))
+    ]
+    if finite_val:
+        val_epochs, val_values = zip(*finite_val)
+        ax.plot(val_epochs, val_values, marker="o", linewidth=1.8, label="val_mse")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE Loss")
+    ax.set_title("Loss over epochs")
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return True
+
+
 def run_training(config: dict, model=None, device: str | None = None):
-    """Train model end-to-end using provided config."""
+    """Run the complete SR training lifecycle for one experiment configuration.
+
+    Purpose:
+        Execute data loading, optimization, validation, logging, checkpointing,
+        and final metric artifact generation in one reproducible workflow.
+    Effects:
+        Produces trained weights and run artifacts under the configured run
+        directory, including summaries used for model selection.
+    Influences:
+        Runtime behavior is shaped by config (model choice, LR schedule, split
+        policy, checkpoint frequency, finite-loss policy) and resume state.
+    How to change safely:
+        Preserve artifact filenames/JSON keys expected by tooling and tests; if
+        changing output schema, update downstream consumers together.
+    """
     if device is None:
         device = get_device()
     if model is None:
@@ -227,6 +418,7 @@ def run_training(config: dict, model=None, device: str | None = None):
     )
 
     last_val_metrics: dict[str, float] = {"mse": float("nan"), "ssim": float("nan")}
+    history: dict[str, list[float]] = {"epoch": [], "train_mse": [], "val_mse": [], "lr": []}
     for epoch in range(start_epoch, config["num_epochs"]):
         train_loss = train_one_epoch(
             epoch,
@@ -249,12 +441,16 @@ def run_training(config: dict, model=None, device: str | None = None):
         writer.add_scalar("epoch/lr", current_lr, epoch)
         train_psnr = psnr_from_mse(train_loss)
         writer.add_scalar("epoch/psnr_train", train_psnr, epoch)
+        history["epoch"].append(float(epoch + 1))
+        history["train_mse"].append(float(train_loss))
+        history["lr"].append(float(current_lr))
 
         if val_loader is not None:
             writer.add_scalar("epoch/loss_val", val_loss, epoch)
             val_psnr = psnr_from_mse(val_loss)
             writer.add_scalar("epoch/psnr_val", val_psnr, epoch)
             writer.add_scalar("epoch/ssim_val", val_metrics["ssim"], epoch)
+            history["val_mse"].append(float(val_loss))
             print(
                 f"Epoch {epoch + 1}/{config['num_epochs']} "
                 f"train={train_loss:.6f} val_mse={val_loss:.6f} "
@@ -262,6 +458,7 @@ def run_training(config: dict, model=None, device: str | None = None):
                 f"ssim_val={val_metrics['ssim']:.4f} lr={current_lr:.2e}"
             )
         else:
+            history["val_mse"].append(float("nan"))
             print(
                 f"Epoch {epoch + 1}/{config['num_epochs']} "
                 f"train={train_loss:.6f} psnr_train={train_psnr:.2f} lr={current_lr:.2e}"
@@ -289,4 +486,9 @@ def run_training(config: dict, model=None, device: str | None = None):
     }
     with open(run_dir / "metrics_summary.json", "w", encoding="utf-8") as file_obj:
         json.dump(summary, file_obj, indent=2)
+    with open(run_dir / "metrics_history.json", "w", encoding="utf-8") as file_obj:
+        json.dump(history, file_obj, indent=2)
+    curve_written = write_loss_curve_png(history, run_dir / "loss_curve.png")
+    if curve_written:
+        print(f"[train] wrote {run_dir / 'loss_curve.png'}")
     print(f"Training complete. Run dir: {run_dir}")

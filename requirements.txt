@@ -1,11 +1,13 @@
 # Minimum dependencies for the data pipeline.
-# Tested with Python 3.12.
+# Tested with Python 3.12.3
 
 nibabel>=5.0
 numpy>=1.26
 scipy>=1.11
 torch>=2.1
+matplotlib>=3.8
 nipreps-synthstrip>=0.0.1
 indexed_gzip>=1.7
+tensorboard
 
 

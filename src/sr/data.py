@@ -1,4 +1,19 @@
-"""Data loading for spatial SR training."""
+"""Construct reproducible train/validation loaders for spatial SR.
+
+Purpose:
+    Bridge validated config values to dataset and DataLoader objects used by
+    training and evaluation.
+Effects:
+    Controls which subjects are seen by each split, how degradation is applied,
+    and whether batch ordering/worker RNG are reproducible.
+Influences:
+    Behavior depends on manifest content, split config, voxel settings, and
+    deterministic policy.
+How to change safely:
+    Keep split resolution, degradation creation, and loader seeding aligned with
+    `src.sr.config.DEFAULT_CONFIG` and downstream expectations in
+    `src.sr.training`.
+"""
 
 from __future__ import annotations
 
@@ -24,12 +39,20 @@ def _available_subjects(manifest_path: Path) -> list[str]:
 
 
 def _resolve_subject_split(config: dict, manifest_path: Path) -> tuple[list[str], list[str]]:
-    """Return (train_subjects, val_subjects).
+    """Resolve final subject lists for training and validation.
 
-    Behavior:
-    - If explicit train/val lists are given, use them.
-    - Else if enable_subject_split is True, derive a split from all subjects.
-    - Else (default), put all subjects into train and leave val empty.
+    Purpose:
+        Convert high-level split config into explicit subject lists consumed by
+        `SpatialSRDataset`.
+    Effects:
+        Determines which data contributes to gradient updates vs validation
+        metrics, directly affecting generalization estimates.
+    Influences:
+        Priority order is explicit lists > derived random split > all-train
+        default; derived splits depend on `seed` and `train_split`.
+    How to change safely:
+        Preserve deterministic split behavior and validation safety checks
+        (minimum subject count) when adjusting split policy.
     """
     configured_train = config.get("train_subjects")
     configured_val = config.get("val_subjects")
@@ -85,7 +108,20 @@ def _make_loader(dataset, config: dict, *, shuffle: bool, generator_seed: int):
 
 
 def create_dataloaders(config: dict):
-    """Build train/val loaders using the canonical spatial SR dataset contract."""
+    """Create train/validation loaders configured for spatial SR experiments.
+
+    Purpose:
+        Build the canonical data pipeline consumed by training and eval code.
+    Effects:
+        Instantiates degradation, datasets, and loaders; returns split metadata
+        used for logging and run artifacts.
+    Influences:
+        Loader behavior is affected by voxel-size degradation settings, subject
+        split configuration, batch size, worker count, and deterministic mode.
+    How to change safely:
+        Keep returned tuple structure stable because `run.py` and
+        `training.py` depend on it; if adding fields, update all callers.
+    """
     manifest_path = Path(config["manifest_path"])
     degrade_fn = make_spatial_degradation(
         source_voxel_mm=float(config["source_voxel_mm"]),

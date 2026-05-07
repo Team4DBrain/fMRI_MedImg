@@ -1,4 +1,17 @@
-"""CLI entrypoint for spatial SR train/eval/infer."""
+"""Expose a CLI for training, evaluating, inferring, and plotting SR runs.
+
+Purpose:
+    Provide one command interface that resolves config, validates inputs, and
+    dispatches to the correct SR workflow.
+Effects:
+    Determines which execution path runs and what artifacts/reports are written.
+Influences:
+    Behavior depends on CLI flags, defaults in `src.sr.config`, and checkpoint
+    metadata for eval/infer.
+How to change safely:
+    Keep CLI arguments, config override mapping, and command dispatch logic
+    synchronized with README usage docs and checkpoint expectations.
+"""
 
 from __future__ import annotations
 
@@ -29,14 +42,14 @@ from src.sr import (
     validate_config,
 )
 from src.sr.data import create_dataloaders
-from src.sr.training import masked_local_ssim_3d, masked_mse_loss, psnr_from_mse
+from src.sr.training import masked_local_ssim_3d, masked_mse_loss, psnr_from_mse, write_loss_curve_png
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run SR training/evaluation/inference.")
     parser.add_argument(
         "command",
-        choices=["train", "eval", "infer"],
+        choices=["train", "eval", "infer", "plot-loss"],
         help="What to run.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
@@ -60,6 +73,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to manifest.json produced by src.data.manifest/compute_metadata.",
     )
     parser.add_argument("--run-root", type=Path, default=None, help="Directory for run logs.")
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Run directory for plot-loss (contains metrics_history.json).",
+    )
+    parser.add_argument(
+        "--plot-output",
+        type=Path,
+        default=None,
+        help="Optional PNG output path for plot-loss (default: <run-dir>/loss_curve.png).",
+    )
     parser.add_argument("--resume-checkpoint", type=Path, default=None, help="Path to checkpoint to resume from.")
     parser.add_argument(
         "--checkpoint-path",
@@ -86,6 +111,29 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Optional path to save predicted output volume as .npy.",
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Visualize center slice(s) for input/prediction/target during infer.",
+    )
+    parser.add_argument(
+        "--visualize-output",
+        type=Path,
+        default=None,
+        help="Optional PNG path for infer visualization. If omitted, plot is shown interactively.",
+    )
+    parser.add_argument(
+        "--visualize-direction",
+        choices=["axial", "coronal", "sagittal"],
+        default="axial",
+        help="Slice direction for infer visualization (default: axial).",
+    )
+    parser.add_argument(
+        "--visualize-level",
+        type=float,
+        default=0.5,
+        help="Relative slice level in [0,1] for infer visualization (default: 0.5 center).",
     )
     parser.add_argument(
         "--eval-report",
@@ -304,12 +352,108 @@ def _run_infer(config: dict, args: argparse.Namespace, device: str) -> None:
         args.save_output_npy.parent.mkdir(parents=True, exist_ok=True)
         np.save(args.save_output_npy, prediction)
         print(f"[inference] Saved output to: {args.save_output_npy}")
+
+    if args.visualize or args.visualize_output is not None:
+        _visualize_inference(
+            input_volume=input_volume,
+            prediction_volume=prediction,
+            target_volume=target_volume,
+            output_path=args.visualize_output,
+            show_interactive=bool(args.visualize and args.visualize_output is None),
+            direction=args.visualize_direction,
+            level=args.visualize_level,
+        )
     m = sample["mask_hr"].unsqueeze(0)
     pred_b = prediction_tensor.unsqueeze(0)
     tgt_b = target_tensor.unsqueeze(0)
     mse = float(masked_mse_loss(pred_b, tgt_b, m).item())
     ssim = float(masked_local_ssim_3d(pred_b, tgt_b, m).item())
     print(f"[infer] masked_mse={mse:.6f} masked_psnr={psnr_from_mse(mse):.2f} masked_ssim={ssim:.4f}")
+
+
+def _visualize_inference(
+    input_volume: np.ndarray,
+    prediction_volume: np.ndarray,
+    target_volume: np.ndarray,
+    output_path: Path | None,
+    show_interactive: bool,
+    direction: str,
+    level: float,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError(
+            "matplotlib is required for --visualize/--visualize-output but is not installed."
+        ) from exc
+
+    if not 0.0 <= level <= 1.0:
+        raise ValueError(f"--visualize-level must be in [0,1], got {level}.")
+
+    direction_to_axis = {"sagittal": 0, "coronal": 1, "axial": 2}
+    if direction not in direction_to_axis:
+        raise ValueError(
+            f"Unknown --visualize-direction '{direction}'. "
+            f"Expected one of: {', '.join(direction_to_axis)}"
+        )
+
+    def _extract_slice(volume: np.ndarray) -> tuple[np.ndarray, int]:
+        axis = direction_to_axis[direction]
+        dim = int(volume.shape[axis])
+        idx = min(dim - 1, max(0, int(round(level * (dim - 1)))))
+        if direction == "axial":
+            img = volume[:, :, idx]
+        elif direction == "coronal":
+            img = volume[:, idx, :]
+        else:  # sagittal
+            img = volume[idx, :, :]
+        return img, idx
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    input_slice, input_idx = _extract_slice(input_volume)
+    pred_slice, pred_idx = _extract_slice(prediction_volume)
+    target_slice, target_idx = _extract_slice(target_volume)
+    panels = (
+        ("Input (LR)", input_slice, input_idx),
+        ("Prediction (HR)", pred_slice, pred_idx),
+        ("Target (HR)", target_slice, target_idx),
+    )
+    for ax, (title, image, idx) in zip(axes, panels):
+        ax.imshow(image, cmap="gray")
+        ax.set_title(f"{title}\n{direction} slice={idx} (level={level:.2f})")
+        ax.axis("off")
+    fig.tight_layout()
+
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"[infer] wrote visualization: {output_path}")
+
+    if show_interactive:
+        plt.show()
+
+    plt.close(fig)
+
+
+def _run_plot_loss(args: argparse.Namespace) -> None:
+    if args.run_dir is None:
+        raise ValueError("--run-dir is required for command 'plot-loss'.")
+    run_dir = Path(args.run_dir)
+    if run_dir.is_file():
+        run_dir = run_dir.parent
+    history_path = run_dir / "metrics_history.json"
+    if not history_path.exists():
+        raise FileNotFoundError(
+            f"Missing {history_path}. "
+            "Use a run directory path (not a file), or re-run training with updated code to generate "
+            "metrics_history.json."
+        )
+    history = json.loads(history_path.read_text(encoding="utf-8"))
+    output_path = args.plot_output if args.plot_output is not None else (run_dir / "loss_curve.png")
+    ok = write_loss_curve_png(history, output_path)
+    if not ok:
+        raise RuntimeError("Could not create loss plot PNG. Check matplotlib installation.")
+    print(f"[plot-loss] wrote {output_path}")
 
 
 def main() -> None:
@@ -327,6 +471,10 @@ def main() -> None:
             _run_eval(config, device=device, eval_report=args.eval_report)
         else:
             _run_infer(config, args, device=device)
+        return
+
+    if args.command == "plot-loss":
+        _run_plot_loss(args)
         return
 
     validate_config(config)
