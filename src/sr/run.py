@@ -35,6 +35,7 @@ import torch
 from src.data.degradation_spatial import make_spatial_degradation
 from src.sr import (
     DEFAULT_CONFIG,
+    LOSS_NAMES,
     build_model_from_config,
     get_device,
     run_training,
@@ -56,6 +57,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size.")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs.")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate.")
+    parser.add_argument(
+        "--loss-name",
+        choices=LOSS_NAMES,
+        default=None,
+        help=(
+            "Training objective. masked_mse keeps the original brain-masked MSE; "
+            "mse/l1 are unmasked whole-volume losses; masked_l1 is brain-masked MAE."
+        ),
+    )
     parser.add_argument(
         "--model-name",
         choices=["srcnn3d", "rcan3d"],
@@ -187,6 +197,8 @@ def _apply_overrides(args: argparse.Namespace) -> dict:
         config["num_epochs"] = args.epochs
     if args.lr is not None:
         config["learning_rate"] = args.lr
+    if args.loss_name is not None:
+        config["loss_name"] = args.loss_name
     if args.model_name is not None:
         config["model_name"] = args.model_name
     if args.train_split is not None:
@@ -220,6 +232,7 @@ def _print_effective_config(config: dict, command: str, device: str) -> None:
         "[run] Config: "
         f"seed={config['seed']} batch_size={config['batch_size']} epochs={config['num_epochs']} "
         f"lr={config['learning_rate']} train_split={config['train_split']} "
+        f"loss={config['loss_name']} "
         f"model={config['model_name']} deterministic={config['deterministic']} "
         f"output_shape={config['output_patch_shape']}"
     )

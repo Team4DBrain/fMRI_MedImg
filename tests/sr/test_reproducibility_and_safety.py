@@ -37,6 +37,7 @@ class TestReproducibilityAndSafety(unittest.TestCase):
                     "run_id": f"sub-{subject}_ses-00_task-Test_dir-ap",
                     "subject": subject,
                     "path": img_path.name,
+                    "shape": list(vol.shape),
                     "n_volumes": int(vol.shape[3]),
                     "norm_ref": 1.0,
                     "mask_path": f"masks/{mask_path.name}",
@@ -111,7 +112,7 @@ class TestReproducibilityAndSafety(unittest.TestCase):
             train_loader, _, _, _ = create_dataloaders(config)
             writer = SummaryWriter(log_dir=str(root / "tb"))
             try:
-                loss_value = train_one_epoch(
+                metrics = train_one_epoch(
                     0,
                     model,
                     train_loader,
@@ -122,7 +123,8 @@ class TestReproducibilityAndSafety(unittest.TestCase):
                 )
             finally:
                 writer.close()
-            self.assertTrue(np.isfinite(loss_value))
+            self.assertTrue(np.isfinite(metrics["loss"]))
+            self.assertTrue(np.isfinite(metrics["mse"]))
 
 
 if __name__ == "__main__":

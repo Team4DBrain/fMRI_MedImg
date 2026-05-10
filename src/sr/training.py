@@ -18,6 +18,7 @@ import json
 import math
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -75,6 +76,112 @@ def masked_mse_loss(
     return weighted.sum() / denom
 
 
+LossFunction = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+def mse_loss(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    _mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute unmasked MSE over the whole predicted HR volume.
+
+    Purpose:
+        Let experiments compare brain-masked optimization against a plain
+        reconstruction objective that also penalizes background voxels.
+    Effects:
+        Directly affects gradients when selected via `loss_name="mse"`.
+    Influences:
+        Result depends on output/target scaling and volume size; unlike masked
+        losses, background intensity errors contribute to the objective.
+    How to change safely:
+        Keep the signature aligned with other loss functions so
+        `resolve_loss_function` can swap objectives without training-loop
+        changes.
+    """
+    return F.mse_loss(outputs, targets)
+
+
+def masked_l1_loss(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Compute L1/MAE over voxels selected by a mask.
+
+    Purpose:
+        Offer a less outlier-sensitive alternative to masked MSE while keeping
+        optimization focused on in-brain voxels.
+    Effects:
+        Directly affects gradients when selected via `loss_name="masked_l1"`.
+    Influences:
+        Result depends on mask coverage and intensity normalization; increasing
+        mask scope makes more voxels contribute equally by absolute error.
+    How to change safely:
+        Keep mask semantics consistent with `mask_hr`, and update metric labels
+        or tests if the normalization policy changes.
+    """
+    abs_err = torch.abs(outputs - targets)
+    weighted = abs_err * mask
+    denom = torch.clamp(mask.sum(), min=eps)
+    return weighted.sum() / denom
+
+
+def l1_loss(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    _mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute unmasked L1/MAE over the whole predicted HR volume.
+
+    Purpose:
+        Let experiments optimize absolute reconstruction error without applying
+        the brain mask.
+    Effects:
+        Directly affects gradients when selected via `loss_name="l1"`.
+    Influences:
+        Background voxels and normalization scale can change the objective
+        magnitude because every voxel contributes equally.
+    How to change safely:
+        Preserve the interchangeable loss signature so new objectives remain
+        pluggable in training and validation.
+    """
+    return F.l1_loss(outputs, targets)
+
+
+LOSS_REGISTRY: dict[str, LossFunction] = {
+    "masked_mse": masked_mse_loss,
+    "mse": mse_loss,
+    "masked_l1": masked_l1_loss,
+    "l1": l1_loss,
+}
+
+
+def resolve_loss_function(loss_name: str) -> LossFunction:
+    """Return the configured optimization objective by stable name.
+
+    Purpose:
+        Keep loss selection modular so experiments can switch objectives from
+        config/CLI without editing the training loop.
+    Effects:
+        Controls which scalar is backpropagated and, for validation, which loss
+        drives LR scheduling and best-checkpoint selection.
+    Influences:
+        Available names are defined in `LOSS_REGISTRY`; adding a loss requires
+        registering it here and validating the config name.
+    How to change safely:
+        Keep error messages listing valid names so bad experiment configs fail
+        early and are easy to fix.
+    """
+    normalized = str(loss_name).strip().lower()
+    try:
+        return LOSS_REGISTRY[normalized]
+    except KeyError as exc:
+        available = ", ".join(sorted(LOSS_REGISTRY))
+        raise ValueError(f"Unknown loss_name '{loss_name}'. Available: {available}") from exc
+
+
 def _ssim_window_size(spatial: tuple[int, int, int]) -> int:
     m = min(spatial)
     w = min(7, m)
@@ -130,24 +237,27 @@ def masked_local_ssim_3d(
     return weighted / denom
 
 
-def validate_one_epoch(model, val_loader, device):
+def validate_one_epoch(model, val_loader, device, loss_fn: LossFunction | None = None):
     """Run validation metrics for one epoch without gradient updates.
 
     Purpose:
         Quantify generalization after each training epoch.
     Effects:
-        Produces masked MSE/SSIM used in logs, scheduler decisions, and best
-        checkpoint selection.
+        Produces the selected validation loss plus masked MSE/SSIM used in logs,
+        scheduler decisions, and best checkpoint selection.
     Influences:
         Behavior depends on whether a validation loader exists; missing loader
         returns NaNs by design.
     How to change safely:
-        Maintain returned dictionary keys (`mse`, `ssim`) because callers and
-        summaries depend on them.
+        Maintain returned dictionary keys (`loss`, `mse`, `ssim`) because
+        callers and summaries depend on them.
     """
     if val_loader is None:
-        return {"mse": float("nan"), "ssim": float("nan")}
+        return {"loss": float("nan"), "mse": float("nan"), "ssim": float("nan")}
+    if loss_fn is None:
+        loss_fn = masked_mse_loss
     model.eval()
+    running_loss = 0.0
     running_mse = 0.0
     running_ssim = 0.0
     n_batches = max(1, len(val_loader))
@@ -157,9 +267,14 @@ def validate_one_epoch(model, val_loader, device):
             labels = batch["target"].to(device)
             mask = batch["mask_hr"].to(device)
             outputs = model(inputs)
+            running_loss += loss_fn(outputs, labels, mask).item()
             running_mse += masked_mse_loss(outputs, labels, mask).item()
             running_ssim += masked_local_ssim_3d(outputs, labels, mask).item()
-    return {"mse": running_mse / n_batches, "ssim": running_ssim / n_batches}
+    return {
+        "loss": running_loss / n_batches,
+        "mse": running_mse / n_batches,
+        "ssim": running_ssim / n_batches,
+    }
 
 
 def train_one_epoch(
@@ -171,24 +286,29 @@ def train_one_epoch(
     tb_writer,
     log_interval=10,
     strict_finite_loss: bool = True,
+    loss_fn: LossFunction | None = None,
+    loss_name: str = "masked_mse",
 ):
     """Execute one full training epoch over the training loader.
 
     Purpose:
-        Perform forward/backward optimization steps and collect train-loss
-        statistics.
+        Perform forward/backward optimization steps and collect train loss plus
+        masked-MSE statistics.
     Effects:
         Updates model weights, writes batch loss to TensorBoard, and returns the
-        epoch-average training loss.
+        epoch-average selected training loss and masked MSE metric.
     Influences:
-        Behavior depends on optimizer state, `strict_finite_loss`, and
-        `log_interval` verbosity.
+        Behavior depends on optimizer state, selected `loss_fn`,
+        `strict_finite_loss`, and `log_interval` verbosity.
     How to change safely:
-        Keep loss definition aligned with validation/eval metrics and preserve
-        global-step semantics used by TensorBoard comparisons.
+        Keep loss selection aligned with validation and preserve global-step
+        semantics used by TensorBoard comparisons.
     """
+    if loss_fn is None:
+        loss_fn = masked_mse_loss
     model.train()
     running_loss = 0.0
+    running_mse = 0.0
     for batch_idx, batch in enumerate(train_loader):
         inputs = batch["input"].to(device)
         labels = batch["target"].to(device)
@@ -196,20 +316,26 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         outputs = model(inputs)
-        loss = masked_mse_loss(outputs, labels, mask)
+        loss = loss_fn(outputs, labels, mask)
         if strict_finite_loss:
             ensure_finite_loss(loss, epoch_index=epoch_index, batch_idx=batch_idx)
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item()
+        running_mse += masked_mse_loss(outputs.detach(), labels, mask).item()
         global_step = epoch_index * len(train_loader) + batch_idx
         tb_writer.add_scalar("batch/loss_train", loss.item(), global_step)
+        tb_writer.add_scalar("batch/mse_train", running_mse / (batch_idx + 1), global_step)
 
         if (batch_idx + 1) % log_interval == 0:
-            print(f"Epoch {epoch_index + 1} Batch {batch_idx + 1}/{len(train_loader)} loss={loss.item():.6f}")
+            print(
+                f"Epoch {epoch_index + 1} Batch {batch_idx + 1}/{len(train_loader)} "
+                f"{loss_name}={loss.item():.6f}"
+            )
 
-    return running_loss / max(1, len(train_loader))
+    n_batches = max(1, len(train_loader))
+    return {"loss": running_loss / n_batches, "mse": running_mse / n_batches}
 
 
 def save_checkpoint(path: Path, epoch: int, model, optimizer, best_val_loss: float, config: dict):
@@ -309,7 +435,7 @@ def build_training_components(model, config: dict):
     return optimizer, scheduler
 
 
-def write_loss_curve_png(history: dict[str, list[float]], output_path: Path) -> bool:
+def write_loss_curve_png(history: dict[str, object], output_path: Path) -> bool:
     """Render epoch-wise loss history to a PNG for quick run inspection.
 
     Purpose:
@@ -334,14 +460,17 @@ def write_loss_curve_png(history: dict[str, list[float]], output_path: Path) -> 
         return False
 
     epochs = history.get("epoch", [])
-    train_loss = history.get("train_mse", [])
-    val_loss = history.get("val_mse", [])
+    train_loss = history.get("train_loss", history.get("train_mse", []))
+    val_loss = history.get("val_loss", history.get("val_mse", []))
+    if not isinstance(epochs, list) or not isinstance(train_loss, list) or not isinstance(val_loss, list):
+        return False
     if not epochs or not train_loss:
         return False
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(epochs, train_loss, marker="o", linewidth=1.8, label="train_mse")
+    loss_name = str(history.get("loss_name", "masked_mse"))
+    ax.plot(epochs, train_loss, marker="o", linewidth=1.8, label=f"train_{loss_name}")
     finite_val = [
         (epoch, value)
         for epoch, value in zip(epochs, val_loss, strict=False)
@@ -349,9 +478,9 @@ def write_loss_curve_png(history: dict[str, list[float]], output_path: Path) -> 
     ]
     if finite_val:
         val_epochs, val_values = zip(*finite_val)
-        ax.plot(val_epochs, val_values, marker="o", linewidth=1.8, label="val_mse")
+        ax.plot(val_epochs, val_values, marker="o", linewidth=1.8, label=f"val_{loss_name}")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("MSE Loss")
+    ax.set_ylabel("Loss")
     ax.set_title("Loss over epochs")
     ax.grid(True, linestyle="--", alpha=0.35)
     ax.legend()
@@ -383,6 +512,8 @@ def run_training(config: dict, model=None, device: str | None = None):
         model = build_model_from_config(config).to(device)
 
     optimizer, scheduler = build_training_components(model, config)
+    loss_name = str(config.get("loss_name", "masked_mse")).strip().lower()
+    loss_fn = resolve_loss_function(loss_name)
 
     model_name = str(config["model_name"]).strip().lower()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -417,10 +548,25 @@ def run_training(config: dict, model=None, device: str | None = None):
         device,
     )
 
-    last_val_metrics: dict[str, float] = {"mse": float("nan"), "ssim": float("nan")}
-    history: dict[str, list[float]] = {"epoch": [], "train_mse": [], "val_mse": [], "lr": []}
+    last_val_metrics: dict[str, float] = {"loss": float("nan"), "mse": float("nan"), "ssim": float("nan")}
+    best_val_mse = float("nan")
+    epoch_history: list[float] = []
+    train_loss_history: list[float] = []
+    val_loss_history: list[float] = []
+    train_mse_history: list[float] = []
+    val_mse_history: list[float] = []
+    lr_history: list[float] = []
+    history: dict[str, object] = {
+        "loss_name": loss_name,
+        "epoch": epoch_history,
+        "train_loss": train_loss_history,
+        "val_loss": val_loss_history,
+        "train_mse": train_mse_history,
+        "val_mse": val_mse_history,
+        "lr": lr_history,
+    }
     for epoch in range(start_epoch, config["num_epochs"]):
-        train_loss = train_one_epoch(
+        train_metrics = train_one_epoch(
             epoch,
             model,
             train_loader,
@@ -429,39 +575,51 @@ def run_training(config: dict, model=None, device: str | None = None):
             writer,
             log_interval=config["log_interval"],
             strict_finite_loss=bool(config.get("strict_finite_loss", True)),
+            loss_fn=loss_fn,
+            loss_name=loss_name,
         )
+        train_loss = train_metrics["loss"]
+        train_mse = train_metrics["mse"]
 
-        val_metrics = validate_one_epoch(model, val_loader, device)
-        val_loss = val_metrics["mse"]
+        val_metrics = validate_one_epoch(model, val_loader, device, loss_fn=loss_fn)
+        val_loss = val_metrics["loss"]
+        val_mse = val_metrics["mse"]
         scheduler.step(val_loss)
         last_val_metrics = val_metrics
 
         current_lr = optimizer.param_groups[0]["lr"]
         writer.add_scalar("epoch/loss_train", train_loss, epoch)
+        writer.add_scalar("epoch/mse_train", train_mse, epoch)
         writer.add_scalar("epoch/lr", current_lr, epoch)
-        train_psnr = psnr_from_mse(train_loss)
+        train_psnr = psnr_from_mse(train_mse)
         writer.add_scalar("epoch/psnr_train", train_psnr, epoch)
-        history["epoch"].append(float(epoch + 1))
-        history["train_mse"].append(float(train_loss))
-        history["lr"].append(float(current_lr))
+        epoch_history.append(float(epoch + 1))
+        train_loss_history.append(float(train_loss))
+        train_mse_history.append(float(train_mse))
+        lr_history.append(float(current_lr))
 
         if val_loader is not None:
             writer.add_scalar("epoch/loss_val", val_loss, epoch)
-            val_psnr = psnr_from_mse(val_loss)
+            writer.add_scalar("epoch/mse_val", val_mse, epoch)
+            val_psnr = psnr_from_mse(val_mse)
             writer.add_scalar("epoch/psnr_val", val_psnr, epoch)
             writer.add_scalar("epoch/ssim_val", val_metrics["ssim"], epoch)
-            history["val_mse"].append(float(val_loss))
+            val_loss_history.append(float(val_loss))
+            val_mse_history.append(float(val_mse))
             print(
                 f"Epoch {epoch + 1}/{config['num_epochs']} "
-                f"train={train_loss:.6f} val_mse={val_loss:.6f} "
+                f"train_{loss_name}={train_loss:.6f} val_{loss_name}={val_loss:.6f} "
+                f"train_mse={train_mse:.6f} val_mse={val_mse:.6f} "
                 f"psnr_train={train_psnr:.2f} psnr_val={val_psnr:.2f} "
                 f"ssim_val={val_metrics['ssim']:.4f} lr={current_lr:.2e}"
             )
         else:
-            history["val_mse"].append(float("nan"))
+            val_loss_history.append(float("nan"))
+            val_mse_history.append(float("nan"))
             print(
                 f"Epoch {epoch + 1}/{config['num_epochs']} "
-                f"train={train_loss:.6f} psnr_train={train_psnr:.2f} lr={current_lr:.2e}"
+                f"train_{loss_name}={train_loss:.6f} train_mse={train_mse:.6f} "
+                f"psnr_train={train_psnr:.2f} lr={current_lr:.2e}"
             )
 
         if (epoch + 1) % config["checkpoint_interval"] == 0:
@@ -470,13 +628,18 @@ def run_training(config: dict, model=None, device: str | None = None):
 
         if val_loader is not None and val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_val_mse = val_mse
             save_checkpoint(run_dir / "best.pt", epoch, model, optimizer, best_val_loss, config)
 
     save_checkpoint(run_dir / "final.pt", config["num_epochs"] - 1, model, optimizer, best_val_loss, config)
     writer.close()
     summary = {
-        "best_val_mse": best_val_loss if val_loader is not None else float("nan"),
-        "final_train_mse": train_loss,
+        "loss_name": loss_name,
+        "best_val_loss": best_val_loss if val_loader is not None else float("nan"),
+        "best_val_mse": best_val_mse if val_loader is not None else float("nan"),
+        "final_train_loss": train_loss,
+        "final_train_mse": train_mse,
+        "final_val_loss": last_val_metrics["loss"],
         "final_val_mse": last_val_metrics["mse"],
         "final_val_psnr": psnr_from_mse(last_val_metrics["mse"]),
         "final_val_ssim": last_val_metrics["ssim"],

@@ -29,6 +29,12 @@ class TestModelFactoryAndConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_config(config)
 
+    def test_validate_config_rejects_unknown_loss(self):
+        config = dict(DEFAULT_CONFIG)
+        config["loss_name"] = "not-real"
+        with self.assertRaises(ValueError):
+            validate_config(config)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,7 @@ OUTPUT_DIM_X = 128
 OUTPUT_DIM_Y = 128
 OUTPUT_DIM_Z = 93
 OUTPUT_DIM = (OUTPUT_DIM_X, OUTPUT_DIM_Y, OUTPUT_DIM_Z)
+LOSS_NAMES = ("masked_mse", "mse", "masked_l1", "l1")
 
 DEFAULT_CONFIG = {
     "seed": 42,
@@ -53,6 +54,7 @@ DEFAULT_CONFIG = {
     "enable_subject_split": False,
     "model_name": "srcnn3d",
     "model_kwargs": {},
+    "loss_name": "masked_mse",
     "resume_checkpoint": None,
     "strict_finite_loss": True,
 }
@@ -155,6 +157,10 @@ def validate_config(config: dict) -> None:
         raise ValueError("learning_rate must be > 0.")
     if float(config["source_voxel_mm"]) <= 0 or float(config["target_voxel_mm"]) <= 0:
         raise ValueError("source_voxel_mm and target_voxel_mm must be > 0.")
+    loss_name = str(config.get("loss_name", "masked_mse")).strip().lower()
+    if loss_name not in LOSS_NAMES:
+        available = ", ".join(LOSS_NAMES)
+        raise ValueError(f"Unknown loss_name '{config.get('loss_name')}'. Available: {available}")
 
     model_name = str(config["model_name"]).strip().lower()
     if model_name not in MODEL_REGISTRY:
