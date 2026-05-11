@@ -1,174 +1,242 @@
-"""Define and validate runtime configuration for the spatial SR pipeline.
+"""Runtime configuration for the spatial-SR pipeline.
 
 Purpose:
-    Centralize defaults and reproducibility policy so train/eval/infer resolve
-    behavior from one source of truth.
+    Provide one explicit, serialisable place that holds every value driving
+    training, evaluation and inference. Every field has a default so a fresh
+    user can run the pipeline without guessing parameters, while the saved
+    ``config.json`` makes each completed run fully reproducible.
 Effects:
-    Directly affects model selection, data loading, optimization settings,
-    output geometry, and safety checks in `src.sr.run` and `src.sr.training`.
+    Drives model/data/optimizer construction and the train/val split. The
+    JSON form lands in the run directory and is the single source of truth
+    when a run is resumed.
 Influences:
-    Values can be overridden by CLI flags in `src.sr.run._apply_overrides` and
-    partially replaced by checkpoint config for eval/infer.
+    CLI flags in ``src.sr.cli`` override defaults at construction time.
+    ``validate(...)`` is called once before any expensive work to fail fast
+    on inconsistent values.
 How to change safely:
-    Keep keys aligned with `run.py` override handling and
-    `training.py`/`data.py` consumers; update `validate_config` whenever adding
-    new config fields that can break runtime assumptions.
+    Add a new field with a default. Update ``validate`` if the field needs
+    range/registry checks. Keep ``to_json``/``from_json`` in sync if the
+    field is not JSON-serialisable out of the box (Path/tuple are handled).
 """
 
+from __future__ import annotations
+
+import json
 import random
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 
-from .model import MODEL_REGISTRY
-
-INPUT_DIM_X = 64
-INPUT_DIM_Y = 64
-INPUT_DIM_Z = 46
-INPUT_DIM = (INPUT_DIM_X, INPUT_DIM_Y, INPUT_DIM_Z)
-OUTPUT_DIM_X = 128
-OUTPUT_DIM_Y = 128
-OUTPUT_DIM_Z = 93
-OUTPUT_DIM = (OUTPUT_DIM_X, OUTPUT_DIM_Y, OUTPUT_DIM_Z)
-LOSS_NAMES = ("masked_mse", "mse", "masked_l1", "l1")
-
-DEFAULT_CONFIG = {
-    "seed": 42,
-    "deterministic": True,
-    "batch_size": 4,
-    "num_epochs": 20,
-    "learning_rate": 1e-3,
-    "train_split": 0.8,
-    "num_workers": 0,
-    "log_interval": 10,
-    "checkpoint_interval": 1,
-    "run_root": Path("./src/sr/runs"),
-    "manifest_path": Path("./manifest.json"),
-    "input_patch_shape": INPUT_DIM,
-    "output_patch_shape": OUTPUT_DIM,
-    "source_voxel_mm": 1.5,
-    "target_voxel_mm": 3.0,
-    "train_subjects": None,
-    "val_subjects": None,
-    "enable_subject_split": False,
-    "model_name": "srcnn3d",
-    "model_kwargs": {},
-    "loss_name": "masked_mse",
-    "resume_checkpoint": None,
-    "strict_finite_loss": True,
-}
+DEFAULT_MANIFEST_PATH = Path("/srv/venvs/team4dbrain/derivatives/manifest.json")
+DEFAULT_RUN_ROOT = Path("src/sr/runs")
+DEFAULT_OUTPUT_SHAPE: tuple[int, int, int] = (128, 128, 93)
 
 
-def set_seed(seed: int, deterministic: bool = False) -> None:
-    """Set random seeds and backend policy for reproducible experiments.
+@dataclass
+class SRConfig:
+    """All knobs the SR pipeline reads at runtime.
 
-    Purpose:
-        Make data order, initialization, and stochastic ops repeatable.
-    Effects:
-        Changes Python/NumPy/PyTorch RNG streams and then applies deterministic
-        backend policy, which affects runtime speed vs reproducibility.
-    Influences:
-        Effective behavior depends on CUDA availability and the `deterministic`
-        flag passed from config/CLI.
-    How to change safely:
-        Keep this as the single place where all RNGs are seeded before training
-        or evaluation; if a new RNG source is introduced, seed it here too.
+    Defaults reflect the IBC dataset at 1.5 mm (HR) -> 3 mm (LR) with the
+    no_crop_v1 data pipeline. Edit ``config.json`` directly inside a run
+    directory if you want to resume with a different number of epochs.
+    """
+
+    # Reproducibility / safety
+    seed: int = 42
+    deterministic: bool = True
+    strict_finite_loss: bool = True
+
+    # Paths
+    manifest_path: Path = DEFAULT_MANIFEST_PATH
+    run_root: Path = DEFAULT_RUN_ROOT
+
+    # Model
+    model_name: str = "srcnn3d"
+    model_kwargs: dict[str, Any] = field(default_factory=dict)
+    output_patch_shape: tuple[int, int, int] = DEFAULT_OUTPUT_SHAPE
+
+    # Spatial degradation
+    source_voxel_mm: float = 1.5
+    target_voxel_mm: float = 3.0
+
+    # Subject split (0.8/0.2 by default; explicit lists override the random split)
+    train_split: float = 0.8
+    train_subjects: list[str] | None = None
+    val_subjects: list[str] | None = None
+
+    # Training loop
+    batch_size: int = 4
+    num_epochs: int = 20
+    num_workers: int = 0
+    log_interval: int = 10
+
+    # Loss + optimizer + scheduler (modular: swap names, kwargs stay JSON)
+    loss_name: str = "masked_mse"
+    optimizer_name: str = "adam"
+    learning_rate: float = 1e-3
+    optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
+    scheduler_name: str = "plateau"
+    scheduler_kwargs: dict[str, Any] = field(
+        default_factory=lambda: {"factor": 0.5, "patience": 3}
+    )
+
+    # Logging
+    tensorboard: bool = True
+
+
+def to_json(config: SRConfig, path: Path) -> None:
+    """Write ``config`` to ``path`` as pretty-printed JSON.
+
+    Atomic via tmp + replace so an interrupt cannot leave a half-written
+    file that breaks a later resume.
+    """
+    payload = _config_to_dict(config)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def from_json(path: Path) -> SRConfig:
+    """Load an ``SRConfig`` from a JSON file written by ``to_json``."""
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return _config_from_dict(raw)
+
+
+def _config_to_dict(config: SRConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["manifest_path"] = str(config.manifest_path)
+    payload["run_root"] = str(config.run_root)
+    payload["output_patch_shape"] = list(config.output_patch_shape)
+    return payload
+
+
+def _config_from_dict(raw: dict[str, Any]) -> SRConfig:
+    kwargs: dict[str, Any] = dict(raw)
+    if "manifest_path" in kwargs:
+        kwargs["manifest_path"] = Path(kwargs["manifest_path"])
+    if "run_root" in kwargs:
+        kwargs["run_root"] = Path(kwargs["run_root"])
+    if "output_patch_shape" in kwargs:
+        kwargs["output_patch_shape"] = tuple(kwargs["output_patch_shape"])
+    return SRConfig(**kwargs)
+
+
+def validate(config: SRConfig) -> None:
+    """Fail fast on inconsistent or impossible configurations.
+
+    Performs registry lookups via late imports to avoid a circular import
+    chain (``models``/``losses``/``components`` all read ``SRConfig`` types).
+    """
+    from src.sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
+    from src.sr.losses import LOSS_REGISTRY
+    from src.sr.models import MODEL_REGISTRY
+
+    if config.batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if config.num_epochs < 1:
+        raise ValueError("num_epochs must be >= 1")
+    if config.num_workers < 0:
+        raise ValueError("num_workers must be >= 0")
+    if config.log_interval < 1:
+        raise ValueError("log_interval must be >= 1")
+    if config.learning_rate <= 0:
+        raise ValueError("learning_rate must be > 0")
+    if not 0.0 < config.train_split <= 1.0:
+        raise ValueError("train_split must be in (0, 1]")
+    if config.source_voxel_mm <= 0 or config.target_voxel_mm <= 0:
+        raise ValueError("source_voxel_mm and target_voxel_mm must be > 0")
+    if len(config.output_patch_shape) != 3:
+        raise ValueError("output_patch_shape must have 3 entries (D, H, W)")
+
+    if config.model_name not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model_name '{config.model_name}'. "
+            f"Available: {sorted(MODEL_REGISTRY)}"
+        )
+    if config.loss_name not in LOSS_REGISTRY:
+        raise ValueError(
+            f"Unknown loss_name '{config.loss_name}'. "
+            f"Available: {sorted(LOSS_REGISTRY)}"
+        )
+    if config.optimizer_name not in OPTIMIZER_REGISTRY:
+        raise ValueError(
+            f"Unknown optimizer_name '{config.optimizer_name}'. "
+            f"Available: {sorted(OPTIMIZER_REGISTRY)}"
+        )
+    if config.scheduler_name not in SCHEDULER_REGISTRY:
+        raise ValueError(
+            f"Unknown scheduler_name '{config.scheduler_name}'. "
+            f"Available: {sorted(SCHEDULER_REGISTRY)}"
+        )
+
+    manifest = Path(config.manifest_path)
+    if not manifest.exists():
+        raise FileNotFoundError(f"manifest_path does not exist: {manifest}")
+
+
+def seed_everything(seed: int, deterministic: bool) -> None:
+    """Seed Python/NumPy/torch and toggle deterministic backends.
+
+    Calling this once in the main process is enough; DataLoader workers
+    are seeded separately via ``worker_init_fn`` in ``src.sr.data``.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    apply_deterministic_policy(deterministic)
-
-
-def apply_deterministic_policy(deterministic: bool) -> None:
-    """Toggle deterministic algorithm/backends used by PyTorch.
-
-    Purpose:
-        Control the trade-off between reproducibility and throughput.
-    Effects:
-        Enables deterministic algorithms and disables cuDNN benchmarking when
-        requested; otherwise restores faster non-deterministic defaults.
-    Influences:
-        Behavior differs on CPU-only vs CUDA runs because cuDNN flags only apply
-        when available.
-    How to change safely:
-        If backend flags are updated, keep both branches explicit so users can
-        still intentionally choose reproducible or performance-oriented runs.
-    """
     if deterministic:
         torch.use_deterministic_algorithms(True, warn_only=True)
         if torch.backends.cudnn.is_available():
-            torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
     else:
         torch.use_deterministic_algorithms(False)
         if torch.backends.cudnn.is_available():
-            torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
 
 
-def get_device() -> str:
-    """Return the default compute device for SR commands.
-
-    Purpose:
-        Provide one consistent auto-selection policy for train/eval/infer.
-    Effects:
-        Determines where tensors/models are allocated when the user does not
-        pass `--device`.
-    Influences:
-        Depends on `torch.cuda.is_available()` at runtime.
-    How to change safely:
-        Keep return values compatible with `argparse` `--device` choices and
-        with `.to(device)` calls throughout the SR module.
-    """
+def auto_device() -> str:
+    """Pick ``cuda`` when available, else ``cpu``. Single source of truth."""
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def validate_config(config: dict) -> None:
-    """Fail fast when config values would produce invalid or unsafe runs.
+def summary(config: SRConfig) -> str:
+    """Human-readable, one-screen block of the active configuration.
 
-    Purpose:
-        Catch misconfiguration before expensive training/evaluation starts.
-    Effects:
-        Rejects impossible splits, invalid optimization settings, unknown model
-        names, malformed kwargs, and missing manifest path.
-    Influences:
-        Validation criteria depend on model registry contents and whether
-        subject splitting is enabled.
-    How to change safely:
-        Add checks whenever new config keys drive behavior in data/model/trainer
-        code, so errors remain early and actionable.
+    Used right after ``validate`` so users see exactly what the run will do
+    before any data is read. The order mirrors the dataclass for greppability.
     """
-    if bool(config.get("enable_subject_split", False)):
-        if not 0.0 < float(config["train_split"]) <= 1.0:
-            raise ValueError("train_split must be in (0, 1]. when subject split is enabled.")
-    if int(config["batch_size"]) < 1:
-        raise ValueError("batch_size must be >= 1.")
-    if int(config["num_epochs"]) < 1:
-        raise ValueError("num_epochs must be >= 1.")
-    if int(config["num_workers"]) < 0:
-        raise ValueError("num_workers must be >= 0.")
-    if int(config["checkpoint_interval"]) < 1:
-        raise ValueError("checkpoint_interval must be >= 1.")
-    if float(config["learning_rate"]) <= 0:
-        raise ValueError("learning_rate must be > 0.")
-    if float(config["source_voxel_mm"]) <= 0 or float(config["target_voxel_mm"]) <= 0:
-        raise ValueError("source_voxel_mm and target_voxel_mm must be > 0.")
-    loss_name = str(config.get("loss_name", "masked_mse")).strip().lower()
-    if loss_name not in LOSS_NAMES:
-        available = ", ".join(LOSS_NAMES)
-        raise ValueError(f"Unknown loss_name '{config.get('loss_name')}'. Available: {available}")
-
-    model_name = str(config["model_name"]).strip().lower()
-    if model_name not in MODEL_REGISTRY:
-        available = ", ".join(sorted(MODEL_REGISTRY))
-        raise ValueError(f"Unknown model_name '{config['model_name']}'. Available: {available}")
-    if not isinstance(config.get("model_kwargs", {}), dict):
-        raise ValueError("model_kwargs must be a dictionary.")
-
-    manifest_path = Path(config["manifest_path"])
-    if not manifest_path.exists():
-        raise ValueError(f"manifest_path does not exist: {manifest_path}")
+    lines = [
+        "Configuration",
+        f"  seed              = {config.seed}",
+        f"  deterministic     = {config.deterministic}",
+        f"  strict_finite     = {config.strict_finite_loss}",
+        f"  manifest_path     = {config.manifest_path}",
+        f"  run_root          = {config.run_root}",
+        f"  model_name        = {config.model_name}",
+        f"  model_kwargs      = {config.model_kwargs}",
+        f"  output_patch      = {tuple(config.output_patch_shape)}",
+        f"  source/target_mm  = {config.source_voxel_mm} -> {config.target_voxel_mm}",
+        f"  train_split       = {config.train_split}",
+        f"  train_subjects    = {config.train_subjects}",
+        f"  val_subjects      = {config.val_subjects}",
+        f"  batch_size        = {config.batch_size}",
+        f"  num_epochs        = {config.num_epochs}",
+        f"  num_workers       = {config.num_workers}",
+        f"  log_interval      = {config.log_interval}",
+        f"  loss_name         = {config.loss_name}",
+        f"  optimizer_name    = {config.optimizer_name}",
+        f"  learning_rate     = {config.learning_rate}",
+        f"  optimizer_kwargs  = {config.optimizer_kwargs}",
+        f"  scheduler_name    = {config.scheduler_name}",
+        f"  scheduler_kwargs  = {config.scheduler_kwargs}",
+        f"  tensorboard       = {config.tensorboard}",
+    ]
+    return "\n".join(lines)

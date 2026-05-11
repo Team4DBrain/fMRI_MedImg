@@ -1,34 +1,6 @@
-"""Re-export stable SR entry points used by CLI and external callers.
+"""Spatial super-resolution package.
 
-Purpose:
-    Provide a concise import surface (`src.sr`) without exposing internal file
-    structure details to downstream code.
-Effects:
-    Controls which symbols are considered public and import-stable.
-Influences:
-    Public surface changes when module-level exports or `__all__` are modified.
-How to change safely:
-    Add/remove exports intentionally and keep references in `run.py` and tests
-    aligned to avoid import regressions.
+This package is intentionally import-light. Use the dedicated submodules
+directly (`src.sr.config`, `src.sr.train`, `src.sr.infer`, ...) and the CLI
+entry point ``python -m src.sr`` for end-to-end runs.
 """
-
-from .config import DEFAULT_CONFIG, LOSS_NAMES, apply_deterministic_policy, get_device, set_seed, validate_config
-from .data import create_dataloaders
-from .model import MODEL_REGISTRY, RCAN3D, SRCNN3D, build_model_from_config, select_model
-from .training import run_training
-
-__all__ = [
-    "DEFAULT_CONFIG",
-    "LOSS_NAMES",
-    "set_seed",
-    "apply_deterministic_policy",
-    "get_device",
-    "validate_config",
-    "MODEL_REGISTRY",
-    "SRCNN3D",
-    "RCAN3D",
-    "select_model",
-    "build_model_from_config",
-    "create_dataloaders",
-    "run_training",
-]

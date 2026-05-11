@@ -1,179 +1,146 @@
-## `src/sr` - Spatial Super-Resolution Pipeline
+# `src/sr` — Spatial Super-Resolution
 
-This package trains and runs 3D super-resolution models that reconstruct a
-high-resolution (HR) fMRI volume from a simulated low-resolution (LR) volume.
-Two model backbones (`srcnn3d`, `rcan3d`) share one common data and training
-pipeline.
+Minimal, modular 3D SR pipeline for fMRI volumes. Three commands, one
+config dataclass, one checkpoint format. No automatic post-training
+analysis — the user composes plots, comparisons, and reports themselves.
 
-## Models
+## Layout
 
-- **`srcnn3d`**: Trilinear upsample to HR, then a shallow 3D SRCNN stack. Default
-  in [`config.py`](config.py) because it is cheaper in memory and time while the
-  pipeline is validated.
-- **`rcan3d`**: 3D adaptation of the RCAN topology from the reference 2D
-  implementation (residual channel-attention blocks inside **residual groups**,
-  then a final body convolution, then a **global skip** from head features—see
-  [`model.py`](model.py)). LR→HR sizing uses **trilinear** interpolation to
-  `output_patch_shape`, not learnable PixelShuffle, which matches fixed HR patch
-  geometry from the dataset. It is **not** weight-compatible with ~/RCAN
-  checkpoints. Constructor knobs include `n_feats`, `n_resgroups`,
-  `n_resblocks`, and `reduction` (passed via `model_kwargs` in config).
+```
+src/sr/
+├── config.py       # SRConfig dataclass, defaults, JSON IO, validate
+├── models.py       # SRCNN3D, RCAN3D, MODEL_REGISTRY, build_model
+├── losses.py       # mse, masked_mse, l1, masked_l1 + LOSS_REGISTRY
+├── metrics.py      # psnr, masked/unmasked SSIM, compute_full_metrics
+├── components.py   # OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
+├── data.py         # build_loaders, subject split, seeded workers
+├── checkpoint.py   # EpochState save/load, find_latest_epoch
+├── train.py        # train(config, resume_dir=None)
+├── infer.py        # evaluate, infer_one, list_samples, make_slice_figure
+└── cli.py + __main__.py   # `python -m src.sr ...`
+```
 
-## End-to-end program flow
+Each module owns one responsibility. To swap a loss, model, optimizer or
+scheduler, add an entry to the corresponding registry and pass its name
+via the CLI — no edits to `train.py` required.
 
-The CLI entrypoint is `python -m src.sr.run <command>`.
+## Defaults
 
-1. Build config from defaults + CLI overrides (`config.py`, `run.py`).
-2. Validate config to fail fast on bad values (`validate_config`).
-3. Set seed and deterministic backend policy for reproducibility.
-4. Build train/val loaders (`data.py` -> `SpatialSRDataset`).
-5. Build model from the registry (`model.py`).
-6. Execute one command path:
-   - `train`: optimize model and save artifacts/checkpoints.
-   - `eval`: load checkpoint and report masked metrics.
-   - `infer`: run one sample and optionally save prediction.
-   - `plot-loss`: render loss curve from run history.
-
-## Why each training step exists
-
-- **Manifest-driven loading**: keeps paths, shapes, and metadata centralized and
-  consistent.
-- **Spatial degradation (HR -> LR)**: creates realistic LR inputs via k-space
-  truncation so SR learning matches the target acquisition scenario.
-- **Mask-aware loss/metrics**: focuses optimization/evaluation on in-brain
-  voxels instead of background.
-- **Train/val subject split**: supports cleaner validation and reduces leakage
-  risk when split mode is enabled.
-- **Checkpointing + logs**: enables resume, model selection (`best.pt`), and
-  reproducible experiment tracking.
-
-## Scope
-
-- single spatial SR task
-- model registry with `srcnn3d` and `rcan3d`
-- canonical dataset contract from `src.data.datasets.SpatialSRDataset`
-- mask-aware MSE/PSNR/SSIM reporting
-- reproducible splits and run artifacts
-
-## Module map
-
-- `config.py`: defaults, seed/device helpers, config validation
-- `model.py`: `SRCNN3D`, `RCAN3D`, registry/factory
-- `data.py`: subject splitting and DataLoader creation
-- `training.py`: losses, metrics, training loop, checkpointing, loss plotting
-- `run.py`: CLI parser and command execution
-
-## Data contract
-
-`SpatialSRDataset` returns dictionaries with:
-
-- `input`: LR volume `(1, kx, ky, kz)`
-- `target`: HR volume `(1, X, Y, Z)`
-- `mask_hr`: HR brain mask `(1, X, Y, Z)`
-- `mask_lr`: LR brain mask `(1, kx, ky, kz)`
-- `run_id`, `t`: sample metadata
-
-Training/eval use `mask_hr` for masked MSE, derived PSNR, and masked local
-3D SSIM.
-
-## Shape behavior (important)
-
-- `output_patch_shape` is actively used by the model forward pass for
-  interpolation target size.
-- `input_patch_shape` exists in default config but is currently not used to
-  construct the dataset pipeline.
-- LR input shape is determined by manifest HR shape plus voxel ratio
-  (`source_voxel_mm` -> `target_voxel_mm`) through spatial degradation.
-
-## CLI commands and parameters
-
-### Commands
-
-- `train`
-- `eval`
-- `infer`
-- `plot-loss`
-
-### Common options
-
-- `--seed INT`
-- `--batch-size INT`
-- `--epochs INT`
-- `--lr FLOAT`
-- `--model-name {srcnn3d,rcan3d}`
-- `--train-split FLOAT`
-- `--num-workers INT`
-- `--log-interval INT`
-- `--checkpoint-interval INT`
-- `--manifest-path PATH`
-- `--run-root PATH`
-- `--device {cpu,cuda}`
-- `--deterministic` / `--no-deterministic`
-- `--strict-finite-loss` / `--no-strict-finite-loss`
-
-### Train-related options
-
-- `--resume-checkpoint PATH`
-
-### Eval/Infer options
-
-- `--checkpoint-path PATH` (required for `eval` and `infer`)
-- `--output-shape D H W`
-- `--inference-index INT`
-- `--save-output-npy PATH` (infer only)
-- `--visualize` (infer only; show center-slice figure for input/prediction/target)
-- `--visualize-output PATH` (infer only; save the visualization as PNG)
-- `--visualize-direction {axial,coronal,sagittal}` (infer only; default `axial`)
-- `--visualize-level FLOAT` (infer only; relative slice level in `[0,1]`, default `0.5`)
-- `--eval-report PATH` (eval only; default `./eval_report.json`)
-
-### Plot-loss options
-
-- `--run-dir PATH` (required)
-- `--plot-output PATH` (optional)
+| Field | Default |
+|---|---|
+| `manifest_path` | `/srv/venvs/team4dbrain/derivatives/manifest.json` |
+| `run_root` | `src/sr/runs` |
+| `model_name` | `srcnn3d` |
+| `output_patch_shape` | `(128, 128, 93)` |
+| `source_voxel_mm` -> `target_voxel_mm` | `1.5 -> 3.0` |
+| `train_split` | `0.8` (train) / `0.2` (val), shuffled by `seed` |
+| `loss_name` | `masked_mse` |
+| `optimizer_name`, `learning_rate` | `adam`, `1e-3` |
+| `scheduler_name`, `scheduler_kwargs` | `plateau`, `{"factor":0.5,"patience":3}` |
+| `seed`, `deterministic`, `strict_finite_loss` | `42`, `true`, `true` |
+| `batch_size`, `num_epochs`, `num_workers`, `log_interval` | `4`, `20`, `0`, `10` |
+| `tensorboard` | `true` |
 
 ## Run artifacts
 
-Each training run writes to `src/sr/runs/<model_name>/<timestamp>/`:
+```
+src/sr/runs/<model_name>/<timestamp>/
+├── config.json         # written once at start of run, source of truth
+├── split.json          # written once, resolved train/val subjects
+├── metrics.json        # rewritten atomically every epoch (plain JSON)
+├── tb/                 # TensorBoard scalars (if --tensorboard)
+└── epochs/
+    ├── epoch_001.pt    # full EpochState (model + opt + sched + RNG + history)
+    ├── epoch_002.pt
+    └── ...
+```
 
-- `config.json` (effective config)
-- `split.json` (resolved train/val subjects and sample counts)
-- `tb/` TensorBoard logs
-- `epochs/epoch_XXX/checkpoint.pt`
-- `best.pt` (best validation checkpoint when validation exists)
-- `final.pt`
-- `metrics_summary.json` (final summary metrics)
-- `metrics_history.json` (epoch-wise train/val loss + LR)
-- `loss_curve.png`
+`epoch_NNN.pt` is fully self-contained: kill the process at any point and
+resume from the last successfully-written epoch with zero information
+loss. There is no `final.pt`, no `best.pt`, no `metrics_summary.json` —
+those are user-side compositions.
 
-## Typical usage
+## CLI
 
 ```bash
-# Train
-python -m src.sr.run train \
-  --manifest-path ./manifest.json \
-  --model-name srcnn3d \
-  --batch-size 4 \
-  --epochs 20 \
-  --lr 1e-3
+# Train from scratch (uses every default)
+python -m src.sr train
 
-# Plot loss for a finished run
-python -m src.sr.run plot-loss \
-  --run-dir ./src/sr/runs/srcnn3d/<run>
+# Train with custom knobs
+python -m src.sr train \
+  --model-name rcan3d \
+  --model-kwargs '{"n_feats": 48, "n_resgroups": 3}' \
+  --loss-name masked_l1 \
+  --optimizer-name adamw \
+  --optimizer-kwargs '{"weight_decay": 1e-4}' \
+  --scheduler-name cosine \
+  --scheduler-kwargs '{"T_max": 20}' \
+  --epochs 20 --batch-size 4 --lr 1e-3
 
-# Evaluate a checkpoint
-python -m src.sr.run eval \
-  --manifest-path ./manifest.json \
-  --checkpoint-path ./src/sr/runs/srcnn3d/<run>/best.pt \
-  --eval-report ./eval_report.json
+# Resume an interrupted run (config flags are rejected; saved config wins)
+python -m src.sr train --resume-dir src/sr/runs/srcnn3d/20260511_120000
 
-# Inference on one sample
-python -m src.sr.run infer \
-  --manifest-path ./manifest.json \
-  --checkpoint-path ./src/sr/runs/srcnn3d/<run>/best.pt \
-  --inference-index 0 \
-  --save-output-npy ./prediction.npy \
-  --visualize-output ./prediction_preview.png \
-  --visualize-direction coronal \
-  --visualize-level 0.3
+# Evaluate a checkpoint on its saved val split
+python -m src.sr eval \
+  --checkpoint src/sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+  --report ./report.json
+
+# List samples available in the manifest used by a checkpoint
+python -m src.sr infer \
+  --checkpoint src/sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+  --list-samples
+
+# Infer one sample, save a slice figure
+python -m src.sr infer \
+  --checkpoint src/sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+  --subject 01 --session 00 --task ArchiStandard --direction ap --t 12 \
+  --axis coronal --slice-level 0.4 \
+  --save-png ./infer_preview.png \
+  --save-npy ./infer_pred.npy
 ```
+
+## Resume contract
+
+`--resume-dir` reads `config.json` from the run directory and ignores
+every other config flag. To change a value for the resumed run, edit
+`config.json` in place first (typical case: extend `num_epochs` to keep
+training longer).
+
+The newest `epochs/epoch_NNN.pt` is the resume point. Training continues
+in the same directory; the metrics history is preserved and appended.
+
+## User-side analysis (no auto plots)
+
+```python
+import json, matplotlib.pyplot as plt
+history = json.loads(open("src/sr/runs/srcnn3d/<run>/metrics.json").read())
+epochs = [h["epoch"] for h in history]
+plt.plot(epochs, [h["train_loss"] for h in history], label="train")
+plt.plot(epochs, [h.get("val_masked_mse") for h in history], label="val")
+plt.xlabel("epoch"); plt.legend(); plt.show()
+```
+
+To inspect any saved epoch:
+
+```python
+import torch
+state = torch.load("src/sr/runs/srcnn3d/<run>/epochs/epoch_007.pt", map_location="cpu")
+print(state["best_epoch_number"], state["best_val_loss"])
+print(state["metrics_history"][-1])
+```
+
+## Why each design choice exists
+
+- **Per-epoch full state**: every checkpoint is a resumable, self-contained
+  snapshot. The "last successfully written epoch" is always the resume
+  point, even after SIGKILL.
+- **No auto post-training analysis**: keeps the trainer focused and lets
+  the user compose comparisons across runs without baked-in assumptions.
+- **Registries for losses/models/optimizers/schedulers**: swap behaviour
+  by name + JSON kwargs. No need to read the training loop to extend it.
+- **Maximum metric tracking**: validation logs every loss + every metric
+  every epoch, so cross-run comparisons don't depend on which loss was
+  optimized.
+- **Explicit config**: every value driving a run lands in `config.json`.
+  Resume refuses to mix CLI overrides with a saved config so the
+  reproduction story stays simple.
