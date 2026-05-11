@@ -5,6 +5,20 @@ high-resolution (HR) fMRI volume from a simulated low-resolution (LR) volume.
 Two model backbones (`srcnn3d`, `rcan3d`) share one common data and training
 pipeline.
 
+## Models
+
+- **`srcnn3d`**: Trilinear upsample to HR, then a shallow 3D SRCNN stack. Default
+  in [`config.py`](config.py) because it is cheaper in memory and time while the
+  pipeline is validated.
+- **`rcan3d`**: 3D adaptation of the RCAN topology from the reference 2D
+  implementation (residual channel-attention blocks inside **residual groups**,
+  then a final body convolution, then a **global skip** from head features—see
+  [`model.py`](model.py)). LR→HR sizing uses **trilinear** interpolation to
+  `output_patch_shape`, not learnable PixelShuffle, which matches fixed HR patch
+  geometry from the dataset. It is **not** weight-compatible with ~/RCAN
+  checkpoints. Constructor knobs include `n_feats`, `n_resgroups`,
+  `n_resblocks`, and `reduction` (passed via `model_kwargs` in config).
+
 ## End-to-end program flow
 
 The CLI entrypoint is `python -m src.sr.run <command>`.

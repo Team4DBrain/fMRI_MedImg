@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from src.sr.config import DEFAULT_CONFIG, validate_config
 from src.sr.model import RCAN3D, SRCNN3D, build_model_from_config, select_model
 
@@ -10,6 +12,20 @@ class TestModelFactoryAndConfig(unittest.TestCase):
         rcan = select_model("rcan3d", output_patch_shape=(24, 24, 24))
         self.assertIsInstance(srcnn, SRCNN3D)
         self.assertIsInstance(rcan, RCAN3D)
+
+    def test_rcan3d_forward_matches_output_patch_shape(self):
+        out_shape = (12, 14, 10)
+        lr_shape = (6, 7, 5)
+        model = select_model(
+            "rcan3d",
+            output_patch_shape=out_shape,
+            n_resgroups=1,
+            n_resblocks=1,
+            n_feats=8,
+        )
+        x = torch.randn(2, 1, *lr_shape)
+        y = model(x)
+        self.assertEqual(tuple(y.shape), (2, 1, *out_shape))
 
     def test_select_model_unknown_raises(self):
         with self.assertRaises(ValueError):
@@ -34,7 +50,6 @@ class TestModelFactoryAndConfig(unittest.TestCase):
         config["loss_name"] = "not-real"
         with self.assertRaises(ValueError):
             validate_config(config)
-
 
 if __name__ == "__main__":
     unittest.main()

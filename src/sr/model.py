@@ -65,36 +65,74 @@ class SRCNN3D(nn.Module):
                     nn.init.constant_(module.bias, 0)
 
 
-class RCAN3D(nn.Module):
-    """Attention-based 3D SR model with residual channel-attention blocks.
+class ResidualGroup3D(nn.Module):
+    """Stack of RCAB-style blocks plus a grouping conv and a skip (RCAN RG).
 
     Purpose:
-        Offer a stronger alternative to SRCNN that can model richer feature
-        interactions through residual attention.
+        Mirror the 2D `ResidualGroup` in ~/RCAN: several channel-attention
+        residual blocks, then a 3×3×3 conv, with an additive skip around the
+        whole group so gradients and low-frequency structure flow more easily.
     Effects:
-        Increases representational capacity and compute cost; still outputs HR
-        tensors at `output_patch_shape` for the same training loop.
+        Each group refines features and fuses them before the next group; depth
+        scales with `n_resblocks` per group and the number of groups in `RCAN3D`.
     Influences:
-        Capacity and runtime are controlled by `n_feats`, `n_blocks`, and
-        `reduction`, plus optimizer settings from training config.
+        VRAM and latency grow with `n_feats`, `n_resblocks`, and spatial size.
     How to change safely:
-        Preserve shape contract and registry integration; document default
-        hyperparameters if tuning affects memory/performance significantly.
+        Keep the final conv output channels equal to `n_feats` so the group skip
+        `x + body(x)` stays shape-valid; match any topology change in checkpoints.
+    """
+
+    def __init__(self, n_feats: int, n_resblocks: int, reduction: int):
+        super().__init__()
+        layers: list[nn.Module] = [
+            ResidualChannelAttentionBlock3D(n_feats=n_feats, reduction=reduction)
+            for _ in range(n_resblocks)
+        ]
+        layers.append(nn.Conv3d(n_feats, n_feats, kernel_size=3, padding=1))
+        self.body = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
+class RCAN3D(nn.Module):
+    """3D RCAN-style SR: residual groups (RCABs), global body skip, trilinear HR size.
+
+    Purpose:
+        Provide a capacity step above `SRCNN3D` while following the RCAN layout
+        from the reference 2D code (~/RCAN): head → stacked residual groups →
+        final body conv → global residual with head features → tail conv. LR is
+        upsampled to `output_patch_shape` with trilinear interpolation (fixed HR
+        grid from the manifest), not learnable 2D PixelShuffle, which fits this
+        pipeline’s voxel geometry.
+    Effects:
+        Predicts single-channel HR at `output_patch_shape`; capacity and memory
+        scale with `n_resgroups`, `n_resblocks`, and `n_feats`.
+    Influences:
+        Hyperparameters and optimizer settings in training config; cannot load
+        2D RCAN weights without ad-hoc inflation (different dims and upsampler).
+    How to change safely:
+        Preserve NCDHW shapes; after changing group counts or widths, retrain or
+        migrate checkpoints; tune `n_feats` first if GPU memory is tight.
     """
 
     def __init__(
         self,
         output_patch_shape=(50, 50, 50),
         n_feats: int = 32,
-        n_blocks: int = 4,
+        n_resgroups: int = 2,
+        n_resblocks: int = 2,
         reduction: int = 8,
     ):
         super().__init__()
         self.output_patch_shape = tuple(output_patch_shape)
         self.head = nn.Conv3d(1, n_feats, kernel_size=3, padding=1)
-        self.body = nn.Sequential(
-            *[ResidualChannelAttentionBlock3D(n_feats=n_feats, reduction=reduction) for _ in range(n_blocks)]
-        )
+        body_layers: list[nn.Module] = [
+            ResidualGroup3D(n_feats=n_feats, n_resblocks=n_resblocks, reduction=reduction)
+            for _ in range(n_resgroups)
+        ]
+        body_layers.append(nn.Conv3d(n_feats, n_feats, kernel_size=3, padding=1))
+        self.body = nn.Sequential(*body_layers)
         self.tail = nn.Conv3d(n_feats, 1, kernel_size=3, padding=1)
 
     def forward(self, x):
