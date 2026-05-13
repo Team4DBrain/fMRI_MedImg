@@ -62,13 +62,11 @@ class SRConfig:
     source_voxel_mm: float = 1.5
     target_voxel_mm: float = 3.0
 
-    # Subject split (0.8/0.2 by default; explicit lists override the random split)
+    # Dataset split (0.8/0.2 by default; seeded random split over all samples)
     train_split: float = 0.8
-    train_subjects: list[str] | None = None
-    val_subjects: list[str] | None = None
 
     # Training loop
-    batch_size: int = 4
+    batch_size: int = 15
     num_epochs: int = 20
     num_workers: int = 0
     log_interval: int = 10
@@ -225,8 +223,6 @@ def summary(config: SRConfig) -> str:
         f"  output_patch      = {tuple(config.output_patch_shape)}",
         f"  source/target_mm  = {config.source_voxel_mm} -> {config.target_voxel_mm}",
         f"  train_split       = {config.train_split}",
-        f"  train_subjects    = {config.train_subjects}",
-        f"  val_subjects      = {config.val_subjects}",
         f"  batch_size        = {config.batch_size}",
         f"  num_epochs        = {config.num_epochs}",
         f"  num_workers       = {config.num_workers}",

@@ -96,10 +96,12 @@ def select_sample(
     candidates = [
         row
         for row in rows
-        if (subject is None or row["subject"] == subject)
-        and (session is None or row["session"] == session)
-        and (task is None or row["task"] == task)
-        and (direction is None or row["direction"] == direction)
+        if (
+            (subject is None or row["subject"] == subject)
+            and (session is None or row["session"] == session)
+            and (task is None or row["task"] == task)
+            and (direction is None or row["direction"] == direction)
+        )
     ]
     if not candidates:
         raise ValueError(
@@ -191,7 +193,7 @@ def evaluate(
     averaged = average_metric_dicts(per_batch)
     print(f"[eval] checkpoint   = {checkpoint_path}")
     print(f"[eval] manifest     = {config.manifest_path}")
-    print(f"[eval] val_subjects = {split_info['val_subjects']}")
+    print(f"[eval] split_source = {split_info['source']}")
     print(f"[eval] val_samples  = {split_info['val_samples']}")
     for key in sorted(averaged):
         print(f"[eval] {key:>14} = {averaged[key]:.6f}")
@@ -199,7 +201,7 @@ def evaluate(
     payload = {
         "checkpoint": str(checkpoint_path),
         "manifest_path": str(config.manifest_path),
-        "val_subjects": split_info["val_subjects"],
+        "split_source": split_info["source"],
         "val_samples": split_info["val_samples"],
         "metrics": averaged,
     }
@@ -226,9 +228,7 @@ def infer_one(
     """Run one (run, timepoint) through the model and return tensors + metrics.
 
     ``selection`` is the dict returned by ``select_sample`` (must contain
-    ``subject``, ``run_id``, ``t``). The dataset uses ``subject_filter`` to
-    narrow to one subject so the rest of the manifest does not have to be
-    indexed.
+    ``subject``, ``run_id``, ``t``).
     """
     model, config, device = _load_model_from_checkpoint(checkpoint_path, override_manifest)
 
@@ -238,16 +238,12 @@ def infer_one(
     )
     dataset = SpatialSRDataset(
         manifest_path=Path(config.manifest_path),
-        subject_filter=[selection["subject"]],
         degrade_fn=degrade_fn,
     )
 
     sample_index = None
     for idx, (run_idx, t) in enumerate(dataset.samples):
-        if (
-            dataset.runs[run_idx]["run_id"] == selection["run_id"]
-            and t == selection["t"]
-        ):
+        if dataset.runs[run_idx]["run_id"] == selection["run_id"] and t == selection["t"]:
             sample_index = idx
             break
     if sample_index is None:

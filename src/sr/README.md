@@ -13,7 +13,7 @@ src/sr/
 ├── losses.py       # mse, masked_mse, l1, masked_l1 + LOSS_REGISTRY
 ├── metrics.py      # psnr, masked/unmasked SSIM, compute_full_metrics
 ├── components.py   # OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
-├── data.py         # build_loaders, subject split, seeded workers
+├── data.py         # build_loaders, dataset split, seeded workers
 ├── checkpoint.py   # EpochState save/load, find_latest_epoch
 ├── train.py        # train(config, resume_dir=None)
 ├── infer.py        # evaluate, infer_one, list_samples, make_slice_figure
@@ -46,7 +46,7 @@ via the CLI — no edits to `train.py` required.
 ```
 src/sr/runs/<model_name>/<timestamp>/
 ├── config.json         # written once at start of run, source of truth
-├── split.json          # written once, resolved train/val subjects
+├── split.json          # written once, resolved train/val sample split
 ├── metrics.json        # rewritten atomically every epoch (plain JSON)
 ├── tb/                 # TensorBoard scalars (if --tensorboard)
 └── epochs/

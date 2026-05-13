@@ -84,10 +84,10 @@ def _prepare_run_directory(
                 f"Cannot resume: {config_path} does not exist. "
                 "Pass a run directory that contains config.json."
             )
-        saved = from_json(config_path)
+        saved_config: SRConfig = from_json(config_path)
         print(f"[train] Resume requested from {run_dir}")
         print(f"[train] Using saved config from {config_path}")
-        return run_dir, saved
+        return run_dir, saved_config
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(config.run_root) / config.model_name / timestamp
@@ -229,8 +229,7 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
     train_loader, val_loader, split_info = build_loaders(config)
     if resume_dir is None:
         write_split_json(run_dir, split_info)
-    print(f"[train] train_subjects = {split_info['train_subjects']}")
-    print(f"[train] val_subjects   = {split_info['val_subjects']}")
+    print(f"[train] split_source  = {split_info['source']}")
     print(
         f"[train] samples: train={split_info['train_samples']}  "
         f"val={split_info['val_samples']}  "

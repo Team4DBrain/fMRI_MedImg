@@ -2,15 +2,14 @@
 
 Purpose:
     Turn an ``SRConfig`` + a manifest on disk into reproducible train and
-    validation DataLoaders. Subject-level splitting is the default so the
-    val set is never the same patients as the train set.
+    validation DataLoaders using a seeded random split across the full
+    dataset sample index.
 Effects:
-    Determines which volumes a model sees, in what order, with what
-    degradation. Seeding policy here is what makes runs (and resumes)
+    Determines which volumes/timepoints a model sees, in what order, with
+    what degradation. Seeding policy here is what makes runs (and resumes)
     deterministic.
 Influences:
-    Behaviour depends on ``manifest_path``, ``train_split``,
-    ``train_subjects``/``val_subjects`` (explicit override) and
+    Behaviour depends on ``manifest_path``, ``train_split`` and
     ``source_voxel_mm``/``target_voxel_mm`` (degradation).
 How to change safely:
     Keep ``build_loaders`` returning ``(train_loader, val_loader|None,
@@ -26,53 +25,32 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from src.data.datasets import SpatialSRDataset
 from src.data.degradation_spatial import make_spatial_degradation
 from src.sr.config import SRConfig
 
 
-def _available_subjects(manifest_path: Path) -> list[str]:
-    """Return all unique subjects in the manifest in deterministic order."""
-    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    subjects = {str(run["subject"]) for run in manifest.get("runs", []) if "subject" in run}
-    if not subjects:
-        raise RuntimeError(f"Manifest at {manifest_path} contains no subjects.")
-    return sorted(subjects)
+def resolve_sample_split(
+    n_samples: int, config: SRConfig
+) -> tuple[list[int], list[int], dict[str, Any]]:
+    """Decide which sample indices go into train vs. val."""
+    if n_samples < 1:
+        raise ValueError("Dataset is empty after manifest filtering.")
 
-
-def resolve_subject_split(
-    config: SRConfig,
-) -> tuple[list[str], list[str], dict[str, Any]]:
-    """Decide which subjects go into train vs. val.
-
-    Resolution order (first match wins):
-        1. Explicit ``train_subjects`` AND ``val_subjects`` from config.
-        2. ``train_split == 1.0`` -> everything trains, no validation.
-        3. Seeded shuffle of all manifest subjects, split at
-           ``int(len * train_split)`` (clamped to keep both sides non-empty).
-    """
-    if config.train_subjects is not None and config.val_subjects is not None:
-        train = [str(s) for s in config.train_subjects]
-        val = [str(s) for s in config.val_subjects]
-        if not train:
-            raise ValueError("Explicit train_subjects must be non-empty.")
-        return train, val, {"source": "explicit"}
-
-    subjects = _available_subjects(config.manifest_path)
     if config.train_split == 1.0:
-        return subjects, [], {"source": "all_train"}
+        return list(range(n_samples)), [], {"source": "all_train"}
 
-    if len(subjects) < 2:
+    if n_samples < 2:
         raise ValueError(
-            f"Need at least 2 subjects for a train/val split (manifest has "
-            f"{len(subjects)}). Either pass --train-split 1.0 to disable "
+            f"Need at least 2 samples for a train/val split (dataset has "
+            f"{n_samples}). Either pass --train-split 1.0 to disable "
             "validation or extend the manifest."
         )
 
     rng = np.random.default_rng(int(config.seed))
-    shuffled = list(subjects)
+    shuffled = list(range(n_samples))
     rng.shuffle(shuffled)
     split_idx = int(len(shuffled) * float(config.train_split))
     split_idx = max(1, min(split_idx, len(shuffled) - 1))
@@ -129,21 +107,18 @@ def build_loaders(
         source_voxel_mm=float(config.source_voxel_mm),
         target_voxel_mm=float(config.target_voxel_mm),
     )
-    train_subjects, val_subjects, split_meta = resolve_subject_split(config)
-
-    train_dataset = SpatialSRDataset(
+    full_dataset = SpatialSRDataset(
         manifest_path=Path(config.manifest_path),
-        subject_filter=train_subjects,
         degrade_fn=degrade_fn,
     )
+    train_indices, val_indices, split_meta = resolve_sample_split(
+        len(full_dataset), config
+    )
+    train_dataset = Subset(full_dataset, train_indices)
 
-    val_dataset: SpatialSRDataset | None = None
-    if val_subjects:
-        val_dataset = SpatialSRDataset(
-            manifest_path=Path(config.manifest_path),
-            subject_filter=val_subjects,
-            degrade_fn=degrade_fn,
-        )
+    val_dataset: Subset[SpatialSRDataset] | None = None
+    if val_indices:
+        val_dataset = Subset(full_dataset, val_indices)
 
     # Distinct generator seeds keep train and val shuffling independent.
     train_loader = _make_loader(
@@ -159,8 +134,8 @@ def build_loaders(
 
     split_info = {
         "source": split_meta["source"],
-        "train_subjects": train_subjects,
-        "val_subjects": val_subjects,
+        "train_indices": train_indices,
+        "val_indices": val_indices,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset) if val_dataset is not None else 0,
     }

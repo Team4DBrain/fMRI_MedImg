@@ -100,19 +100,7 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
         "--train-split",
         type=float,
         default=None,
-        help="Fraction of subjects used for training (1.0 disables validation).",
-    )
-    parser.add_argument(
-        "--train-subjects",
-        nargs="+",
-        default=None,
-        help="Explicit subject list for training; overrides --train-split.",
-    )
-    parser.add_argument(
-        "--val-subjects",
-        nargs="+",
-        default=None,
-        help="Explicit subject list for validation; overrides --train-split.",
+        help="Fraction of dataset samples used for training (1.0 disables validation).",
     )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None, dest="num_epochs")
@@ -237,8 +225,6 @@ _CLI_TO_CONFIG: dict[str, str] = {
     "source_voxel_mm": "source_voxel_mm",
     "target_voxel_mm": "target_voxel_mm",
     "train_split": "train_split",
-    "train_subjects": "train_subjects",
-    "val_subjects": "val_subjects",
     "batch_size": "batch_size",
     "num_epochs": "num_epochs",
     "num_workers": "num_workers",
@@ -315,7 +301,7 @@ def _run_train(args: argparse.Namespace) -> None:
         # replace it with the on-disk one before doing anything.
         train(_DEFAULT_CONFIG, resume_dir=args.resume_dir)
         return
-    config = _config_from_args(args)
+    config: SRConfig = _config_from_args(args)
     train(config, resume_dir=None)
 
 
