@@ -69,16 +69,58 @@ def restore_rng_state(state: dict[str, Any]) -> None:
 
     Missing keys are tolerated for forward-compat; e.g. an older checkpoint
     without a CUDA RNG state simply leaves CUDA RNG untouched.
+
+    ``torch.set_rng_state`` requires the CPU RNG blob on CPU (uint8 /
+    ByteTensor). Checkpoints loaded with ``torch.load(..., map_location=cuda)``
+    may have moved that tensor to GPU; normalize here so resume always works.
     """
     if "python" in state and state["python"] is not None:
         random.setstate(state["python"])
     if "numpy" in state and state["numpy"] is not None:
         np.random.set_state(state["numpy"])
     if "torch_cpu" in state and state["torch_cpu"] is not None:
-        torch.set_rng_state(state["torch_cpu"])
+        cpu_rng = state["torch_cpu"]
+        if isinstance(cpu_rng, torch.Tensor):
+            cpu_rng = cpu_rng.detach().cpu().contiguous()
+        torch.set_rng_state(cpu_rng)
     cuda_states = state.get("torch_cuda_all")
     if cuda_states is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(cuda_states)
+        # Each entry must be a uint8 / ByteTensor blob (typically CPU tensors
+        # after ``torch.load(..., map_location='cpu')``); ``set_rng_state``
+        # clones then installs on the matching device index.
+        normalized: list[torch.Tensor] = []
+        for s in cuda_states:
+            if not isinstance(s, torch.Tensor):
+                raise TypeError(
+                    f"torch_cuda_all must contain only tensors, got {type(s).__name__}"
+                )
+            normalized.append(s.detach().cpu().contiguous())
+        torch.cuda.set_rng_state_all(normalized)
+
+
+def _normalize_rng_state_after_load(rng_state: dict[str, Any] | None) -> None:
+    """In-place fix for RNG tensors after ``torch.load``.
+
+    Purpose: keep RNG blobs on CPU as contiguous tensors so ``restore_rng_state``
+    can pass them to ``torch.set_rng_state`` / ``torch.cuda.set_rng_state_all``
+    without dtype/device surprises. Effect: normalizes ``torch_cpu`` and each
+    entry of ``torch_cuda_all`` when present. Influences: only ``load_epoch``.
+    Change guidance: if adding new RNG keys, mirror the same normalization rules.
+    """
+    if not rng_state:
+        return
+    t = rng_state.get("torch_cpu")
+    if isinstance(t, torch.Tensor):
+        rng_state["torch_cpu"] = t.detach().cpu().contiguous()
+
+    cuda_all = rng_state.get("torch_cuda_all")
+    if cuda_all is None:
+        return
+    if isinstance(cuda_all, (list, tuple)):
+        rng_state["torch_cuda_all"] = [
+            s.detach().cpu().contiguous() if isinstance(s, torch.Tensor) else s
+            for s in cuda_all
+        ]
 
 
 def _epochs_dir(run_dir: Path) -> Path:
@@ -143,10 +185,20 @@ def load_epoch(path: Path, map_location: str | None = None) -> EpochState:
     The file is produced by this code and lives next to the run's
     ``config.json``, so trust is on par with reading any other artifact
     from the run directory.
+
+    Checkpoints are always loaded with ``map_location='cpu'``. Passing
+    ``map_location=cuda`` to ``torch.load`` rewrites every tensor in the file,
+    including RNG byte blobs, which breaks ``torch.set_rng_state`` and
+    ``torch.cuda.set_rng_state_all``. Callers move weights to the training
+    device by loading into modules already on that device (``load_state_dict``).
+    The ``map_location`` argument is kept for call-site compatibility but is
+    ignored.
     """
-    payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    _ = map_location
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or "model_state_dict" not in payload:
         raise ValueError(f"File at {path} is not a valid EpochState payload.")
+    _normalize_rng_state_after_load(payload.get("rng_state"))
     return _payload_to_state(payload)
 
 
