@@ -25,11 +25,12 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from src.data.datasets import SpatialSRDataset
 from src.data.degradation_spatial import make_spatial_degradation
 from src.sr.config import SRConfig
+from src.sr.patch_data import PatchTrainingDataset
 
 
 def resolve_sample_split(
@@ -74,7 +75,7 @@ def _seed_worker(seed: int) -> Any:
 
 
 def _make_loader(
-    dataset: SpatialSRDataset,
+    dataset: Dataset,
     config: SRConfig,
     *,
     shuffle: bool,
@@ -114,7 +115,16 @@ def build_loaders(
     train_indices, val_indices, split_meta = resolve_sample_split(
         len(full_dataset), config
     )
-    train_dataset = Subset(full_dataset, train_indices)
+    train_base: Dataset = Subset(full_dataset, train_indices)
+    if config.model_name == "srcnn3d_patch":
+        train_dataset: Dataset = PatchTrainingDataset(
+            train_base,
+            patch_hr_shape=tuple(config.patch_hr_shape),
+            patches_per_volume=config.patches_per_volume,
+            seed=config.seed,
+        )
+    else:
+        train_dataset = train_base
 
     val_dataset: Subset[SpatialSRDataset] | None = None
     if val_indices:
@@ -136,9 +146,14 @@ def build_loaders(
         "source": split_meta["source"],
         "train_indices": train_indices,
         "val_indices": val_indices,
+        "train_volumes": len(train_base),
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset) if val_dataset is not None else 0,
+        "patch_training": config.model_name == "srcnn3d_patch",
     }
+    if config.model_name == "srcnn3d_patch":
+        split_info["patch_hr_shape"] = list(config.patch_hr_shape)
+        split_info["patches_per_volume"] = config.patches_per_volume
     return train_loader, val_loader, split_info
 
 

@@ -63,6 +63,56 @@ class SRCNN3D(nn.Module):
         return self.conv3(x)
 
 
+# Valid 9-1-5 convolutions shrink each spatial dim by this many voxels.
+SRCNN3D_PATCH_RECEPTIVE_SHRINK = 12
+
+
+class SRCNN3DPatch(nn.Module):
+    """3D SRCNN with valid convolutions and paper-style patch training.
+
+    Purpose:
+        Experiment variant of ``SRCNN3D`` that matches the original SRCNN
+        training recipe: no padding (valid conv), loss on the central valid
+        region, and patch-based training via ``PatchTrainingDataset``.
+    Effects:
+        Output spatial size is ``upsample_to`` minus ``SRCNN3D_PATCH_RECEPTIVE_SHRINK``
+        per axis. Callers crop ``target``/``mask_hr`` with ``center_crop_to_pred``.
+        Full-volume val/infer pass ``upsample_to=output_patch_shape`` (via target shape).
+    Influences:
+        ``patch_hr_shape`` and ``patches_per_volume`` in ``SRConfig`` drive training
+        crops only; ``output_patch_shape`` still sets full-volume HR grid size.
+    How to change safely:
+        Keep kernel sizes 9/1/5 and padding=0 so ``RECEPTIVE_SHRINK`` stays in sync
+        with ``src.sr.shape_utils``.
+    """
+
+    RECEPTIVE_SHRINK = SRCNN3D_PATCH_RECEPTIVE_SHRINK
+
+    def __init__(self, output_patch_shape: tuple[int, int, int]) -> None:
+        super().__init__()
+        self.output_patch_shape = tuple(output_patch_shape)
+        self.conv1 = nn.Conv3d(1, 64, kernel_size=9, padding=0)
+        self.conv2 = nn.Conv3d(64, 32, kernel_size=1, padding=0)
+        self.conv3 = nn.Conv3d(32, 1, kernel_size=5, padding=0)
+        for module in self.modules():
+            if isinstance(module, nn.Conv3d):
+                nn.init.normal_(module.weight, mean=0.0, std=0.001)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        upsample_to: tuple[int, int, int] | None = None,
+    ) -> torch.Tensor:
+        size = tuple(upsample_to) if upsample_to is not None else self.output_patch_shape
+        x = F.interpolate(x, size=size, mode="trilinear", align_corners=False)
+        x = F.relu(self.conv1(x), inplace=True)
+        x = F.relu(self.conv2(x), inplace=True)
+        return self.conv3(x)
+
+
 class _ChannelAttention3D(nn.Module):
     """Squeeze-excitation gate over feature channels (RCAN core block)."""
 
@@ -160,6 +210,7 @@ class RCAN3D(nn.Module):
 
 MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "srcnn3d": SRCNN3D,
+    "srcnn3d_patch": SRCNN3DPatch,
     "rcan3d": RCAN3D,
 }
 

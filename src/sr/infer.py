@@ -33,6 +33,7 @@ from src.sr.config import SRConfig, auto_device, from_json
 from src.sr.data import build_loaders
 from src.sr.metrics import compute_full_metrics
 from src.sr.models import build_model
+from src.sr.forward import model_forward
 
 
 AXIS_TO_INDEX: dict[str, int] = {"sagittal": 0, "coronal": 1, "axial": 2}
@@ -183,9 +184,10 @@ def evaluate(
 
     per_batch: list[dict[str, float]] = []
     for batch in val_loader:
-        pred = model(batch["input"].to(device))
+        inputs = batch["input"].to(device)
         target = batch["target"].to(device)
         mask = batch["mask_hr"].to(device)
+        pred = model_forward(model, inputs, target, config.model_name)
         per_batch.append(compute_full_metrics(pred, target, mask))
 
     from src.sr.metrics import average_metric_dicts
@@ -256,7 +258,7 @@ def infer_one(
     inputs = sample["input"].unsqueeze(0).to(device)
     target = sample["target"].unsqueeze(0).to(device)
     mask = sample["mask_hr"].unsqueeze(0).to(device)
-    pred = model(inputs)
+    pred = model_forward(model, inputs, target, config.model_name)
 
     metrics = compute_full_metrics(pred, target, mask)
     return {

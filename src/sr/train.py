@@ -52,7 +52,9 @@ from src.sr.config import (
 from src.sr.data import build_loaders, write_split_json
 from src.sr.losses import resolve_loss
 from src.sr.metrics import average_metric_dicts, compute_full_metrics
+from src.sr.forward import model_forward
 from src.sr.models import build_model, count_parameters
+from src.sr.shape_utils import align_pred_target_mask
 
 
 BANNER = "=" * 60
@@ -105,6 +107,7 @@ def _train_one_epoch(
     optimizer: torch.optim.Optimizer,
     loss_fn,
     loss_name: str,
+    model_name: str,
     device: str,
     log_interval: int,
     strict_finite_loss: bool,
@@ -122,7 +125,8 @@ def _train_one_epoch(
         mask = batch["mask_hr"].to(device)
 
         optimizer.zero_grad(set_to_none=True)
-        pred = model(inputs)
+        pred = model_forward(model, inputs, target, model_name)
+        pred, target, mask = align_pred_target_mask(pred, target, mask)
         loss = loss_fn(pred, target, mask)
 
         if strict_finite_loss and not math.isfinite(float(loss.detach().item())):
@@ -156,6 +160,7 @@ def _validate_one_epoch(
     *,
     model: torch.nn.Module,
     loader: DataLoader,
+    model_name: str,
     device: str,
 ) -> tuple[dict[str, float], float]:
     """Validation pass that reports all losses + all metrics per batch.
@@ -171,7 +176,7 @@ def _validate_one_epoch(
         inputs = batch["input"].to(device)
         target = batch["target"].to(device)
         mask = batch["mask_hr"].to(device)
-        pred = model(inputs)
+        pred = model_forward(model, inputs, target, model_name)
         per_batch.append(compute_full_metrics(pred, target, mask))
     duration = time.perf_counter() - start
     return average_metric_dicts(per_batch), duration
@@ -303,6 +308,7 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
                 optimizer=optimizer,
                 loss_fn=loss_fn,
                 loss_name=config.loss_name,
+                model_name=config.model_name,
                 device=device,
                 log_interval=config.log_interval,
                 strict_finite_loss=config.strict_finite_loss,
@@ -311,7 +317,10 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
 
             if val_loader is not None:
                 val_metrics, val_duration = _validate_one_epoch(
-                    model=model, loader=val_loader, device=device
+                    model=model,
+                    loader=val_loader,
+                    model_name=config.model_name,
+                    device=device,
                 )
             else:
                 val_metrics, val_duration = {}, 0.0

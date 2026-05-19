@@ -29,6 +29,7 @@ from src.sr.losses import (
     masked_mse_loss,
     mse_loss,
 )
+from src.sr.shape_utils import align_pred_target_mask
 
 
 def psnr_from_mse(mse: float, data_range: float = 1.0) -> float:
@@ -113,7 +114,11 @@ def compute_full_metrics(
     Returned keys (all floats):
         mse, masked_mse, l1, masked_l1,
         psnr, masked_psnr, ssim, masked_ssim
+
+    When ``pred`` is smaller than ``target`` (e.g. ``SRCNN3DPatch`` valid conv),
+    ``target`` and ``mask`` are center-cropped to ``pred``'s spatial size first.
     """
+    pred, target, mask = align_pred_target_mask(pred, target, mask)
     values: dict[str, float] = {}
     values["mse"] = float(mse_loss(pred, target, mask).item())
     values["masked_mse"] = float(masked_mse_loss(pred, target, mask).item())

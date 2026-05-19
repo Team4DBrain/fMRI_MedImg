@@ -94,6 +94,20 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="HR output shape (D H W).",
     )
+    parser.add_argument(
+        "--patch-hr-shape",
+        type=int,
+        nargs=3,
+        metavar=("D", "H", "W"),
+        default=None,
+        help="HR training patch size for srcnn3d_patch (D H W).",
+    )
+    parser.add_argument(
+        "--patches-per-volume",
+        type=int,
+        default=None,
+        help="Random training patches drawn per volume (srcnn3d_patch).",
+    )
     parser.add_argument("--source-voxel-mm", type=float, default=None)
     parser.add_argument("--target-voxel-mm", type=float, default=None)
     parser.add_argument(
@@ -222,6 +236,8 @@ _CLI_TO_CONFIG: dict[str, str] = {
     "model_name": "model_name",
     "model_kwargs": "model_kwargs",
     "output_shape": "output_patch_shape",
+    "patch_hr_shape": "patch_hr_shape",
+    "patches_per_volume": "patches_per_volume",
     "source_voxel_mm": "source_voxel_mm",
     "target_voxel_mm": "target_voxel_mm",
     "train_split": "train_split",
@@ -254,7 +270,7 @@ def _parse_value(cli_attr: str, value: Any) -> Any:
         if not isinstance(parsed, dict):
             raise SystemExit(f"--{cli_attr.replace('_', '-')} must be a JSON object.")
         return parsed
-    if cli_attr == "output_shape":
+    if cli_attr in ("output_shape", "patch_hr_shape"):
         return tuple(int(v) for v in value)
     return value
 

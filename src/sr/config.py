@@ -33,6 +33,9 @@ import torch
 DEFAULT_MANIFEST_PATH = Path("/srv/venvs/team4dbrain/derivatives/manifest.json")
 DEFAULT_RUN_ROOT = Path("src/sr/runs")
 DEFAULT_OUTPUT_SHAPE: tuple[int, int, int] = (128, 128, 93)
+DEFAULT_PATCH_HR_SHAPE: tuple[int, int, int] = (48, 48, 48)
+# Must match valid 9-1-5 shrink in SRCNN3DPatch (+1 so output has >=1 voxel).
+MIN_PATCH_HR_EDGE = 13
 
 
 @dataclass
@@ -57,6 +60,10 @@ class SRConfig:
     model_name: str = "srcnn3d"
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     output_patch_shape: tuple[int, int, int] = DEFAULT_OUTPUT_SHAPE
+
+    # Patch training (used when model_name == "srcnn3d_patch")
+    patch_hr_shape: tuple[int, int, int] = DEFAULT_PATCH_HR_SHAPE
+    patches_per_volume: int = 32
 
     # Spatial degradation
     source_voxel_mm: float = 1.5
@@ -110,6 +117,7 @@ def _config_to_dict(config: SRConfig) -> dict[str, Any]:
     payload["manifest_path"] = str(config.manifest_path)
     payload["run_root"] = str(config.run_root)
     payload["output_patch_shape"] = list(config.output_patch_shape)
+    payload["patch_hr_shape"] = list(config.patch_hr_shape)
     return payload
 
 
@@ -121,6 +129,8 @@ def _config_from_dict(raw: dict[str, Any]) -> SRConfig:
         kwargs["run_root"] = Path(kwargs["run_root"])
     if "output_patch_shape" in kwargs:
         kwargs["output_patch_shape"] = tuple(kwargs["output_patch_shape"])
+    if "patch_hr_shape" in kwargs:
+        kwargs["patch_hr_shape"] = tuple(kwargs["patch_hr_shape"])
     return SRConfig(**kwargs)
 
 
@@ -150,6 +160,23 @@ def validate(config: SRConfig) -> None:
         raise ValueError("source_voxel_mm and target_voxel_mm must be > 0")
     if len(config.output_patch_shape) != 3:
         raise ValueError("output_patch_shape must have 3 entries (D, H, W)")
+    if len(config.patch_hr_shape) != 3:
+        raise ValueError("patch_hr_shape must have 3 entries (D, H, W)")
+    if config.patches_per_volume < 1:
+        raise ValueError("patches_per_volume must be >= 1")
+
+    if config.model_name == "srcnn3d_patch":
+        for axis, edge in enumerate(config.patch_hr_shape):
+            if edge < MIN_PATCH_HR_EDGE:
+                raise ValueError(
+                    f"patch_hr_shape[{axis}]={edge} must be >= {MIN_PATCH_HR_EDGE} "
+                    f"so valid conv output has at least one voxel per axis"
+                )
+            if edge > config.output_patch_shape[axis]:
+                raise ValueError(
+                    f"patch_hr_shape[{axis}]={edge} exceeds "
+                    f"output_patch_shape[{axis}]={config.output_patch_shape[axis]}"
+                )
 
     if config.model_name not in MODEL_REGISTRY:
         raise ValueError(
@@ -221,6 +248,8 @@ def summary(config: SRConfig) -> str:
         f"  model_name        = {config.model_name}",
         f"  model_kwargs      = {config.model_kwargs}",
         f"  output_patch      = {tuple(config.output_patch_shape)}",
+        f"  patch_hr_shape    = {tuple(config.patch_hr_shape)}",
+        f"  patches_per_vol   = {config.patches_per_volume}",
         f"  source/target_mm  = {config.source_voxel_mm} -> {config.target_voxel_mm}",
         f"  train_split       = {config.train_split}",
         f"  batch_size        = {config.batch_size}",
