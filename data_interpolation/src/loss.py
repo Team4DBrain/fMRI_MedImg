@@ -87,6 +87,11 @@ class HybridL1SSIMLoss(nn.Module):
 
     def _ssim3d(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute mean full-volume SSIM for 5D tensors `(B,C,D,H,W)`."""
+        # SSIM variance is `E[X^2] - E[X]^2`: catastrophic cancellation in bf16
+        # gives negative variances and blows the division. Force float32 here.
+        pred = pred.float()
+        target = target.float()
+
         # SSIM constants prevent division by zero in low-variance windows.
         c1 = (0.01 * self.data_range) ** 2
         c2 = (0.03 * self.data_range) ** 2
