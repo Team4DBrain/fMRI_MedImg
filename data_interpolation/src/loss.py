@@ -87,35 +87,39 @@ class HybridL1SSIMLoss(nn.Module):
 
     def _ssim3d(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute mean full-volume SSIM for 5D tensors `(B,C,D,H,W)`."""
-        # SSIM variance is `E[X^2] - E[X]^2`: catastrophic cancellation in bf16
-        # gives negative variances and blows the division. Force float32 here.
-        pred = pred.float()
-        target = target.float()
+        # SSIM variance is `E[X^2] - E[X]^2`. Under bf16 autocast this cancels
+        # to negative values and the divide explodes (~1e8). Disable autocast
+        # AND cast to float32 — casting alone is not enough because conv3d
+        # under autocast forces its inputs back to bf16 regardless.
+        with torch.amp.autocast(device_type=pred.device.type, enabled=False):
+            pred = pred.float()
+            target = target.float()
 
-        # SSIM constants prevent division by zero in low-variance windows.
-        c1 = (0.01 * self.data_range) ** 2
-        c2 = (0.03 * self.data_range) ** 2
+            # SSIM constants prevent division by zero in low-variance windows.
+            c1 = (0.01 * self.data_range) ** 2
+            c2 = (0.03 * self.data_range) ** 2
 
-        # Local means.
-        mu_x = self._separable_gaussian(pred)
-        mu_y = self._separable_gaussian(target)
+            # Local means.
+            mu_x = self._separable_gaussian(pred)
+            mu_y = self._separable_gaussian(target)
 
-        # Mean products used in the SSIM equation.
-        mu_x_sq = mu_x.pow(2)
-        mu_y_sq = mu_y.pow(2)
-        mu_xy = mu_x * mu_y
+            # Mean products used in the SSIM equation.
+            mu_x_sq = mu_x.pow(2)
+            mu_y_sq = mu_y.pow(2)
+            mu_xy = mu_x * mu_y
 
-        # Local variances and covariance.
-        sigma_x_sq = self._separable_gaussian(pred * pred) - mu_x_sq
-        sigma_y_sq = self._separable_gaussian(target * target) - mu_y_sq
-        sigma_xy = self._separable_gaussian(pred * target) - mu_xy
+            # Local variances and covariance. Clamp to >=0 — even in float32
+            # the subtraction can land slightly negative on homogeneous patches.
+            sigma_x_sq = (self._separable_gaussian(pred * pred) - mu_x_sq).clamp_min(0.0)
+            sigma_y_sq = (self._separable_gaussian(target * target) - mu_y_sq).clamp_min(0.0)
+            sigma_xy = self._separable_gaussian(pred * target) - mu_xy
 
-        # Standard SSIM formula.
-        numerator = (2 * mu_xy + c1) * (2 * sigma_xy + c2)
-        denominator = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
+            # Standard SSIM formula.
+            numerator = (2 * mu_xy + c1) * (2 * sigma_xy + c2)
+            denominator = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
 
-        # Reduce to one scalar over batch, channels, and voxels.
-        return (numerator / denominator.clamp_min(1e-12)).mean()
+            # Reduce to one scalar over batch, channels, and voxels.
+            return (numerator / denominator.clamp_min(1e-12)).mean()
 
     def forward(
         self,
