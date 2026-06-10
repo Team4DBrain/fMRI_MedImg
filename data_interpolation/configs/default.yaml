@@ -1,0 +1,38 @@
+# Default config for fMRI temporal interpolation training.
+# Override any field from the CLI with `key=value`, e.g.
+#   python train.py --config configs/default.yaml train.epochs=20
+
+data:
+  # BIDS-style root directory scanned recursively for *_bold.nii.gz.
+  # Use file_list instead when you want explicit files (and set root: null).
+  root: data/
+  file_list: null
+  norm_mode: zscore       # zscore | percentile
+  val_fraction: 0.1
+
+model:
+  in_channels: 2
+  out_channels: 1
+  base_channels: 32
+  depth: 4
+
+train:
+  epochs: 20
+  batch_size: null        # null -> 4 on CUDA, 1 otherwise
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  num_workers: null       # null -> 8 on CUDA, 0 otherwise
+  alpha: 0.5              # L1 weight in hybrid loss; SSIM weight is (1 - alpha)
+  use_mask_loss: false
+  residual: false
+  save_every: 1
+  save_every_steps: 0
+  log_every: 10
+  seed: 0
+  device: null            # null -> auto: cuda > mps > cpu
+  max_samples: null       # cap dataset for smoke tests; null = no cap
+  compile: false          # CUDA only
+
+checkpoint:
+  dir: checkpoints/run
+  resume: null            # path to last.pt to resume from
