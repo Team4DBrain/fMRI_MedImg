@@ -157,12 +157,16 @@ def _validate_one_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
     device: str,
+    training_loss_name: str,
+    training_loss_kwargs: dict[str, Any],
 ) -> tuple[dict[str, float], float]:
     """Validation pass that reports all losses + all metrics per batch.
 
     Returns ``(mean_metrics, duration_s)``. Keys mirror
     ``metrics.compute_full_metrics`` so the training log and analytic
-    notebooks read the same names.
+    notebooks read the same names. Pass ``training_loss_name`` and
+    ``training_loss_kwargs`` so ``val_<loss_name>`` matches the optimiser
+    for parameterised objectives (e.g. dual-domain loss).
     """
     model.eval()
     per_batch: list[dict[str, float]] = []
@@ -172,7 +176,15 @@ def _validate_one_epoch(
         target = batch["target"].to(device)
         mask = batch["mask_hr"].to(device)
         pred = model(inputs)
-        per_batch.append(compute_full_metrics(pred, target, mask))
+        per_batch.append(
+            compute_full_metrics(
+                pred,
+                target,
+                mask,
+                training_loss_name=training_loss_name,
+                training_loss_kwargs=training_loss_kwargs,
+            )
+        )
     duration = time.perf_counter() - start
     return average_metric_dicts(per_batch), duration
 
@@ -242,7 +254,7 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
 
     optimizer = build_optimizer(config, model)
     scheduler, scheduler_needs_val = build_scheduler(config, optimizer)
-    loss_fn = resolve_loss(config.loss_name)
+    loss_fn = resolve_loss(config.loss_name, config.loss_kwargs)
 
     if val_loader is None and scheduler_needs_val:
         raise ValueError(
@@ -311,7 +323,11 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
 
             if val_loader is not None:
                 val_metrics, val_duration = _validate_one_epoch(
-                    model=model, loader=val_loader, device=device
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    training_loss_name=config.loss_name,
+                    training_loss_kwargs=config.loss_kwargs,
                 )
             else:
                 val_metrics, val_duration = {}, 0.0

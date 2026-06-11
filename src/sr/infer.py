@@ -31,7 +31,7 @@ from src.data.degradation_spatial import make_spatial_degradation
 from src.sr.checkpoint import load_epoch, run_dir_for_checkpoint
 from src.sr.config import SRConfig, auto_device, from_json
 from src.sr.data import build_loaders
-from src.sr.metrics import compute_full_metrics
+from src.sr.metrics import compute_full_metrics, volume_intensity_stats
 from src.sr.models import build_model
 
 
@@ -186,7 +186,15 @@ def evaluate(
         pred = model(batch["input"].to(device))
         target = batch["target"].to(device)
         mask = batch["mask_hr"].to(device)
-        per_batch.append(compute_full_metrics(pred, target, mask))
+        per_batch.append(
+            compute_full_metrics(
+                pred,
+                target,
+                mask,
+                training_loss_name=config.loss_name,
+                training_loss_kwargs=config.loss_kwargs,
+            )
+        )
 
     from src.sr.metrics import average_metric_dicts
 
@@ -218,6 +226,16 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 
+def print_volume_intensity_stats(volume_stats: dict[str, dict[str, float]]) -> None:
+    """Print min/max/mean for input, prediction, and target (from ``infer_one``)."""
+    for label in ("input", "prediction", "target"):
+        s = volume_stats[label]
+        print(
+            f"[infer] {label:>12}  min={s['min']:.6f}  "
+            f"max={s['max']:.6f}  mean={s['mean']:.6f}"
+        )
+
+
 @torch.no_grad()
 def infer_one(
     checkpoint_path: Path,
@@ -239,6 +257,8 @@ def infer_one(
     dataset = SpatialSRDataset(
         manifest_path=Path(config.manifest_path),
         degrade_fn=degrade_fn,
+        source_voxel_mm=float(config.source_voxel_mm),
+        target_voxel_mm=float(config.target_voxel_mm),
     )
 
     sample_index = None
@@ -258,7 +278,21 @@ def infer_one(
     mask = sample["mask_hr"].unsqueeze(0).to(device)
     pred = model(inputs)
 
-    metrics = compute_full_metrics(pred, target, mask)
+    metrics = compute_full_metrics(
+        pred,
+        target,
+        mask,
+        training_loss_name=config.loss_name,
+        training_loss_kwargs=config.loss_kwargs,
+    )
+    input_np = inputs.squeeze(0).squeeze(0).detach().cpu().numpy()
+    prediction_np = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
+    target_np = target.squeeze(0).squeeze(0).detach().cpu().numpy()
+    volume_stats = {
+        "input": volume_intensity_stats(input_np),
+        "prediction": volume_intensity_stats(prediction_np),
+        "target": volume_intensity_stats(target_np),
+    }
     return {
         "run_id": selection["run_id"],
         "subject": selection["subject"],
@@ -267,9 +301,10 @@ def infer_one(
         "direction": selection.get("direction"),
         "t": selection["t"],
         "metrics": metrics,
-        "input": inputs.squeeze(0).squeeze(0).detach().cpu().numpy(),
-        "prediction": pred.squeeze(0).squeeze(0).detach().cpu().numpy(),
-        "target": target.squeeze(0).squeeze(0).detach().cpu().numpy(),
+        "volume_stats": volume_stats,
+        "input": input_np,
+        "prediction": prediction_np,
+        "target": target_np,
     }
 
 

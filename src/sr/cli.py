@@ -28,15 +28,17 @@ from pathlib import Path
 from typing import Any
 
 from src.sr.config import SRConfig
+from src.sr.debug import add_debug_arguments, run_debug
 from src.sr.infer import (
     evaluate,
     format_sample_table,
     infer_one,
+    print_volume_intensity_stats,
     list_samples,
     make_slice_figure,
     select_sample,
 )
-from src.sr.losses import LOSS_REGISTRY
+from src.sr.losses import loss_names_for_validation
 from src.sr.models import MODEL_REGISTRY
 from src.sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
 from src.sr.train import train
@@ -107,7 +109,15 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument(
-        "--loss-name", choices=sorted(LOSS_REGISTRY), default=None
+        "--loss-name",
+        choices=sorted(loss_names_for_validation()),
+        default=None,
+    )
+    parser.add_argument(
+        "--loss-kwargs",
+        type=str,
+        default=None,
+        help="JSON dict of extra kwargs for parameterised losses (e.g. dual_domain_masked_mse).",
     )
     parser.add_argument(
         "--optimizer-name",
@@ -195,13 +205,19 @@ def _add_infer_arguments(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.sr",
-        description="Spatial super-resolution CLI (train / eval / infer).",
+        description="Spatial super-resolution CLI (train / eval / infer / debug).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     _add_train_arguments(sub.add_parser("train", help="Train (or resume) a model."))
     _add_eval_arguments(sub.add_parser("eval", help="Evaluate a checkpoint."))
     _add_infer_arguments(sub.add_parser("infer", help="Run one-sample inference."))
+    add_debug_arguments(
+        sub.add_parser(
+            "debug",
+            help="Inspect HR/LR images and masks (no checkpoint).",
+        )
+    )
 
     return parser
 
@@ -230,6 +246,7 @@ _CLI_TO_CONFIG: dict[str, str] = {
     "num_workers": "num_workers",
     "log_interval": "log_interval",
     "loss_name": "loss_name",
+    "loss_kwargs": "loss_kwargs",
     "optimizer_name": "optimizer_name",
     "learning_rate": "learning_rate",
     "optimizer_kwargs": "optimizer_kwargs",
@@ -240,7 +257,7 @@ _CLI_TO_CONFIG: dict[str, str] = {
 
 # CLI attributes whose value is parsed from a JSON string.
 _JSON_FIELDS: frozenset[str] = frozenset(
-    {"model_kwargs", "optimizer_kwargs", "scheduler_kwargs"}
+    {"model_kwargs", "optimizer_kwargs", "scheduler_kwargs", "loss_kwargs"}
 )
 
 
@@ -361,6 +378,7 @@ def _run_infer(args: argparse.Namespace) -> None:
     print(f"[infer] input.shape      = {result['input'].shape}")
     print(f"[infer] prediction.shape = {result['prediction'].shape}")
     print(f"[infer] target.shape     = {result['target'].shape}")
+    print_volume_intensity_stats(result["volume_stats"])
     for key in sorted(result["metrics"]):
         print(f"[infer] {key:>14} = {result['metrics'][key]:.6f}")
 
@@ -393,6 +411,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_eval(args)
     elif args.command == "infer":
         _run_infer(args)
+    elif args.command == "debug":
+        run_debug(args)
     else:
         parser.print_help()
         raise SystemExit(2)

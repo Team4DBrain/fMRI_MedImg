@@ -1,6 +1,6 @@
 # `src/sr` — Spatial Super-Resolution
 
-Minimal, modular 3D SR pipeline for fMRI volumes. Three commands, one
+Minimal, modular 3D SR pipeline for fMRI volumes. Four commands, one
 config dataclass, one checkpoint format. No automatic post-training
 analysis — the user composes plots, comparisons, and reports themselves.
 
@@ -10,13 +10,14 @@ analysis — the user composes plots, comparisons, and reports themselves.
 src/sr/
 ├── config.py       # SRConfig dataclass, defaults, JSON IO, validate
 ├── models.py       # SRCNN3D, RCAN3D, MODEL_REGISTRY, build_model
-├── losses.py       # mse, masked_mse, l1, masked_l1 + LOSS_REGISTRY
+├── losses.py       # mse, masked_mse, kspace_mse, dual_domain_masked_mse, registries
 ├── metrics.py      # psnr, masked/unmasked SSIM, compute_full_metrics
 ├── components.py   # OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
 ├── data.py         # build_loaders, dataset split, seeded workers
 ├── checkpoint.py   # EpochState save/load, find_latest_epoch
 ├── train.py        # train(config, resume_dir=None)
 ├── infer.py        # evaluate, infer_one, list_samples, make_slice_figure
+├── debug.py        # masks, prediction error, baseline comparison, loss curve
 └── cli.py + __main__.py   # `python -m src.sr ...`
 ```
 
@@ -34,7 +35,7 @@ via the CLI — no edits to `train.py` required.
 | `output_patch_shape` | `(128, 128, 93)` |
 | `source_voxel_mm` -> `target_voxel_mm` | `1.5 -> 3.0` |
 | `train_split` | `0.8` (train) / `0.2` (val), shuffled by `seed` |
-| `loss_name` | `masked_mse` |
+| `loss_name`, `loss_kwargs` | `masked_mse`, `{}` (see dual-domain keys below) |
 | `optimizer_name`, `learning_rate` | `adam`, `1e-3` |
 | `scheduler_name`, `scheduler_kwargs` | `plateau`, `{"factor":0.5,"patience":3}` |
 | `seed`, `deterministic`, `strict_finite_loss` | `42`, `true`, `true` |
@@ -77,7 +78,16 @@ python -m src.sr train \
   --scheduler-kwargs '{"T_max": 20}' \
   --epochs 20 --batch-size 4 --lr 1e-3
 
-# Resume an interrupted run (config flags are rejected; saved config wins)
+# Dual-domain (masked image MSE + orthonormal 3D FFT k-space MSE)
+python -m src.sr train \
+  --loss-name dual_domain_masked_mse \
+  --loss-kwargs '{"alpha": 0.5, "beta": 0.5, "kspace_high_freq_weight": 0.5}'
+
+# Focal Frequency Loss (dynamic k-space weighting, ICCV 2021)
+python -m src.sr train \
+  --loss-name focal_frequency \
+  --loss-kwargs '{"alpha": 1.0, "log_matrix": false, "batch_matrix": false}'
+
 python -m src.sr train --resume-dir src/sr/runs/srcnn3d/20260511_120000
 
 # Evaluate a checkpoint on its saved val split
@@ -97,7 +107,51 @@ python -m src.sr infer \
   --axis coronal --slice-level 0.4 \
   --save-png ./infer_preview.png \
   --save-npy ./infer_pred.npy
+
+# Debug: masks + degradation (no checkpoint)
+python -m src.sr debug \
+  --subject 01 --session 03 --task HcpEmotion --direction ap --t 0 \
+  --save-png ./debug_masks.png
+
+# Debug: prediction error vs ground truth + trilinear baseline
+python -m src.sr debug \
+  --checkpoint src/sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+  --subject 01 --session 03 --task HcpEmotion --direction ap --t 0 \
+  --figure both --error-map abs --mask-errors \
+  --save-dir ./debug_out --plot-loss-curve
 ```
+
+## Debug command
+
+`debug` inspects one manifest sample without training. Use it to verify masks,
+degradation, and (with `--checkpoint`) whether the model improves over the
+built-in trilinear upsampling baseline.
+
+| Flag | Purpose |
+|------|---------|
+| `--figure masks` | 2×2 HR/LR images and masks (default without checkpoint) |
+| `--figure infer` | 1×5 GT, prediction, error, baseline, baseline error |
+| `--figure both` | Both figures (default with `--checkpoint`) |
+| `--error-map abs\|signed\|squared` | How to colour pred vs target |
+| `--mask-errors` | Zero error outside the HR brain mask |
+| `--save-dir DIR` | Writes `masks.png`, `infer.png`, optional `loss_curve.png` |
+| `--plot-loss-curve` | Plot `metrics.json` from the checkpoint run |
+
+**Why loss can drop quickly (what to look for)**
+
+- `SRCNN3D` already trilinearly upsamples LR to HR before conv layers — epoch 1
+  loss is mostly “refine interpolation,” not learn SR from scratch.
+- Masked losses (~34% brain voxels) look lower than full-volume MSE.
+- Compare `masked_mse_baseline` vs `masked_mse_pred` in CLI output; small gap
+  means the network adds little beyond upsampling.
+
+**Suggested follow-up visualizations** (not all built in; compose as needed)
+
+- K-space magnitude diff when training with `kspace_mse` / `dual_domain_masked_mse`
+- Side-by-side error maps for `epoch_001.pt` vs `epoch_N.pt`
+- Error histograms in-mask vs out-of-mask
+- Multi-slice montage (several `--slice-level` values)
+- TensorBoard batch scalars under `run_dir/tb/`
 
 ## Resume contract
 

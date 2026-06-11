@@ -110,6 +110,8 @@ def build_loaders(
     full_dataset = SpatialSRDataset(
         manifest_path=Path(config.manifest_path),
         degrade_fn=degrade_fn,
+        source_voxel_mm=float(config.source_voxel_mm),
+        target_voxel_mm=float(config.target_voxel_mm),
     )
     train_indices, val_indices, split_meta = resolve_sample_split(
         len(full_dataset), config
