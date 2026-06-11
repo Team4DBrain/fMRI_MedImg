@@ -7,6 +7,8 @@ Purpose:
 Effects:
     Prints shapes, mask coverage, per-sample metrics, and loss decomposition.
     Writes PNG figures (masks grid, infer/error grid, optional loss curve).
+    Training runs also maintain ``<run_dir>/debug/`` with fixed-sample evolution
+    grids (every epoch shown) and loss curves.
 Influences:
     ``--manifest-path``, sample selectors, ``--checkpoint``, degradation
     voxel sizes (from checkpoint config when a checkpoint is given).
@@ -18,6 +20,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import shutil
+import traceback
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -27,9 +33,16 @@ from torch.nn import functional as F
 
 from src.data.datasets import SpatialSRDataset
 from src.data.degradation_spatial import make_spatial_degradation
-from src.sr.checkpoint import run_dir_for_checkpoint
-from src.sr.config import SRConfig, from_json
+from src.sr.checkpoint import (
+    best_epoch_path,
+    find_latest_epoch,
+    list_epoch_files,
+    load_epoch,
+    run_dir_for_checkpoint,
+)
+from src.sr.config import SRConfig, auto_device, from_json
 from src.sr.infer import format_sample_table, infer_one, list_samples, select_sample
+from src.sr.models import build_model
 from src.sr.losses import (
     kspace_mse_loss,
     masked_mse_loss,
@@ -160,33 +173,8 @@ def load_debug_infer(
     override_manifest: Path | None = None,
 ) -> dict[str, Any]:
     """Run inference and attach mask + trilinear baseline for debug plots."""
-    result = infer_one(
-        checkpoint_path,
-        selection,
-        override_manifest=override_manifest,
-    )
-    run_dir = run_dir_for_checkpoint(checkpoint_path)
-    config = from_json(run_dir / "config.json")
-    effective_manifest = Path(override_manifest or config.manifest_path)
-
-    mask_payload = load_debug_sample(
-        effective_manifest,
-        selection,
-        source_voxel_mm=float(config.source_voxel_mm),
-        target_voxel_mm=float(config.target_voxel_mm),
-    )
-    target = result["target"]
-    prediction = result["prediction"]
-    baseline = _trilinear_baseline_np(result["input"], target.shape)
-
-    return {
-        **result,
-        "hr_mask": mask_payload["hr_mask"],
-        "baseline": baseline,
-        "loss_name": config.loss_name,
-        "loss_kwargs": dict(config.loss_kwargs),
-        "run_dir": run_dir,
-    }
+    effective_manifest = Path(override_manifest or manifest_path)
+    return _build_infer_payload(checkpoint_path, effective_manifest, selection)
 
 
 def print_debug_summary(payload: dict[str, Any]) -> None:
@@ -479,9 +467,623 @@ def plot_loss_curve(
     plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# Run debug bundle (fixed samples, evolution plots, training hooks)
+# ---------------------------------------------------------------------------
+
+RUN_DEBUG_DIRNAME = "debug"
+EVOLUTION_COLS_PER_ROW = 8
+
+
+@dataclass(frozen=True)
+class FixedDebugSample:
+    """One manifest sample used for every run's debug bundle.
+
+    Purpose:
+        Pin a direction-balanced set of runs so training progress is comparable
+        across experiments without re-picking samples each time.
+    Effects:
+        Drives mask figures and evolution PNGs under ``<run_dir>/debug/``.
+    Influences:
+        Edit ``FIXED_DEBUG_SAMPLES`` when the manifest changes; run
+        ``python -m src.sr debug --populate-runs`` to refresh all runs.
+    """
+
+    key: str
+    subject: str
+    session: str
+    task: str
+    direction: Literal["ap", "pa"]
+    t: int
+    axis: str = "coronal"
+    slice_level: float = 0.6
+    note: str = ""
+
+
+# Three AP + three PA runs chosen from the production manifest (high t-SNR,
+# different subjects/paradigms: movie, visual, language, HCP emotion, Stroop,
+# spatial navigation).
+FIXED_DEBUG_SAMPLES: tuple[FixedDebugSample, ...] = (
+    FixedDebugSample(
+        key="ap_sub07_ses34_GoodBadUgly_t070",
+        subject="07",
+        session="34",
+        task="GoodBadUgly",
+        direction="ap",
+        t=70,
+        note="Movie/clips, highest AP t-SNR on server manifest",
+    ),
+    FixedDebugSample(
+        key="ap_sub06_ses08_ContRing_t012",
+        subject="06",
+        session="08",
+        task="ContRing",
+        direction="ap",
+        t=12,
+        note="Contrast ring visual localiser",
+    ),
+    FixedDebugSample(
+        key="ap_sub01_ses03_HcpLanguage_t109",
+        subject="01",
+        session="03",
+        task="HcpLanguage",
+        direction="ap",
+        t=109,
+        note="HCP language, mid-run",
+    ),
+    FixedDebugSample(
+        key="pa_sub02_ses04_HcpEmotion_t069",
+        subject="02",
+        session="04",
+        task="HcpEmotion",
+        direction="pa",
+        t=69,
+        note="HCP emotion, highest PA t-SNR on server manifest",
+    ),
+    FixedDebugSample(
+        key="pa_sub07_ses25_Stroop_t052",
+        subject="07",
+        session="25",
+        task="Stroop",
+        direction="pa",
+        t=52,
+        note="Stroop interference, mid-run",
+    ),
+    FixedDebugSample(
+        key="pa_sub09_ses31_SpatialNavigation_t075",
+        subject="09",
+        session="31",
+        task="SpatialNavigation",
+        direction="pa",
+        t=75,
+        note="Spatial navigation, mid-run",
+    ),
+)
+
+
+def run_debug_dir(run_dir: Path) -> Path:
+    """Return ``<run_dir>/debug/`` for artifact output."""
+    path = Path(run_dir).resolve() / RUN_DEBUG_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def clear_debug_output_dir(debug_dir: Path) -> None:
+    """Remove a run's debug output tree so the next populate starts fresh."""
+    debug_dir = Path(debug_dir)
+    if debug_dir.is_dir():
+        shutil.rmtree(debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+
+def discover_run_dirs(run_root: Path) -> list[Path]:
+    """List every training run directory that contains ``config.json``."""
+    run_root = Path(run_root)
+    if not run_root.is_dir():
+        return []
+
+    run_dirs: list[Path] = []
+    for model_dir in sorted(run_root.iterdir()):
+        if not model_dir.is_dir() or model_dir.name == RUN_DEBUG_DIRNAME:
+            continue
+        for candidate in sorted(model_dir.iterdir()):
+            if candidate.is_dir() and (candidate / "config.json").is_file():
+                run_dirs.append(candidate.resolve())
+    return run_dirs
+
+
+def _selection_for_fixed_sample(
+    manifest_path: Path,
+    sample: FixedDebugSample,
+    *,
+    warn: bool = False,
+) -> dict[str, Any] | None:
+    try:
+        return select_sample(
+            manifest_path,
+            subject=sample.subject,
+            session=sample.session,
+            task=sample.task,
+            direction=sample.direction,
+            t=sample.t,
+        )
+    except ValueError as exc:
+        if warn:
+            print(f"[debug] skipping fixed sample {sample.key}: {exc}")
+        return None
+
+
+def _available_fixed_samples(manifest_path: Path) -> list[FixedDebugSample]:
+    """Return fixed debug samples that resolve in the run manifest."""
+    return [
+        sample
+        for sample in FIXED_DEBUG_SAMPLES
+        if _selection_for_fixed_sample(manifest_path, sample) is not None
+    ]
+
+
+def _write_run_debug_manifest(
+    debug_dir: Path,
+    *,
+    run_dir: Path,
+    available_samples: list[FixedDebugSample],
+) -> None:
+    payload = {
+        "version": 2,
+        "run_dir": str(run_dir),
+        "catalog": [asdict(sample) for sample in FIXED_DEBUG_SAMPLES],
+        "available": [sample.key for sample in available_samples],
+    }
+    (debug_dir / "samples.json").write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _load_target_slice(
+    manifest_path: Path,
+    sample: FixedDebugSample,
+    *,
+    source_voxel_mm: float,
+    target_voxel_mm: float,
+) -> np.ndarray:
+    selection = _selection_for_fixed_sample(manifest_path, sample)
+    if selection is None:
+        raise RuntimeError(f"fixed sample unavailable in manifest: {sample.key}")
+    payload = load_debug_sample(
+        manifest_path,
+        selection,
+        source_voxel_mm=source_voxel_mm,
+        target_voxel_mm=target_voxel_mm,
+    )
+    target_slice, _ = _extract_slice(
+        payload["hr_image"],
+        axis=sample.axis,
+        slice_level=sample.slice_level,
+    )
+    return target_slice
+
+
+@torch.no_grad()
+def _forward_sample(
+    model: torch.nn.Module,
+    config: SRConfig,
+    device: str,
+    manifest_path: Path,
+    selection: dict[str, Any],
+) -> np.ndarray:
+    """Run one manifest sample through ``model`` and return the prediction volume."""
+    degrade_fn = make_spatial_degradation(
+        source_voxel_mm=float(config.source_voxel_mm),
+        target_voxel_mm=float(config.target_voxel_mm),
+    )
+    dataset = SpatialSRDataset(
+        manifest_path=Path(manifest_path),
+        degrade_fn=degrade_fn,
+        source_voxel_mm=float(config.source_voxel_mm),
+        target_voxel_mm=float(config.target_voxel_mm),
+    )
+    sample_index = None
+    for idx, (run_idx, t) in enumerate(dataset.samples):
+        if dataset.runs[run_idx]["run_id"] == selection["run_id"] and t == selection["t"]:
+            sample_index = idx
+            break
+    if sample_index is None:
+        raise RuntimeError(
+            f"Could not locate run_id={selection['run_id']} t={selection['t']} "
+            "in the dataset."
+        )
+    sample = dataset[sample_index]
+    inputs = sample["input"].unsqueeze(0).to(device)
+    pred = model(inputs)
+    return _tensor_to_volume(pred)
+
+
+def _prediction_slice_for_epoch(
+    run_dir: Path,
+    config: SRConfig,
+    sample: FixedDebugSample,
+    *,
+    epoch_number: int,
+    model: torch.nn.Module,
+    device: str,
+    manifest_path: Path,
+) -> np.ndarray:
+    selection = _selection_for_fixed_sample(manifest_path, sample)
+    if selection is None:
+        raise RuntimeError(f"fixed sample unavailable in manifest: {sample.key}")
+    prediction = _forward_sample(model, config, device, manifest_path, selection)
+    pred_slice, _ = _extract_slice(
+        prediction,
+        axis=sample.axis,
+        slice_level=sample.slice_level,
+    )
+    return pred_slice
+
+
+def _compute_all_epoch_prediction_slices(
+    run_dir: Path,
+    config: SRConfig,
+    samples: list[FixedDebugSample],
+) -> dict[str, list[tuple[int, np.ndarray]]]:
+    """Run every saved epoch checkpoint once and collect slices for all samples."""
+    manifest_path = Path(config.manifest_path)
+    slices_by_key: dict[str, list[tuple[int, np.ndarray]]] = {
+        sample.key: [] for sample in samples
+    }
+
+    for checkpoint in list_epoch_files(run_dir):
+        epoch_number = int(checkpoint.stem.split("_")[1])
+        device = auto_device()
+        model = build_model(config).to(device)
+        state = load_epoch(checkpoint, map_location=device)
+        model.load_state_dict(state.model_state_dict)
+        model.eval()
+        for sample in samples:
+            pred_slice = _prediction_slice_for_epoch(
+                run_dir,
+                config,
+                sample,
+                epoch_number=epoch_number,
+                model=model,
+                device=device,
+                manifest_path=manifest_path,
+            )
+            slices_by_key[sample.key].append((epoch_number, pred_slice))
+
+    return slices_by_key
+
+
+def plot_prediction_evolution(
+    *,
+    target_slice: np.ndarray,
+    epoch_slices: list[tuple[int, np.ndarray]],
+    sample: FixedDebugSample,
+    output_path: Path,
+) -> None:
+    """Save GT + every epoch prediction in a multi-row grid (no subsampling)."""
+    if not epoch_slices:
+        return
+
+    plt = _import_matplotlib(agg=True)
+    panels: list[tuple[str, np.ndarray]] = [("Target (GT)", target_slice)]
+    panels.extend((f"epoch {epoch_number}", pred_slice) for epoch_number, pred_slice in epoch_slices)
+
+    ncol = EVOLUTION_COLS_PER_ROW
+    nrow = math.ceil(len(panels) / ncol)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(2.6 * ncol, 2.8 * nrow))
+    axes_list = np.atleast_1d(axes).ravel().tolist()
+
+    gray_stack = np.stack([arr for _, arr in panels])
+    vmin = float(gray_stack.min())
+    vmax = float(gray_stack.max())
+
+    for ax, (title, image) in zip(axes_list, panels):
+        ax.imshow(image, cmap="gray", vmin=vmin, vmax=vmax)
+        ax.set_title(title, fontsize=9)
+        ax.axis("off")
+    for ax in axes_list[len(panels) :]:
+        ax.axis("off")
+
+    fig.suptitle(
+        f"Prediction evolution: {sample.direction} sub-{sample.subject} "
+        f"ses-{sample.session} {sample.task} t={sample.t}\n"
+        f"{sample.axis} slice level={sample.slice_level:.2f}  "
+        f"({len(epoch_slices)} epochs, all shown)",
+        fontsize=10,
+    )
+    fig.tight_layout()
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"[debug] wrote prediction evolution -> {output_path}")
+    plt.close(fig)
+
+
+def _write_mask_figures(
+    debug_dir: Path,
+    manifest_path: Path,
+    *,
+    source_voxel_mm: float,
+    target_voxel_mm: float,
+    samples: list[FixedDebugSample],
+) -> None:
+    masks_dir = debug_dir / "masks"
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    for sample in samples:
+        output_path = masks_dir / f"{sample.key}.png"
+        selection = _selection_for_fixed_sample(manifest_path, sample)
+        if selection is None:
+            continue
+        payload = load_debug_sample(
+            manifest_path,
+            selection,
+            source_voxel_mm=source_voxel_mm,
+            target_voxel_mm=target_voxel_mm,
+        )
+        save_debug_figure(
+            payload,
+            axis=sample.axis,
+            slice_level=sample.slice_level,
+            output_path=output_path,
+            show=False,
+        )
+
+
+def _write_evolution_figures(
+    run_dir: Path,
+    config: SRConfig,
+    *,
+    debug_dir: Path,
+) -> None:
+    manifest_path = Path(config.manifest_path)
+    evolution_dir = debug_dir / "evolution"
+    evolution_dir.mkdir(parents=True, exist_ok=True)
+
+    samples = _available_fixed_samples(manifest_path)
+    if not samples or not list_epoch_files(run_dir):
+        return
+
+    slices_by_key = _compute_all_epoch_prediction_slices(run_dir, config, samples)
+    for sample in samples:
+        epoch_slices = slices_by_key.get(sample.key, [])
+        if not epoch_slices:
+            continue
+        try:
+            target_slice = _load_target_slice(
+                manifest_path,
+                sample,
+                source_voxel_mm=float(config.source_voxel_mm),
+                target_voxel_mm=float(config.target_voxel_mm),
+            )
+        except RuntimeError as exc:
+            print(f"[debug] skipping evolution for {sample.key}: {exc}")
+            continue
+        plot_prediction_evolution(
+            target_slice=target_slice,
+            epoch_slices=epoch_slices,
+            sample=sample,
+            output_path=evolution_dir / f"{sample.key}.png",
+        )
+
+
+def _checkpoint_for_debug_infer(run_dir: Path) -> Path | None:
+    best = best_epoch_path(run_dir)
+    if best.is_file():
+        return best
+    return find_latest_epoch(run_dir)
+
+
+def _build_infer_payload(
+    checkpoint_path: Path,
+    manifest_path: Path,
+    selection: dict[str, Any],
+) -> dict[str, Any]:
+    """Like ``load_debug_infer`` but reuses a caller-loaded ``result`` when provided."""
+    result = infer_one(checkpoint_path, selection, override_manifest=manifest_path)
+    run_dir = run_dir_for_checkpoint(checkpoint_path)
+    config = from_json(run_dir / "config.json")
+    mask_payload = load_debug_sample(
+        manifest_path,
+        selection,
+        source_voxel_mm=float(config.source_voxel_mm),
+        target_voxel_mm=float(config.target_voxel_mm),
+    )
+    target = result["target"]
+    return {
+        **result,
+        "hr_mask": mask_payload["hr_mask"],
+        "baseline": _trilinear_baseline_np(result["input"], target.shape),
+        "loss_name": config.loss_name,
+        "loss_kwargs": dict(config.loss_kwargs),
+        "run_dir": run_dir,
+    }
+
+
+def _write_latest_infer_figures(
+    run_dir: Path, config: SRConfig, *, debug_dir: Path
+) -> None:
+    checkpoint = _checkpoint_for_debug_infer(run_dir)
+    if checkpoint is None:
+        return
+
+    latest_dir = debug_dir / "latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(config.manifest_path)
+
+    for sample in _available_fixed_samples(manifest_path):
+        output_path = latest_dir / f"{sample.key}_infer.png"
+        selection = _selection_for_fixed_sample(manifest_path, sample)
+        if selection is None:
+            continue
+        infer_payload = _build_infer_payload(checkpoint, manifest_path, selection)
+        save_infer_figure(
+            infer_payload,
+            axis=sample.axis,
+            slice_level=sample.slice_level,
+            error_map="abs",
+            mask_errors=True,
+            output_path=output_path,
+            show=False,
+        )
+
+
+def _log_fixed_sample_coverage(manifest_path: Path, available: list[FixedDebugSample]) -> None:
+    if not available:
+        print(
+            f"[debug] warning: none of the fixed debug samples are in {manifest_path}. "
+            "Edit FIXED_DEBUG_SAMPLES in src/sr/debug.py if the manifest differs."
+        )
+    elif len(available) < len(FIXED_DEBUG_SAMPLES):
+        missing = [s.key for s in FIXED_DEBUG_SAMPLES if s not in available]
+        print(
+            f"[debug] note: {len(missing)} fixed sample(s) not in manifest: "
+            + ", ".join(missing)
+        )
+
+
+def ensure_run_debug_layout(run_dir: Path, config: SRConfig) -> Path:
+    """Create ``<run_dir>/debug/`` when a run starts (no wipe on resume)."""
+    debug_dir = run_debug_dir(run_dir)
+    manifest_path = Path(config.manifest_path)
+    available = _available_fixed_samples(manifest_path)
+    _log_fixed_sample_coverage(manifest_path, available)
+    _write_run_debug_manifest(
+        debug_dir, run_dir=run_dir, available_samples=available
+    )
+    _write_mask_figures(
+        debug_dir,
+        manifest_path,
+        source_voxel_mm=float(config.source_voxel_mm),
+        target_voxel_mm=float(config.target_voxel_mm),
+        samples=available,
+    )
+    print(
+        f"[debug] run debug layout ready -> {debug_dir} "
+        f"({len(available)}/{len(FIXED_DEBUG_SAMPLES)} samples)"
+    )
+    return debug_dir
+
+
+def update_run_debug_after_epoch(run_dir: Path, *, epoch_number: int) -> None:
+    """Recompute evolution and loss-curve figures from all epoch checkpoints."""
+    _ = epoch_number
+    run_dir = Path(run_dir).resolve()
+    config = from_json(run_dir / "config.json")
+    debug_dir = run_debug_dir(run_dir)
+
+    _write_evolution_figures(run_dir, config, debug_dir=debug_dir)
+
+    metrics_path = run_dir / "metrics.json"
+    if metrics_path.is_file():
+        plot_loss_curve(run_dir, debug_dir / "loss_curve.png")
+
+
+def finalize_run_debug(run_dir: Path) -> None:
+    """Write heavier debug artifacts once training finishes."""
+    run_dir = Path(run_dir).resolve()
+    config = from_json(run_dir / "config.json")
+    debug_dir = run_debug_dir(run_dir)
+    _write_latest_infer_figures(run_dir, config, debug_dir=debug_dir)
+
+
+def populate_run_debug(run_dir: Path, *, clear: bool = True) -> Path:
+    """Refresh the central debug bundle for one training run."""
+    run_dir = Path(run_dir).resolve()
+    config_path = run_dir / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"No config.json in run directory: {run_dir}")
+
+    config = from_json(config_path)
+    debug_dir = Path(run_dir) / RUN_DEBUG_DIRNAME
+    if clear:
+        clear_debug_output_dir(debug_dir)
+    else:
+        run_debug_dir(run_dir)
+
+    manifest_path = Path(config.manifest_path)
+    available = _available_fixed_samples(manifest_path)
+    _log_fixed_sample_coverage(manifest_path, available)
+    _write_run_debug_manifest(
+        debug_dir, run_dir=run_dir, available_samples=available
+    )
+    _write_mask_figures(
+        debug_dir,
+        manifest_path,
+        source_voxel_mm=float(config.source_voxel_mm),
+        target_voxel_mm=float(config.target_voxel_mm),
+        samples=available,
+    )
+    _write_evolution_figures(run_dir, config, debug_dir=debug_dir)
+
+    metrics_path = run_dir / "metrics.json"
+    if metrics_path.is_file():
+        plot_loss_curve(run_dir, debug_dir / "loss_curve.png")
+
+    _write_latest_infer_figures(run_dir, config, debug_dir=debug_dir)
+    print(f"[debug] populated run debug bundle -> {debug_dir}")
+    return debug_dir
+
+
+def populate_all_runs_debug(
+    run_root: Path | None = None,
+    *,
+    run_dir: Path | None = None,
+) -> list[Path]:
+    """Clear and regenerate debug output for all runs (or one run) under ``run_root``."""
+    if run_dir is not None:
+        return [populate_run_debug(run_dir, clear=True)]
+
+    root = Path(run_root or SRConfig().run_root)
+    run_dirs = discover_run_dirs(root)
+    if not run_dirs:
+        print(f"[debug] no training runs found under {root}")
+        return []
+
+    print(f"[debug] populating debug/ for {len(run_dirs)} run(s) under {root}")
+    written: list[Path] = []
+    for candidate in run_dirs:
+        try:
+            written.append(populate_run_debug(candidate, clear=True))
+        except Exception as exc:
+            print(f"[debug] warning: failed for {candidate}: {exc}")
+            traceback.print_exc()
+    return written
+
+
+def safe_update_run_debug_after_epoch(run_dir: Path, *, epoch_number: int) -> None:
+    """Training hook: never abort the run when debug artifact generation fails."""
+    try:
+        update_run_debug_after_epoch(run_dir, epoch_number=epoch_number)
+    except Exception as exc:
+        print(f"[train] warning: run debug update failed after epoch {epoch_number}: {exc}")
+        traceback.print_exc()
+
+
 def add_debug_arguments(parser: argparse.ArgumentParser) -> None:
     """Register flags for the ``debug`` subcommand."""
     defaults = SRConfig()
+    parser.add_argument(
+        "--populate-runs",
+        action="store_true",
+        help=(
+            "Clear and regenerate <run_dir>/debug/ for every training run "
+            "(all models). Default when no sample selectors are given."
+        ),
+    )
+    parser.add_argument(
+        "--run-root",
+        type=Path,
+        default=defaults.run_root,
+        help="Run root to scan with --populate-runs (default: SRConfig run_root).",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Limit --populate-runs to a single training run directory.",
+    )
     parser.add_argument(
         "--manifest-path",
         type=Path,
@@ -595,6 +1197,27 @@ def _resolve_voxel_sizes(
 
 def run_debug(args: argparse.Namespace) -> None:
     """Entry point for ``python -m src.sr debug ...``."""
+    selection_filters = {
+        "subject": args.subject,
+        "session": args.session,
+        "task": args.task,
+        "direction": args.direction,
+        "t": args.t,
+    }
+    wants_single_sample = any(value is not None for value in selection_filters.values())
+
+    if args.populate_runs or (
+        not wants_single_sample
+        and not args.list_samples
+        and args.checkpoint is None
+        and args.save_png is None
+        and args.save_dir is None
+        and not args.show
+        and not args.plot_loss_curve
+    ):
+        populate_all_runs_debug(args.run_root, run_dir=args.run_dir)
+        return
+
     manifest = Path(args.manifest_path)
     if not manifest.is_file():
         raise SystemExit(f"manifest_path does not exist: {manifest}")
@@ -603,17 +1226,10 @@ def run_debug(args: argparse.Namespace) -> None:
         print(format_sample_table(list_samples(manifest)))
         return
 
-    selection_filters = {
-        "subject": args.subject,
-        "session": args.session,
-        "task": args.task,
-        "direction": args.direction,
-        "t": args.t,
-    }
-    if all(value is None for value in selection_filters.values()):
+    if not wants_single_sample:
         raise SystemExit(
-            "debug requires either --list-samples or at least one selector "
-            "(--subject/--session/--task/--direction/--t). See --help."
+            "debug requires either --populate-runs, --list-samples, or sample "
+            "selectors (--subject/--session/--task/--direction/--t). See --help."
         )
 
     figure_mode = _resolve_figure_mode(args)

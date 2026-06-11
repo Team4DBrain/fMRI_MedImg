@@ -79,6 +79,19 @@ class SRConfig:
     optimizer_name: str = "adam"
     learning_rate: float = 1e-3
     optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    # Gradient-norm clipping (training stability).
+    # Purpose: cap the global L2 norm of the gradients each step so a single
+    #   bad batch cannot blow up the Adam update and wreck the weights. The
+    #   srcnn3d runs show exactly that failure -- a mid-training loss spike
+    #   (train_loss ~0.005 -> ~0.035) that costs many epochs to recover from.
+    # Effect: when set, ``torch.nn.utils.clip_grad_norm_`` runs after
+    #   ``loss.backward()`` and before ``optimizer.step()`` in the train loop.
+    # Influences: only the optimizer step; metrics/checkpoints are unchanged.
+    # Change guidance: ``None`` (default) disables clipping so existing runs
+    #   and resumes reproduce bit-for-bit. Typical stabilising value is 1.0;
+    #   lower it (e.g. 0.5) if spikes persist, raise it if training stalls.
+    grad_clip_norm: float | None = None
     scheduler_name: str = "plateau"
     scheduler_kwargs: dict[str, Any] = field(
         default_factory=lambda: {"factor": 0.5, "patience": 3}
@@ -181,6 +194,10 @@ def validate(config: SRConfig) -> None:
         raise ValueError("log_interval must be >= 1")
     if config.learning_rate <= 0:
         raise ValueError("learning_rate must be > 0")
+    if config.grad_clip_norm is not None and config.grad_clip_norm <= 0:
+        raise ValueError(
+            "grad_clip_norm must be > 0 when set, or None to disable clipping."
+        )
     if not 0.0 < config.train_split <= 1.0:
         raise ValueError("train_split must be in (0, 1]")
     if config.source_voxel_mm <= 0 or config.target_voxel_mm <= 0:
@@ -270,6 +287,7 @@ def summary(config: SRConfig) -> str:
         f"  optimizer_name    = {config.optimizer_name}",
         f"  learning_rate     = {config.learning_rate}",
         f"  optimizer_kwargs  = {config.optimizer_kwargs}",
+        f"  grad_clip_norm    = {config.grad_clip_norm}",
         f"  scheduler_name    = {config.scheduler_name}",
         f"  scheduler_kwargs  = {config.scheduler_kwargs}",
         f"  tensorboard       = {config.tensorboard}",

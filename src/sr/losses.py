@@ -51,6 +51,8 @@ def masked_mse_loss(
     fire in practice (validate_paths and the dataset reject empty masks).
     """
     sq_err = (pred - target) ** 2
+    #mask_reduced = torch.clamp(mask, min=0.25)
+    #denom = torch.clamp(mask_reduced.sum(), min=eps)
     denom = torch.clamp(mask.sum(), min=eps)
     return (sq_err * mask).sum() / denom
 

@@ -128,6 +128,17 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
         "--lr", type=float, default=None, dest="learning_rate"
     )
     parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=None,
+        help=(
+            "Clip the global gradient L2 norm to this value each step "
+            "(training stability). Omit to disable (default); 1.0 is a "
+            "typical stabilising value. Prevents the mid-training loss "
+            "spikes seen in earlier srcnn3d runs."
+        ),
+    )
+    parser.add_argument(
         "--optimizer-kwargs",
         type=str,
         default=None,
@@ -249,6 +260,7 @@ _CLI_TO_CONFIG: dict[str, str] = {
     "loss_kwargs": "loss_kwargs",
     "optimizer_name": "optimizer_name",
     "learning_rate": "learning_rate",
+    "grad_clip_norm": "grad_clip_norm",
     "optimizer_kwargs": "optimizer_kwargs",
     "scheduler_name": "scheduler_name",
     "scheduler_kwargs": "scheduler_kwargs",
