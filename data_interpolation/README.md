@@ -121,6 +121,38 @@ Match `--norm-mode` and `--residual` to whatever was used at training time.
 The shipped pretrained checkpoint was trained with `norm-mode=zscore` and
 **without** residual, so the defaults are correct.
 
+## Module API — use from the larger project
+
+Other pipeline components can call the interpolation module directly instead of
+shelling out to `main.py`:
+
+```python
+from data_interpolation import interpolate_file
+
+output_path = interpolate_file(
+    input_path="/srv/fMRI-data/sub-01_ses-00_task-X_bold.nii.gz",
+    output_path="results/sub-01_ses-00_task-X_bold_2x.nii.gz",
+    weights="data_interpolation/checkpoints/pretrained/model_weights.pt",
+)
+```
+
+When processing many files, load the checkpoint once:
+
+```python
+from data_interpolation import FMRIInterpolator
+
+interpolator = FMRIInterpolator(
+    weights="data_interpolation/checkpoints/pretrained/model_weights.pt",
+)
+
+for input_path, output_path in jobs:
+    interpolator.interpolate(input_path, output_path)
+```
+
+The default mode is `insert`, which returns a 4D NIfTI with `2T - 1` frames and
+halves the header TR when available. Use `mode="fill-gaps"` to write only the
+synthetic frames.
+
 ## Pretrained weights
 
 `checkpoints/pretrained/model_weights.pt` (~90 MB) is the best full-training
