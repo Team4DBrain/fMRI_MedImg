@@ -12,16 +12,30 @@ venv/
 .vscode/
 .idea/
 
-# Data — users provide their own (BIDS root or BOLD files)
+# Data - users provide their own BIDS root or BOLD files.
 data/**
 !data/.gitkeep
 
-# Results — generated at runtime
+# Results - keep lightweight evaluation summaries, ignore generated volumes.
 results/**
 !results/.gitkeep
+!results/**/
+!results/**/*.csv
+!results/**/*.json
+!results/**/*.png
+!results/**/*.txt
+results/**/*.nii
+results/**/*.nii.gz
 
-# Checkpoints — ignore everything EXCEPT the shipped pretrained folder
+# Checkpoints - keep metadata/history for reproducibility, ignore heavy tensors
+# unless explicitly promoted to the shipped pretrained weights.
 checkpoints/**
 !checkpoints/.gitkeep
-!checkpoints/pretrained/
-!checkpoints/pretrained/**
+!checkpoints/**/
+!checkpoints/**/README.md
+!checkpoints/**/history.json
+!checkpoints/**/config.yaml
+!checkpoints/**/config.yml
+!checkpoints/**/metrics.csv
+!checkpoints/**/metrics.json
+!checkpoints/pretrained/model_weights.pt
