@@ -12,6 +12,10 @@ venv/
 .vscode/
 .idea/
 
+# Local logs and editor backups
+logs/
+*~
+
 # Data - users provide their own BIDS root or BOLD files.
 data/**
 !data/.gitkeep
