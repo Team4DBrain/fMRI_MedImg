@@ -480,8 +480,8 @@ class FixedDebugSample:
     """One manifest sample used for every run's debug bundle.
 
     Purpose:
-        Pin a direction-balanced set of runs so training progress is comparable
-        across experiments without re-picking samples each time.
+        Pin three manifest runs per slice axis (coronal, axial, sagittal) so
+        training progress is comparable across experiments without re-picking.
     Effects:
         Drives mask figures and evolution PNGs under ``<run_dir>/debug/``.
     Influences:
@@ -500,63 +500,110 @@ class FixedDebugSample:
     note: str = ""
 
 
-# Three AP + three PA runs chosen from the production manifest (high t-SNR,
-# different subjects/paradigms: movie, visual, language, HCP emotion, Stroop,
-# spatial navigation).
+# Three runs per slice axis (coronal / axial / sagittal), chosen from the
+# production manifest for high t-SNR and paradigm diversity.
 FIXED_DEBUG_SAMPLES: tuple[FixedDebugSample, ...] = (
+    # --- coronal ---
     FixedDebugSample(
-        key="ap_sub07_ses34_GoodBadUgly_t070",
+        key="coronal_ap_sub07_ses34_GoodBadUgly_t070",
         subject="07",
         session="34",
         task="GoodBadUgly",
         direction="ap",
         t=70,
-        note="Movie/clips, highest AP t-SNR on server manifest",
+        axis="coronal",
+        slice_level=0.6,
+        note="Movie/clips, high AP t-SNR",
     ),
     FixedDebugSample(
-        key="ap_sub06_ses08_ContRing_t012",
-        subject="06",
-        session="08",
-        task="ContRing",
-        direction="ap",
-        t=12,
-        note="Contrast ring visual localiser",
-    ),
-    FixedDebugSample(
-        key="ap_sub01_ses03_HcpLanguage_t109",
-        subject="01",
-        session="03",
-        task="HcpLanguage",
-        direction="ap",
-        t=109,
-        note="HCP language, mid-run",
-    ),
-    FixedDebugSample(
-        key="pa_sub02_ses04_HcpEmotion_t069",
+        key="coronal_pa_sub02_ses04_HcpEmotion_t069",
         subject="02",
         session="04",
         task="HcpEmotion",
         direction="pa",
         t=69,
-        note="HCP emotion, highest PA t-SNR on server manifest",
+        axis="coronal",
+        slice_level=0.6,
+        note="HCP emotion, high PA t-SNR",
     ),
     FixedDebugSample(
-        key="pa_sub07_ses25_Stroop_t052",
+        key="coronal_ap_sub06_ses08_ContRing_t012",
+        subject="06",
+        session="08",
+        task="ContRing",
+        direction="ap",
+        t=12,
+        axis="coronal",
+        slice_level=0.6,
+        note="Contrast ring visual localiser",
+    ),
+    # --- axial ---
+    FixedDebugSample(
+        key="axial_ap_sub01_ses03_HcpLanguage_t109",
+        subject="01",
+        session="03",
+        task="HcpLanguage",
+        direction="ap",
+        t=109,
+        axis="axial",
+        slice_level=0.5,
+        note="HCP language, mid-run",
+    ),
+    FixedDebugSample(
+        key="axial_pa_sub07_ses25_Stroop_t052",
         subject="07",
         session="25",
         task="Stroop",
         direction="pa",
         t=52,
-        note="Stroop interference, mid-run",
+        axis="axial",
+        slice_level=0.5,
+        note="Stroop interference",
     ),
     FixedDebugSample(
-        key="pa_sub09_ses31_SpatialNavigation_t075",
+        key="axial_pa_sub09_ses31_SpatialNavigation_t075",
         subject="09",
         session="31",
         task="SpatialNavigation",
         direction="pa",
         t=75,
-        note="Spatial navigation, mid-run",
+        axis="axial",
+        slice_level=0.5,
+        note="Spatial navigation",
+    ),
+    # --- sagittal ---
+    FixedDebugSample(
+        key="sagittal_pa_sub07_ses35_EmoReco_t099",
+        subject="07",
+        session="35",
+        task="EmoReco",
+        direction="pa",
+        t=99,
+        axis="sagittal",
+        slice_level=0.5,
+        note="Emotion recognition, mid-run",
+    ),
+    FixedDebugSample(
+        key="sagittal_pa_sub11_ses30_BiologicalMotion1_t102",
+        subject="11",
+        session="30",
+        task="BiologicalMotion1",
+        direction="pa",
+        t=102,
+        axis="sagittal",
+        slice_level=0.5,
+        note="Biological motion",
+    ),
+    FixedDebugSample(
+        key="sagittal_pa_sub13_ses03_RSVPLanguage_t155",
+        subject="13",
+        session="03",
+        task="RSVPLanguage",
+        direction="pa",
+        t=155,
+        axis="sagittal",
+        slice_level=0.5,
+        note="RSVP language, mid-run",
     ),
 )
 
@@ -740,15 +787,22 @@ def _compute_all_epoch_prediction_slices(
         model.load_state_dict(state.model_state_dict)
         model.eval()
         for sample in samples:
-            pred_slice = _prediction_slice_for_epoch(
-                run_dir,
-                config,
-                sample,
-                epoch_number=epoch_number,
-                model=model,
-                device=device,
-                manifest_path=manifest_path,
-            )
+            try:
+                pred_slice = _prediction_slice_for_epoch(
+                    run_dir,
+                    config,
+                    sample,
+                    epoch_number=epoch_number,
+                    model=model,
+                    device=device,
+                    manifest_path=manifest_path,
+                )
+            except Exception as exc:
+                print(
+                    f"[debug] warning: epoch {epoch_number} failed for "
+                    f"{sample.key}: {exc}"
+                )
+                continue
             slices_by_key[sample.key].append((epoch_number, pred_slice))
 
     return slices_by_key
@@ -813,22 +867,25 @@ def _write_mask_figures(
     masks_dir.mkdir(parents=True, exist_ok=True)
     for sample in samples:
         output_path = masks_dir / f"{sample.key}.png"
-        selection = _selection_for_fixed_sample(manifest_path, sample)
-        if selection is None:
-            continue
-        payload = load_debug_sample(
-            manifest_path,
-            selection,
-            source_voxel_mm=source_voxel_mm,
-            target_voxel_mm=target_voxel_mm,
-        )
-        save_debug_figure(
-            payload,
-            axis=sample.axis,
-            slice_level=sample.slice_level,
-            output_path=output_path,
-            show=False,
-        )
+        try:
+            selection = _selection_for_fixed_sample(manifest_path, sample)
+            if selection is None:
+                continue
+            payload = load_debug_sample(
+                manifest_path,
+                selection,
+                source_voxel_mm=source_voxel_mm,
+                target_voxel_mm=target_voxel_mm,
+            )
+            save_debug_figure(
+                payload,
+                axis=sample.axis,
+                slice_level=sample.slice_level,
+                output_path=output_path,
+                show=False,
+            )
+        except Exception as exc:
+            print(f"[debug] warning: mask figure failed for {sample.key}: {exc}")
 
 
 def _write_evolution_figures(
@@ -857,15 +914,18 @@ def _write_evolution_figures(
                 source_voxel_mm=float(config.source_voxel_mm),
                 target_voxel_mm=float(config.target_voxel_mm),
             )
-        except RuntimeError as exc:
-            print(f"[debug] skipping evolution for {sample.key}: {exc}")
+        except Exception as exc:
+            print(f"[debug] warning: evolution failed for {sample.key}: {exc}")
             continue
-        plot_prediction_evolution(
-            target_slice=target_slice,
-            epoch_slices=epoch_slices,
-            sample=sample,
-            output_path=evolution_dir / f"{sample.key}.png",
-        )
+        try:
+            plot_prediction_evolution(
+                target_slice=target_slice,
+                epoch_slices=epoch_slices,
+                sample=sample,
+                output_path=evolution_dir / f"{sample.key}.png",
+            )
+        except Exception as exc:
+            print(f"[debug] warning: evolution plot failed for {sample.key}: {exc}")
 
 
 def _checkpoint_for_debug_infer(run_dir: Path) -> Path | None:
@@ -914,19 +974,22 @@ def _write_latest_infer_figures(
 
     for sample in _available_fixed_samples(manifest_path):
         output_path = latest_dir / f"{sample.key}_infer.png"
-        selection = _selection_for_fixed_sample(manifest_path, sample)
-        if selection is None:
-            continue
-        infer_payload = _build_infer_payload(checkpoint, manifest_path, selection)
-        save_infer_figure(
-            infer_payload,
-            axis=sample.axis,
-            slice_level=sample.slice_level,
-            error_map="abs",
-            mask_errors=True,
-            output_path=output_path,
-            show=False,
-        )
+        try:
+            selection = _selection_for_fixed_sample(manifest_path, sample)
+            if selection is None:
+                continue
+            infer_payload = _build_infer_payload(checkpoint, manifest_path, selection)
+            save_infer_figure(
+                infer_payload,
+                axis=sample.axis,
+                slice_level=sample.slice_level,
+                error_map="abs",
+                mask_errors=True,
+                output_path=output_path,
+                show=False,
+            )
+        except Exception as exc:
+            print(f"[debug] warning: latest infer failed for {sample.key}: {exc}")
 
 
 def _log_fixed_sample_coverage(manifest_path: Path, available: list[FixedDebugSample]) -> None:
@@ -1019,7 +1082,10 @@ def populate_run_debug(run_dir: Path, *, clear: bool = True) -> Path:
 
     metrics_path = run_dir / "metrics.json"
     if metrics_path.is_file():
-        plot_loss_curve(run_dir, debug_dir / "loss_curve.png")
+        try:
+            plot_loss_curve(run_dir, debug_dir / "loss_curve.png")
+        except Exception as exc:
+            print(f"[debug] warning: loss curve failed for {run_dir.name}: {exc}")
 
     _write_latest_infer_figures(run_dir, config, debug_dir=debug_dir)
     print(f"[debug] populated run debug bundle -> {debug_dir}")
@@ -1044,10 +1110,14 @@ def populate_all_runs_debug(
     print(f"[debug] populating debug/ for {len(run_dirs)} run(s) under {root}")
     written: list[Path] = []
     for candidate in run_dirs:
+        debug_dir = candidate / RUN_DEBUG_DIRNAME
         try:
             written.append(populate_run_debug(candidate, clear=True))
         except Exception as exc:
-            print(f"[debug] warning: failed for {candidate}: {exc}")
+            print(f"[debug] skipping {candidate}: {exc}")
+            if debug_dir.is_dir():
+                shutil.rmtree(debug_dir)
+                print(f"[debug] removed {debug_dir}")
             traceback.print_exc()
     return written
 

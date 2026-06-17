@@ -431,6 +431,11 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
         if scheduler is not None and state.scheduler_state_dict is not None:
             scheduler.load_state_dict(state.scheduler_state_dict)
         restore_rng_state(state.rng_state)
+        # After a manual config.json edit (e.g. lower LR for stabilised resume),
+        # re-apply learning_rate so param_groups match the saved config instead
+        # of the values frozen inside the checkpoint optimizer state.
+        for group in optimizer.param_groups:
+            group["lr"] = float(config.learning_rate)
         metrics_history = list(state.metrics_history)
         best_val_loss = state.best_val_loss
         best_epoch_number = state.best_epoch_number
