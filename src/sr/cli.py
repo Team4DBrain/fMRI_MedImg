@@ -47,7 +47,6 @@ from src.sr.train import train
 # Build a "default config" sentinel once so resume-mode can detect when the
 # user passed a non-default flag and reject it with a clear message.
 _DEFAULT_CONFIG = SRConfig()
-_CONFIG_FIELDS: list[str] = [field.name for field in dataclasses.fields(SRConfig)]
 
 
 # ---------------------------------------------------------------------------

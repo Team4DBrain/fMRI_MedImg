@@ -33,6 +33,54 @@ from src.sr.config import SRConfig
 from src.sr.patch_data import PatchTrainingDataset
 
 
+def build_spatial_sr_dataset(
+    manifest_path: Path,
+    *,
+    source_voxel_mm: float,
+    target_voxel_mm: float,
+) -> SpatialSRDataset:
+    """Build a full-manifest ``SpatialSRDataset`` for infer/debug paths.
+
+    Purpose:
+        Single construction site so degradation voxel sizes and manifest
+        path stay aligned across train loaders, ``infer_one``, and debug.
+    Effects:
+        Returns the same dataset type ``build_loaders`` uses before splitting.
+    """
+    degrade_fn = make_spatial_degradation(
+        source_voxel_mm=float(source_voxel_mm),
+        target_voxel_mm=float(target_voxel_mm),
+    )
+    return SpatialSRDataset(
+        manifest_path=Path(manifest_path),
+        degrade_fn=degrade_fn,
+        source_voxel_mm=float(source_voxel_mm),
+        target_voxel_mm=float(target_voxel_mm),
+    )
+
+
+def resolve_dataset_sample(
+    dataset: SpatialSRDataset,
+    run_id: str,
+    t: int,
+) -> dict[str, Any]:
+    """Return the sample dict for exactly one ``(run_id, timepoint)``.
+
+    Purpose:
+        Replace repeated index scans in infer/debug when a run and ``t``
+        are already chosen.
+    Effects:
+        Raises ``RuntimeError`` when the pair is absent from the dataset.
+    """
+    for idx, (run_idx, sample_t) in enumerate(dataset.samples):
+        if dataset.runs[run_idx]["run_id"] == run_id and sample_t == t:
+            return dataset[idx]
+    raise RuntimeError(
+        f"Could not locate run_id={run_id} t={t} in the dataset. "
+        "The manifest may have changed since training."
+    )
+
+
 def resolve_sample_split(
     n_samples: int, config: SRConfig
 ) -> tuple[list[int], list[int], dict[str, Any]]:
@@ -104,15 +152,10 @@ def build_loaders(
     at the start of a run, so users can inspect the split without loading
     a checkpoint.
     """
-    degrade_fn = make_spatial_degradation(
-        source_voxel_mm=float(config.source_voxel_mm),
-        target_voxel_mm=float(config.target_voxel_mm),
-    )
-    full_dataset = SpatialSRDataset(
-        manifest_path=Path(config.manifest_path),
-        degrade_fn=degrade_fn,
-        source_voxel_mm=float(config.source_voxel_mm),
-        target_voxel_mm=float(config.target_voxel_mm),
+    full_dataset = build_spatial_sr_dataset(
+        config.manifest_path,
+        source_voxel_mm=config.source_voxel_mm,
+        target_voxel_mm=config.target_voxel_mm,
     )
     train_indices, val_indices, split_meta = resolve_sample_split(
         len(full_dataset), config

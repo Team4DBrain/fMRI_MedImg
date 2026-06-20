@@ -207,11 +207,9 @@ class SRCNN3DPatch(nn.Module):
         ``patch_hr_shape`` and ``patches_per_volume`` in ``SRConfig`` drive training
         crops only; ``output_patch_shape`` still sets full-volume HR grid size.
     How to change safely:
-        Keep kernel sizes 9/1/5 and padding=0 so ``RECEPTIVE_SHRINK`` stays in sync
-        with ``src.sr.shape_utils``.
+        Keep kernel sizes 9/1/5 and padding=0 so ``SRCNN3D_PATCH_RECEPTIVE_SHRINK``
+        stays in sync with ``src.sr.shape_utils``.
     """
-
-    RECEPTIVE_SHRINK = SRCNN3D_PATCH_RECEPTIVE_SHRINK
 
     def __init__(self, output_patch_shape: tuple[int, int, int]) -> None:
         super().__init__()

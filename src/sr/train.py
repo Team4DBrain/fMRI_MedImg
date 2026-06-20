@@ -119,7 +119,6 @@ def _train_one_epoch(
     log_interval: int,
     strict_finite_loss: bool,
     tb_writer: SummaryWriter | None,
-    run_dir: Path,
     config: SRConfig,
 ) -> tuple[float, float]:
     """Single training pass over ``loader``. Returns (mean_loss, duration_s)."""
@@ -168,91 +167,6 @@ def _train_one_epoch(
                 f"[train] epoch {epoch_index + 1}  step {batch_idx + 1}/{n_batches}  "
                 f"{loss_name}={loss.item():.6f}  lr={current_lr:.2e}"
             )
-
-        # TEMP_REMOVE_START: one-off mid-training infer snapshot (delete whole block)
-        if (
-            False and
-            epoch_index == 0
-            and batch_idx == 31
-            and not getattr(_train_one_epoch, "_temp_infer_done", False)
-        ):
-            _train_one_epoch._temp_infer_done = True
-            from src.data.datasets import SpatialSRDataset
-            from src.data.degradation_spatial import make_spatial_degradation
-            from src.sr.infer import make_slice_figure, select_sample
-
-            _temp_subject = "04"
-            _temp_session = "23"
-            _temp_task = "Audio"
-            _temp_direction = "pa"
-            _temp_t = 12
-            _temp_axis = "coronal"
-            _temp_slice_level = 0.6
-
-            was_training = model.training
-            try:
-                with torch.no_grad():
-                    model.eval()
-                    chosen = select_sample(
-                        Path(config.manifest_path),
-                        subject=_temp_subject,
-                        session=_temp_session,
-                        task=_temp_task,
-                        direction=_temp_direction,
-                        t=_temp_t,
-                    )
-                    degrade_fn = make_spatial_degradation(
-                        source_voxel_mm=float(config.source_voxel_mm),
-                        target_voxel_mm=float(config.target_voxel_mm),
-                    )
-                    dataset = SpatialSRDataset(
-                        manifest_path=Path(config.manifest_path),
-                        degrade_fn=degrade_fn,
-                        source_voxel_mm=float(config.source_voxel_mm),
-                        target_voxel_mm=float(config.target_voxel_mm),
-                    )
-                    sample_index = None
-                    for idx, (run_idx, t) in enumerate(dataset.samples):
-                        if (
-                            dataset.runs[run_idx]["run_id"] == chosen["run_id"]
-                            and t == chosen["t"]
-                        ):
-                            sample_index = idx
-                            break
-                    if sample_index is None:
-                        raise RuntimeError(
-                            f"TEMP infer: sample not in dataset "
-                            f"run_id={chosen['run_id']} t={chosen['t']}"
-                        )
-                    sample = dataset[sample_index]
-                    infer_in = sample["input"].unsqueeze(0).to(device)
-                    infer_tgt = sample["target"].unsqueeze(0).to(device)
-                    infer_pred = model(infer_in)
-
-                    out_dir = Path("data") / run_dir.name
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    stem = (
-                        f"sub{_temp_subject}_ses{_temp_session}_{_temp_task}_"
-                        f"{_temp_direction}_t{_temp_t}_{_temp_axis}_"
-                        f"sl{_temp_slice_level:.1f}"
-                    )
-                    png_path = out_dir / f"{stem}.png"
-                    make_slice_figure(
-                        input_vol=infer_in.squeeze(0).squeeze(0).cpu().numpy(),
-                        prediction_vol=infer_pred.squeeze(0).squeeze(0).cpu().numpy(),
-                        target_vol=infer_tgt.squeeze(0).squeeze(0).cpu().numpy(),
-                        axis=_temp_axis,
-                        slice_level=_temp_slice_level,
-                        output_path=png_path,
-                        show=False,
-                    )
-                    print(f"[train] TEMP infer wrote -> {png_path.resolve()}")
-            finally:
-                if was_training:
-                    model.train()
-                import sys
-                sys.exit(0)
-        # TEMP_REMOVE_END
 
     duration = time.perf_counter() - start
     return running / n_batches, duration
@@ -430,7 +344,7 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
             raise FileNotFoundError(
                 f"Cannot resume {run_dir}: no epoch checkpoint found under epochs/"
             )
-        state = load_epoch(latest, map_location=device)
+        state = load_epoch(latest)
         model.load_state_dict(state.model_state_dict)
         optimizer.load_state_dict(state.optimizer_state_dict)
         if scheduler is not None and state.scheduler_state_dict is not None:
@@ -481,7 +395,6 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
                 log_interval=config.log_interval,
                 strict_finite_loss=config.strict_finite_loss,
                 tb_writer=tb_writer,
-                run_dir=run_dir,
                 config=config,
             )
 
@@ -545,7 +458,7 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
             written = save_epoch(run_dir, state)
             write_metrics_json(run_dir, metrics_history)
             print(f"[train] wrote {written.relative_to(run_dir.parent)}")
-            safe_update_run_debug_after_epoch(run_dir, epoch_number=epoch_number)
+            safe_update_run_debug_after_epoch(run_dir)
 
             # Mirror the current best epoch to a stable ``epochs/best.pt`` so
             # eval/infer can always load the best model without re-reading

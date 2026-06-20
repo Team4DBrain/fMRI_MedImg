@@ -213,7 +213,7 @@ def save_best_epoch(run_dir: Path, state: EpochState) -> Path:
     return path
 
 
-def load_epoch(path: Path, map_location: str | None = None) -> EpochState:
+def load_epoch(path: Path) -> EpochState:
     """Load an ``EpochState`` written by ``save_epoch``.
 
     ``weights_only=False`` is required because the payload intentionally
@@ -222,15 +222,12 @@ def load_epoch(path: Path, map_location: str | None = None) -> EpochState:
     ``config.json``, so trust is on par with reading any other artifact
     from the run directory.
 
-    Checkpoints are always loaded with ``map_location='cpu'``. Passing
-    ``map_location=cuda`` to ``torch.load`` rewrites every tensor in the file,
-    including RNG byte blobs, which breaks ``torch.set_rng_state`` and
-    ``torch.cuda.set_rng_state_all``. Callers move weights to the training
-    device by loading into modules already on that device (``load_state_dict``).
-    The ``map_location`` argument is kept for call-site compatibility but is
-    ignored.
+    Checkpoints are always loaded with ``map_location='cpu'``. Loading onto
+    CUDA here rewrites every tensor in the file, including RNG byte blobs,
+    which breaks ``torch.set_rng_state`` and ``torch.cuda.set_rng_state_all``.
+    Callers move weights to the training device via ``load_state_dict`` on
+    modules already on that device.
     """
-    _ = map_location
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or "model_state_dict" not in payload:
         raise ValueError(f"File at {path} is not a valid EpochState payload.")

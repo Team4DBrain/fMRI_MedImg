@@ -31,8 +31,6 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from src.data.datasets import SpatialSRDataset
-from src.data.degradation_spatial import make_spatial_degradation
 from src.sr.checkpoint import (
     best_epoch_path,
     find_latest_epoch,
@@ -41,7 +39,9 @@ from src.sr.checkpoint import (
     run_dir_for_checkpoint,
 )
 from src.sr.config import SRConfig, auto_device, from_json
-from src.sr.infer import format_sample_table, infer_one, list_samples, select_sample
+from src.sr.data import build_spatial_sr_dataset, resolve_dataset_sample
+from src.sr.forward import model_forward
+from src.sr.infer import extract_slice, format_sample_table, infer_one, list_samples, select_sample
 from src.sr.models import build_model
 from src.sr.losses import (
     kspace_mse_loss,
@@ -49,31 +49,8 @@ from src.sr.losses import (
     merge_dual_domain_kwargs,
 )
 
-AXIS_TO_INDEX: dict[str, int] = {"sagittal": 0, "coronal": 1, "axial": 2}
 FigureMode = Literal["masks", "infer", "both"]
 ErrorMapMode = Literal["abs", "signed", "squared"]
-
-
-def _extract_slice(
-    volume: np.ndarray,
-    *,
-    axis: str,
-    slice_level: float,
-) -> tuple[np.ndarray, int]:
-    """Return one 2D slice and its index along ``axis``."""
-    if axis not in AXIS_TO_INDEX:
-        raise ValueError(f"Unknown axis '{axis}'. Choose one of: {sorted(AXIS_TO_INDEX)}")
-    if not 0.0 <= slice_level <= 1.0:
-        raise ValueError(f"slice_level must be in [0, 1], got {slice_level}")
-
-    idx_axis = AXIS_TO_INDEX[axis]
-    dim = int(volume.shape[idx_axis])
-    idx = min(dim - 1, max(0, int(round(slice_level * (dim - 1)))))
-    if axis == "axial":
-        return volume[:, :, idx], idx
-    if axis == "coronal":
-        return volume[:, idx, :], idx
-    return volume[idx, :, :], idx
 
 
 def _tensor_to_volume(tensor: torch.Tensor) -> np.ndarray:
@@ -126,29 +103,12 @@ def load_debug_sample(
     target_voxel_mm: float,
 ) -> dict[str, Any]:
     """Load HR/LR image and mask tensors for one (run, timepoint)."""
-    degrade_fn = make_spatial_degradation(
-        source_voxel_mm=float(source_voxel_mm),
-        target_voxel_mm=float(target_voxel_mm),
+    dataset = build_spatial_sr_dataset(
+        manifest_path,
+        source_voxel_mm=source_voxel_mm,
+        target_voxel_mm=target_voxel_mm,
     )
-    dataset = SpatialSRDataset(
-        manifest_path=Path(manifest_path),
-        degrade_fn=degrade_fn,
-        source_voxel_mm=float(source_voxel_mm),
-        target_voxel_mm=float(target_voxel_mm),
-    )
-
-    sample_index: int | None = None
-    for idx, (run_idx, t) in enumerate(dataset.samples):
-        if dataset.runs[run_idx]["run_id"] == selection["run_id"] and t == selection["t"]:
-            sample_index = idx
-            break
-    if sample_index is None:
-        raise RuntimeError(
-            f"Could not locate run_id={selection['run_id']} t={selection['t']} "
-            "in the dataset. Check manifest filters and paths."
-        )
-
-    sample = dataset[sample_index]
+    sample = resolve_dataset_sample(dataset, selection["run_id"], selection["t"])
     return {
         "run_id": selection["run_id"],
         "subject": selection.get("subject"),
@@ -289,16 +249,16 @@ def save_debug_figure(
     """Save a 2×2 figure: HR image, HR mask, LR image, LR mask."""
     plt = _import_matplotlib(agg=output_path is not None)
 
-    hr_slice, hr_idx = _extract_slice(
+    hr_slice, hr_idx = extract_slice(
         payload["hr_image"], axis=axis, slice_level=slice_level
     )
-    hr_mask_slice, _ = _extract_slice(
+    hr_mask_slice, _ = extract_slice(
         payload["hr_mask"], axis=axis, slice_level=slice_level
     )
-    lr_slice, lr_idx = _extract_slice(
+    lr_slice, lr_idx = extract_slice(
         payload["lr_image"], axis=axis, slice_level=slice_level
     )
-    lr_mask_slice, _ = _extract_slice(
+    lr_mask_slice, _ = extract_slice(
         payload["lr_mask"], axis=axis, slice_level=slice_level
     )
 
@@ -349,15 +309,15 @@ def save_infer_figure(
     pred = payload["prediction"]
     baseline = payload["baseline"]
 
-    target_slice, idx = _extract_slice(target, axis=axis, slice_level=slice_level)
-    pred_slice, _ = _extract_slice(pred, axis=axis, slice_level=slice_level)
-    baseline_slice, _ = _extract_slice(baseline, axis=axis, slice_level=slice_level)
-    mask_slice, _ = _extract_slice(payload["hr_mask"], axis=axis, slice_level=slice_level)
+    target_slice, idx = extract_slice(target, axis=axis, slice_level=slice_level)
+    pred_slice, _ = extract_slice(pred, axis=axis, slice_level=slice_level)
+    baseline_slice, _ = extract_slice(baseline, axis=axis, slice_level=slice_level)
+    mask_slice, _ = extract_slice(payload["hr_mask"], axis=axis, slice_level=slice_level)
 
     err_vol = _error_volume(pred, target, mode=error_map)
     base_err_vol = _error_volume(baseline, target, mode="abs")
-    err_slice, _ = _extract_slice(err_vol, axis=axis, slice_level=slice_level)
-    base_err_slice, _ = _extract_slice(base_err_vol, axis=axis, slice_level=slice_level)
+    err_slice, _ = extract_slice(err_vol, axis=axis, slice_level=slice_level)
+    base_err_slice, _ = extract_slice(base_err_vol, axis=axis, slice_level=slice_level)
 
     if mask_errors:
         err_slice = _apply_mask_slice(err_slice, mask_slice)
@@ -703,7 +663,7 @@ def _load_target_slice(
         source_voxel_mm=source_voxel_mm,
         target_voxel_mm=target_voxel_mm,
     )
-    target_slice, _ = _extract_slice(
+    target_slice, _ = extract_slice(
         payload["hr_image"],
         axis=sample.axis,
         slice_level=sample.slice_level,
@@ -720,29 +680,15 @@ def _forward_sample(
     selection: dict[str, Any],
 ) -> np.ndarray:
     """Run one manifest sample through ``model`` and return the prediction volume."""
-    degrade_fn = make_spatial_degradation(
-        source_voxel_mm=float(config.source_voxel_mm),
-        target_voxel_mm=float(config.target_voxel_mm),
+    dataset = build_spatial_sr_dataset(
+        manifest_path,
+        source_voxel_mm=config.source_voxel_mm,
+        target_voxel_mm=config.target_voxel_mm,
     )
-    dataset = SpatialSRDataset(
-        manifest_path=Path(manifest_path),
-        degrade_fn=degrade_fn,
-        source_voxel_mm=float(config.source_voxel_mm),
-        target_voxel_mm=float(config.target_voxel_mm),
-    )
-    sample_index = None
-    for idx, (run_idx, t) in enumerate(dataset.samples):
-        if dataset.runs[run_idx]["run_id"] == selection["run_id"] and t == selection["t"]:
-            sample_index = idx
-            break
-    if sample_index is None:
-        raise RuntimeError(
-            f"Could not locate run_id={selection['run_id']} t={selection['t']} "
-            "in the dataset."
-        )
-    sample = dataset[sample_index]
+    sample = resolve_dataset_sample(dataset, selection["run_id"], selection["t"])
     inputs = sample["input"].unsqueeze(0).to(device)
-    pred = model(inputs)
+    target = sample["target"].unsqueeze(0).to(device)
+    pred = model_forward(model, inputs, target, config.model_name)
     return _tensor_to_volume(pred)
 
 
@@ -760,7 +706,7 @@ def _prediction_slice_for_epoch(
     if selection is None:
         raise RuntimeError(f"fixed sample unavailable in manifest: {sample.key}")
     prediction = _forward_sample(model, config, device, manifest_path, selection)
-    pred_slice, _ = _extract_slice(
+    pred_slice, _ = extract_slice(
         prediction,
         axis=sample.axis,
         slice_level=sample.slice_level,
@@ -783,7 +729,7 @@ def _compute_all_epoch_prediction_slices(
         epoch_number = int(checkpoint.stem.split("_")[1])
         device = auto_device()
         model = build_model(config).to(device)
-        state = load_epoch(checkpoint, map_location=device)
+        state = load_epoch(checkpoint)
         model.load_state_dict(state.model_state_dict)
         model.eval()
         for sample in samples:
@@ -940,20 +886,14 @@ def _build_infer_payload(
     manifest_path: Path,
     selection: dict[str, Any],
 ) -> dict[str, Any]:
-    """Like ``load_debug_infer`` but reuses a caller-loaded ``result`` when provided."""
+    """Build infer payload with mask and trilinear baseline for debug plots."""
     result = infer_one(checkpoint_path, selection, override_manifest=manifest_path)
     run_dir = run_dir_for_checkpoint(checkpoint_path)
     config = from_json(run_dir / "config.json")
-    mask_payload = load_debug_sample(
-        manifest_path,
-        selection,
-        source_voxel_mm=float(config.source_voxel_mm),
-        target_voxel_mm=float(config.target_voxel_mm),
-    )
     target = result["target"]
     return {
         **result,
-        "hr_mask": mask_payload["hr_mask"],
+        "hr_mask": result["mask_hr"],
         "baseline": _trilinear_baseline_np(result["input"], target.shape),
         "loss_name": config.loss_name,
         "loss_kwargs": dict(config.loss_kwargs),
@@ -1029,9 +969,8 @@ def ensure_run_debug_layout(run_dir: Path, config: SRConfig) -> Path:
     return debug_dir
 
 
-def update_run_debug_after_epoch(run_dir: Path, *, epoch_number: int) -> None:
+def update_run_debug_after_epoch(run_dir: Path) -> None:
     """Recompute evolution and loss-curve figures from all epoch checkpoints."""
-    _ = epoch_number
     run_dir = Path(run_dir).resolve()
     config = from_json(run_dir / "config.json")
     debug_dir = run_debug_dir(run_dir)
@@ -1122,12 +1061,12 @@ def populate_all_runs_debug(
     return written
 
 
-def safe_update_run_debug_after_epoch(run_dir: Path, *, epoch_number: int) -> None:
+def safe_update_run_debug_after_epoch(run_dir: Path) -> None:
     """Training hook: never abort the run when debug artifact generation fails."""
     try:
-        update_run_debug_after_epoch(run_dir, epoch_number=epoch_number)
+        update_run_debug_after_epoch(run_dir)
     except Exception as exc:
-        print(f"[train] warning: run debug update failed after epoch {epoch_number}: {exc}")
+        print(f"[train] warning: run debug update failed: {exc}")
         traceback.print_exc()
 
 

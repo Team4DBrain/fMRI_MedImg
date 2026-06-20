@@ -26,12 +26,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from src.data.datasets import SpatialSRDataset
-from src.data.degradation_spatial import make_spatial_degradation
 from src.sr.checkpoint import load_epoch, run_dir_for_checkpoint
 from src.sr.config import SRConfig, auto_device, from_json
-from src.sr.data import build_loaders
-from src.sr.metrics import compute_full_metrics, volume_intensity_stats
+from src.sr.data import build_loaders, build_spatial_sr_dataset, resolve_dataset_sample
+from src.sr.metrics import average_metric_dicts, compute_full_metrics, volume_intensity_stats
 from src.sr.models import build_model
 from src.sr.forward import model_forward
 
@@ -134,6 +132,33 @@ def select_sample(
     return chosen
 
 
+def extract_slice(
+    volume: np.ndarray,
+    *,
+    axis: str,
+    slice_level: float,
+) -> tuple[np.ndarray, int]:
+    """Return one 2D slice and its index along ``axis``.
+
+    Purpose:
+        Shared slice extraction for infer figures and debug evolution plots
+        so axis naming and level-to-index mapping stay consistent.
+    """
+    if axis not in AXIS_TO_INDEX:
+        raise ValueError(f"Unknown axis '{axis}'. Choose one of: {sorted(AXIS_TO_INDEX)}")
+    if not 0.0 <= slice_level <= 1.0:
+        raise ValueError(f"slice_level must be in [0, 1], got {slice_level}")
+
+    idx_axis = AXIS_TO_INDEX[axis]
+    dim = int(volume.shape[idx_axis])
+    idx = min(dim - 1, max(0, int(round(slice_level * (dim - 1)))))
+    if axis == "axial":
+        return volume[:, :, idx], idx
+    if axis == "coronal":
+        return volume[:, idx, :], idx
+    return volume[idx, :, :], idx
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint loading helpers
 # ---------------------------------------------------------------------------
@@ -150,7 +175,7 @@ def _load_model_from_checkpoint(
         config.manifest_path = Path(override_manifest)
     device = auto_device()
     model = build_model(config).to(device)
-    state = load_epoch(checkpoint_path, map_location=device)
+    state = load_epoch(checkpoint_path)
     model.load_state_dict(state.model_state_dict)
     model.eval()
     return model, config, device
@@ -197,8 +222,6 @@ def evaluate(
                 training_loss_kwargs=config.loss_kwargs,
             )
         )
-
-    from src.sr.metrics import average_metric_dicts
 
     averaged = average_metric_dicts(per_batch)
     print(f"[eval] checkpoint   = {checkpoint_path}")
@@ -252,29 +275,12 @@ def infer_one(
     """
     model, config, device = _load_model_from_checkpoint(checkpoint_path, override_manifest)
 
-    degrade_fn = make_spatial_degradation(
-        source_voxel_mm=float(config.source_voxel_mm),
-        target_voxel_mm=float(config.target_voxel_mm),
+    dataset = build_spatial_sr_dataset(
+        config.manifest_path,
+        source_voxel_mm=config.source_voxel_mm,
+        target_voxel_mm=config.target_voxel_mm,
     )
-    dataset = SpatialSRDataset(
-        manifest_path=Path(config.manifest_path),
-        degrade_fn=degrade_fn,
-        source_voxel_mm=float(config.source_voxel_mm),
-        target_voxel_mm=float(config.target_voxel_mm),
-    )
-
-    sample_index = None
-    for idx, (run_idx, t) in enumerate(dataset.samples):
-        if dataset.runs[run_idx]["run_id"] == selection["run_id"] and t == selection["t"]:
-            sample_index = idx
-            break
-    if sample_index is None:
-        raise RuntimeError(
-            f"Could not locate run_id={selection['run_id']} t={selection['t']} "
-            "in the filtered dataset. The manifest may have changed since training."
-        )
-
-    sample = dataset[sample_index]
+    sample = resolve_dataset_sample(dataset, selection["run_id"], selection["t"])
     inputs = sample["input"].unsqueeze(0).to(device)
     target = sample["target"].unsqueeze(0).to(device)
     mask = sample["mask_hr"].unsqueeze(0).to(device)
@@ -290,6 +296,7 @@ def infer_one(
     input_np = inputs.squeeze(0).squeeze(0).detach().cpu().numpy()
     prediction_np = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
     target_np = target.squeeze(0).squeeze(0).detach().cpu().numpy()
+    mask_hr_np = mask.squeeze(0).squeeze(0).detach().cpu().numpy()
     volume_stats = {
         "input": volume_intensity_stats(input_np),
         "prediction": volume_intensity_stats(prediction_np),
@@ -307,6 +314,7 @@ def infer_one(
         "input": input_np,
         "prediction": prediction_np,
         "target": target_np,
+        "mask_hr": mask_hr_np,
     }
 
 
@@ -342,21 +350,11 @@ def make_slice_figure(
     if not 0.0 <= slice_level <= 1.0:
         raise ValueError(f"slice_level must be in [0, 1], got {slice_level}")
 
-    def extract(volume: np.ndarray) -> tuple[np.ndarray, int]:
-        idx_axis = AXIS_TO_INDEX[axis]
-        dim = int(volume.shape[idx_axis])
-        idx = min(dim - 1, max(0, int(round(slice_level * (dim - 1)))))
-        if axis == "axial":
-            return volume[:, :, idx], idx
-        if axis == "coronal":
-            return volume[:, idx, :], idx
-        return volume[idx, :, :], idx
-
     fig, axes = plt.subplots(1, 3, figsize=(14, 5))
     panels = [
-        ("Input (LR)", extract(input_vol)),
-        ("Prediction", extract(prediction_vol)),
-        ("Target (HR)", extract(target_vol)),
+        ("Input (LR)", extract_slice(input_vol, axis=axis, slice_level=slice_level)),
+        ("Prediction", extract_slice(prediction_vol, axis=axis, slice_level=slice_level)),
+        ("Target (HR)", extract_slice(target_vol, axis=axis, slice_level=slice_level)),
     ]
     for ax, (title, (image, idx)) in zip(axes, panels):
         ax.imshow(image, cmap="gray")

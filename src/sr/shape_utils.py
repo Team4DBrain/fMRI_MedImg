@@ -11,18 +11,13 @@ Influences:
     ``SRCNN3D_PATCH_RECEPTIVE_SHRINK`` in ``models.py`` must match the
     stacked valid receptive field of conv1+conv2+conv3.
 How to change safely:
-    If kernel sizes or padding change, update ``RECEPTIVE_SHRINK`` in both
-    modules and the patch minimum-size check in ``config.validate``.
+    If kernel sizes or padding change, update ``SRCNN3D_PATCH_RECEPTIVE_SHRINK``
+    in ``models.py`` and the patch minimum-size check in ``config.validate``.
 """
 
 from __future__ import annotations
 
 import torch
-
-from src.sr.models import SRCNN3D_PATCH_RECEPTIVE_SHRINK
-
-RECEPTIVE_SHRINK = SRCNN3D_PATCH_RECEPTIVE_SHRINK
-
 
 def center_crop_spatial(
     tensor: torch.Tensor,
