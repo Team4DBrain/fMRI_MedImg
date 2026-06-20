@@ -177,6 +177,42 @@ def save_epoch(run_dir: Path, state: EpochState) -> Path:
     return path
 
 
+def best_epoch_path(run_dir: Path) -> Path:
+    """Canonical path of the rolling best checkpoint.
+
+    Purpose:
+        Give eval/infer a stable, name-independent handle to the best epoch
+        so users no longer have to read ``metrics.json`` and hand-pick an
+        ``epoch_NNN.pt``. The srcnn3d runs peak early then degrade after a
+        loss spike, so "the last epoch" is often *not* the best one.
+    Effect:
+        Lives at ``<run_dir>/epochs/best.pt`` -- inside ``epochs/`` so that
+        ``run_dir_for_checkpoint`` still resolves the owning run via
+        ``parent.parent``. The ``epoch_*`` glob in ``list_epoch_files`` does
+        not match ``best.pt``, so resume's ``find_latest_epoch`` ignores it
+        and resume order is unchanged.
+    Change guidance:
+        Keep this under ``epochs/`` and keep the ``best.pt`` name; eval/infer
+        commands and any user scripts point at this path.
+    """
+    return _epochs_dir(run_dir) / "best.pt"
+
+
+def save_best_epoch(run_dir: Path, state: EpochState) -> Path:
+    """Atomically (over)write ``epochs/best.pt`` with ``state``.
+
+    Mirrors ``save_epoch`` (tmp + replace) so a crash mid-write leaves the
+    previous ``best.pt`` intact. Payload format is identical to a per-epoch
+    checkpoint, so ``load_epoch`` reads it without any special case.
+    """
+    path = best_epoch_path(run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(_state_to_payload(state), tmp)
+    tmp.replace(path)
+    return path
+
+
 def load_epoch(path: Path, map_location: str | None = None) -> EpochState:
     """Load an ``EpochState`` written by ``save_epoch``.
 

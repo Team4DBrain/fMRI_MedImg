@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -36,6 +37,7 @@ from src.sr.checkpoint import (
     find_latest_epoch,
     load_epoch,
     restore_rng_state,
+    save_best_epoch,
     save_epoch,
     write_metrics_json,
 )
@@ -53,6 +55,11 @@ from src.sr.data import build_loaders, write_split_json
 from src.sr.losses import resolve_loss
 from src.sr.metrics import average_metric_dicts, compute_full_metrics
 from src.sr.forward import model_forward
+from src.sr.debug import (
+    ensure_run_debug_layout,
+    finalize_run_debug,
+    safe_update_run_debug_after_epoch,
+)
 from src.sr.models import build_model, count_parameters
 from src.sr.shape_utils import align_pred_target_mask
 
@@ -112,6 +119,8 @@ def _train_one_epoch(
     log_interval: int,
     strict_finite_loss: bool,
     tb_writer: SummaryWriter | None,
+    run_dir: Path,
+    config: SRConfig,
 ) -> tuple[float, float]:
     """Single training pass over ``loader``. Returns (mean_loss, duration_s)."""
     model.train()
@@ -136,6 +145,15 @@ def _train_one_epoch(
             )
 
         loss.backward()
+        # Optional gradient-norm clipping. Runs between backward and step so
+        # a single bad batch cannot push a huge Adam update through and wreck
+        # the weights (the cause of the mid-training loss spike in earlier
+        # srcnn3d runs). ``None`` leaves the update untouched, so runs without
+        # the knob reproduce exactly as before.
+        if config.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=float(config.grad_clip_norm)
+            )
         optimizer.step()
 
         running += float(loss.item())
@@ -151,6 +169,91 @@ def _train_one_epoch(
                 f"{loss_name}={loss.item():.6f}  lr={current_lr:.2e}"
             )
 
+        # TEMP_REMOVE_START: one-off mid-training infer snapshot (delete whole block)
+        if (
+            False and
+            epoch_index == 0
+            and batch_idx == 31
+            and not getattr(_train_one_epoch, "_temp_infer_done", False)
+        ):
+            _train_one_epoch._temp_infer_done = True
+            from src.data.datasets import SpatialSRDataset
+            from src.data.degradation_spatial import make_spatial_degradation
+            from src.sr.infer import make_slice_figure, select_sample
+
+            _temp_subject = "04"
+            _temp_session = "23"
+            _temp_task = "Audio"
+            _temp_direction = "pa"
+            _temp_t = 12
+            _temp_axis = "coronal"
+            _temp_slice_level = 0.6
+
+            was_training = model.training
+            try:
+                with torch.no_grad():
+                    model.eval()
+                    chosen = select_sample(
+                        Path(config.manifest_path),
+                        subject=_temp_subject,
+                        session=_temp_session,
+                        task=_temp_task,
+                        direction=_temp_direction,
+                        t=_temp_t,
+                    )
+                    degrade_fn = make_spatial_degradation(
+                        source_voxel_mm=float(config.source_voxel_mm),
+                        target_voxel_mm=float(config.target_voxel_mm),
+                    )
+                    dataset = SpatialSRDataset(
+                        manifest_path=Path(config.manifest_path),
+                        degrade_fn=degrade_fn,
+                        source_voxel_mm=float(config.source_voxel_mm),
+                        target_voxel_mm=float(config.target_voxel_mm),
+                    )
+                    sample_index = None
+                    for idx, (run_idx, t) in enumerate(dataset.samples):
+                        if (
+                            dataset.runs[run_idx]["run_id"] == chosen["run_id"]
+                            and t == chosen["t"]
+                        ):
+                            sample_index = idx
+                            break
+                    if sample_index is None:
+                        raise RuntimeError(
+                            f"TEMP infer: sample not in dataset "
+                            f"run_id={chosen['run_id']} t={chosen['t']}"
+                        )
+                    sample = dataset[sample_index]
+                    infer_in = sample["input"].unsqueeze(0).to(device)
+                    infer_tgt = sample["target"].unsqueeze(0).to(device)
+                    infer_pred = model(infer_in)
+
+                    out_dir = Path("data") / run_dir.name
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    stem = (
+                        f"sub{_temp_subject}_ses{_temp_session}_{_temp_task}_"
+                        f"{_temp_direction}_t{_temp_t}_{_temp_axis}_"
+                        f"sl{_temp_slice_level:.1f}"
+                    )
+                    png_path = out_dir / f"{stem}.png"
+                    make_slice_figure(
+                        input_vol=infer_in.squeeze(0).squeeze(0).cpu().numpy(),
+                        prediction_vol=infer_pred.squeeze(0).squeeze(0).cpu().numpy(),
+                        target_vol=infer_tgt.squeeze(0).squeeze(0).cpu().numpy(),
+                        axis=_temp_axis,
+                        slice_level=_temp_slice_level,
+                        output_path=png_path,
+                        show=False,
+                    )
+                    print(f"[train] TEMP infer wrote -> {png_path.resolve()}")
+            finally:
+                if was_training:
+                    model.train()
+                import sys
+                sys.exit(0)
+        # TEMP_REMOVE_END
+
     duration = time.perf_counter() - start
     return running / n_batches, duration
 
@@ -162,24 +265,57 @@ def _validate_one_epoch(
     loader: DataLoader,
     model_name: str,
     device: str,
+    training_loss_name: str,
+    training_loss_kwargs: dict[str, Any],
 ) -> tuple[dict[str, float], float]:
     """Validation pass that reports all losses + all metrics per batch.
 
     Returns ``(mean_metrics, duration_s)``. Keys mirror
     ``metrics.compute_full_metrics`` so the training log and analytic
-    notebooks read the same names.
+    notebooks read the same names. Pass ``training_loss_name`` and
+    ``training_loss_kwargs`` so ``val_<loss_name>`` matches the optimiser
+    for parameterised objectives (e.g. dual-domain loss).
+
+    Also computes a **trilinear-only baseline** (input upsampled with
+    trilinear interpolation, no model) and merges those values back under
+    ``baseline_<key>``. This is the floor every architecture must beat:
+    the absolute ``masked_mse`` looks small from the start because the
+    trilinear pre-upsampling already explains most of the low-frequency
+    signal, so the only meaningful diagnostic for "is the model actually
+    learning something?" is the gap, e.g.
+    ``val_masked_psnr - val_baseline_masked_psnr``. The training loop
+    surfaces that gap in the per-epoch summary line.
     """
     model.eval()
     per_batch: list[dict[str, float]] = []
+    per_batch_baseline: list[dict[str, float]] = []
     start = time.perf_counter()
     for batch in loader:
         inputs = batch["input"].to(device)
         target = batch["target"].to(device)
         mask = batch["mask_hr"].to(device)
         pred = model_forward(model, inputs, target, model_name)
-        per_batch.append(compute_full_metrics(pred, target, mask))
+        per_batch.append(
+            compute_full_metrics(
+                pred,
+                target,
+                mask,
+                training_loss_name=training_loss_name,
+                training_loss_kwargs=training_loss_kwargs,
+            )
+        )
+        baseline = F.interpolate(
+            inputs, size=target.shape[2:], mode="trilinear", align_corners=False
+        )
+        per_batch_baseline.append(
+            compute_full_metrics(baseline, target, mask)
+        )
     duration = time.perf_counter() - start
-    return average_metric_dicts(per_batch), duration
+
+    metrics = average_metric_dicts(per_batch)
+    for key, value in average_metric_dicts(per_batch_baseline).items():
+        metrics[f"baseline_{key}"] = value
+    return metrics, duration
 
 
 def _log_epoch_to_tb(
@@ -197,6 +333,18 @@ def _log_epoch_to_tb(
 
 
 def _format_epoch_summary(record: dict[str, Any]) -> str:
+    """One-line per-epoch summary printed to stdout.
+
+    Purpose:
+        Make the per-epoch result skimmable in long terminal logs and
+        surface the trilinear-baseline gap that ``_validate_one_epoch``
+        now logs. ``dPSNR`` / ``dSSIM`` are the actual "is my model
+        better than just resizing?" signal -- a negative value means the
+        model is worse than the no-op baseline.
+    Effects:
+        Only formatting; the underlying values come straight from
+        ``record`` and are also persisted to ``metrics.json``.
+    """
     parts = [
         f"epoch={int(record['epoch'])}",
         f"lr={record['lr']:.2e}",
@@ -212,6 +360,20 @@ def _format_epoch_summary(record: dict[str, Any]) -> str:
                 f"val_s={record['val_duration_s']:.1f}",
             ]
         )
+        if record.get("val_baseline_masked_psnr") is not None:
+            dpsnr = (
+                record["val_masked_psnr"] - record["val_baseline_masked_psnr"]
+            )
+            dssim = (
+                record["val_masked_ssim"] - record["val_baseline_masked_ssim"]
+            )
+            parts.extend(
+                [
+                    f"base_masked_psnr={record['val_baseline_masked_psnr']:.2f}",
+                    f"dPSNR={dpsnr:+.2f}",
+                    f"dSSIM={dssim:+.4f}",
+                ]
+            )
     return " ".join(parts)
 
 
@@ -234,6 +396,7 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
     train_loader, val_loader, split_info = build_loaders(config)
     if resume_dir is None:
         write_split_json(run_dir, split_info)
+    ensure_run_debug_layout(run_dir, config)
     print(f"[train] split_source  = {split_info['source']}")
     print(
         f"[train] samples: train={split_info['train_samples']}  "
@@ -247,7 +410,7 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
 
     optimizer = build_optimizer(config, model)
     scheduler, scheduler_needs_val = build_scheduler(config, optimizer)
-    loss_fn = resolve_loss(config.loss_name)
+    loss_fn = resolve_loss(config.loss_name, config.loss_kwargs)
 
     if val_loader is None and scheduler_needs_val:
         raise ValueError(
@@ -273,6 +436,11 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
         if scheduler is not None and state.scheduler_state_dict is not None:
             scheduler.load_state_dict(state.scheduler_state_dict)
         restore_rng_state(state.rng_state)
+        # After a manual config.json edit (e.g. lower LR for stabilised resume),
+        # re-apply learning_rate so param_groups match the saved config instead
+        # of the values frozen inside the checkpoint optimizer state.
+        for group in optimizer.param_groups:
+            group["lr"] = float(config.learning_rate)
         metrics_history = list(state.metrics_history)
         best_val_loss = state.best_val_loss
         best_epoch_number = state.best_epoch_number
@@ -313,6 +481,8 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
                 log_interval=config.log_interval,
                 strict_finite_loss=config.strict_finite_loss,
                 tb_writer=tb_writer,
+                run_dir=run_dir,
+                config=config,
             )
 
             if val_loader is not None:
@@ -321,6 +491,8 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
                     loader=val_loader,
                     model_name=config.model_name,
                     device=device,
+                    training_loss_name=config.loss_name,
+                    training_loss_kwargs=config.loss_kwargs,
                 )
             else:
                 val_metrics, val_duration = {}, 0.0
@@ -373,9 +545,23 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
             written = save_epoch(run_dir, state)
             write_metrics_json(run_dir, metrics_history)
             print(f"[train] wrote {written.relative_to(run_dir.parent)}")
+            safe_update_run_debug_after_epoch(run_dir, epoch_number=epoch_number)
+
+            # Mirror the current best epoch to a stable ``epochs/best.pt`` so
+            # eval/infer can always load the best model without re-reading
+            # metrics.json. Runs peak early then degrade after a loss spike,
+            # so the last epoch is frequently not the best one.
+            if best_epoch_number == epoch_number and current_val_loss is not None:
+                best_written = save_best_epoch(run_dir, state)
+                print(f"[train] updated {best_written.relative_to(run_dir.parent)}")
     finally:
         if tb_writer is not None:
             tb_writer.close()
+
+    try:
+        finalize_run_debug(run_dir)
+    except Exception as exc:
+        print(f"[train] warning: run debug finalize failed: {exc}")
 
     _banner("DONE")
     print(f"[train] run_dir = {run_dir}")

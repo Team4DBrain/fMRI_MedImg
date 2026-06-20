@@ -45,6 +45,8 @@ class SRConfig:
     Defaults reflect the IBC dataset at 1.5 mm (HR) -> 3 mm (LR) with the
     no_crop_v1 data pipeline. Edit ``config.json`` directly inside a run
     directory if you want to resume with a different number of epochs.
+    ``loss_kwargs`` holds hyperparameters for parameterised losses (see
+    ``resolve_loss`` in ``losses.py``).
     """
 
     # Reproducibility / safety
@@ -80,9 +82,23 @@ class SRConfig:
 
     # Loss + optimizer + scheduler (modular: swap names, kwargs stay JSON)
     loss_name: str = "masked_mse"
+    loss_kwargs: dict[str, Any] = field(default_factory=dict)
     optimizer_name: str = "adam"
     learning_rate: float = 1e-3
     optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    # Gradient-norm clipping (training stability).
+    # Purpose: cap the global L2 norm of the gradients each step so a single
+    #   bad batch cannot blow up the Adam update and wreck the weights. The
+    #   srcnn3d runs show exactly that failure -- a mid-training loss spike
+    #   (train_loss ~0.005 -> ~0.035) that costs many epochs to recover from.
+    # Effect: when set, ``torch.nn.utils.clip_grad_norm_`` runs after
+    #   ``loss.backward()`` and before ``optimizer.step()`` in the train loop.
+    # Influences: only the optimizer step; metrics/checkpoints are unchanged.
+    # Change guidance: ``None`` (default) disables clipping so existing runs
+    #   and resumes reproduce bit-for-bit. Typical stabilising value is 1.0;
+    #   lower it (e.g. 0.5) if spikes persist, raise it if training stalls.
+    grad_clip_norm: float | None = None
     scheduler_name: str = "plateau"
     scheduler_kwargs: dict[str, Any] = field(
         default_factory=lambda: {"factor": 0.5, "patience": 3}
@@ -131,7 +147,41 @@ def _config_from_dict(raw: dict[str, Any]) -> SRConfig:
         kwargs["output_patch_shape"] = tuple(kwargs["output_patch_shape"])
     if "patch_hr_shape" in kwargs:
         kwargs["patch_hr_shape"] = tuple(kwargs["patch_hr_shape"])
+    if kwargs.get("loss_kwargs") is None:
+        kwargs["loss_kwargs"] = {}
     return SRConfig(**kwargs)
+
+
+def _validate_loss_kwargs(config: SRConfig) -> None:
+    """Range-check keys in ``loss_kwargs`` for parameterised objectives."""
+    from src.sr.losses import merge_dual_domain_kwargs, merge_ffl_kwargs
+
+    raw = config.loss_kwargs
+    if raw is not None and not isinstance(raw, dict):
+        raise TypeError("loss_kwargs must be a dict or empty")
+    kw: dict[str, Any] = dict(raw or {})
+
+    if config.loss_name == "dual_domain_masked_mse":
+        m = merge_dual_domain_kwargs(kw)
+        if m["alpha"] < 0 or m["beta"] < 0:
+            raise ValueError("dual_domain_masked_mse: alpha and beta must be >= 0")
+        if m["alpha"] + m["beta"] <= 0:
+            raise ValueError(
+                "dual_domain_masked_mse: alpha + beta must be > 0 so the loss "
+                "is not identically zero."
+            )
+        if m["kspace_high_freq_weight"] < 0:
+            raise ValueError(
+                "dual_domain_masked_mse: kspace_high_freq_weight must be >= 0"
+            )
+    elif config.loss_name == "kspace_mse":
+        boost = float(kw.get("kspace_high_freq_weight", 0.0))
+        if boost < 0:
+            raise ValueError("kspace_mse: kspace_high_freq_weight must be >= 0")
+    elif config.loss_name == "focal_frequency":
+        m = merge_ffl_kwargs(kw)
+        if m["alpha"] < 0:
+            raise ValueError("focal_frequency: alpha must be >= 0")
 
 
 def validate(config: SRConfig) -> None:
@@ -141,7 +191,7 @@ def validate(config: SRConfig) -> None:
     chain (``models``/``losses``/``components`` all read ``SRConfig`` types).
     """
     from src.sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
-    from src.sr.losses import LOSS_REGISTRY
+    from src.sr.losses import loss_names_for_validation
     from src.sr.models import MODEL_REGISTRY
 
     if config.batch_size < 1:
@@ -154,6 +204,10 @@ def validate(config: SRConfig) -> None:
         raise ValueError("log_interval must be >= 1")
     if config.learning_rate <= 0:
         raise ValueError("learning_rate must be > 0")
+    if config.grad_clip_norm is not None and config.grad_clip_norm <= 0:
+        raise ValueError(
+            "grad_clip_norm must be > 0 when set, or None to disable clipping."
+        )
     if not 0.0 < config.train_split <= 1.0:
         raise ValueError("train_split must be in (0, 1]")
     if config.source_voxel_mm <= 0 or config.target_voxel_mm <= 0:
@@ -183,11 +237,12 @@ def validate(config: SRConfig) -> None:
             f"Unknown model_name '{config.model_name}'. "
             f"Available: {sorted(MODEL_REGISTRY)}"
         )
-    if config.loss_name not in LOSS_REGISTRY:
+    if config.loss_name not in loss_names_for_validation():
         raise ValueError(
             f"Unknown loss_name '{config.loss_name}'. "
-            f"Available: {sorted(LOSS_REGISTRY)}"
+            f"Available: {sorted(loss_names_for_validation())}"
         )
+    _validate_loss_kwargs(config)
     if config.optimizer_name not in OPTIMIZER_REGISTRY:
         raise ValueError(
             f"Unknown optimizer_name '{config.optimizer_name}'. "
@@ -257,9 +312,11 @@ def summary(config: SRConfig) -> str:
         f"  num_workers       = {config.num_workers}",
         f"  log_interval      = {config.log_interval}",
         f"  loss_name         = {config.loss_name}",
+        f"  loss_kwargs       = {config.loss_kwargs}",
         f"  optimizer_name    = {config.optimizer_name}",
         f"  learning_rate     = {config.learning_rate}",
         f"  optimizer_kwargs  = {config.optimizer_kwargs}",
+        f"  grad_clip_norm    = {config.grad_clip_norm}",
         f"  scheduler_name    = {config.scheduler_name}",
         f"  scheduler_kwargs  = {config.scheduler_kwargs}",
         f"  tensorboard       = {config.tensorboard}",

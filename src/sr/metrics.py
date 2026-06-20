@@ -19,17 +19,43 @@ How to change safely:
 from __future__ import annotations
 
 import math
+from typing import Any
 
+import numpy as np
 import torch
 from torch.nn import functional as F
 
 from src.sr.losses import (
+    compute_dual_domain_masked_mse,
+    focal_frequency_loss,
+    kspace_mse_loss,
     l1_loss,
     masked_l1_loss,
     masked_mse_loss,
+    merge_dual_domain_kwargs,
+    merge_ffl_kwargs,
     mse_loss,
 )
 from src.sr.shape_utils import align_pred_target_mask
+
+
+def volume_intensity_stats(volume: np.ndarray) -> dict[str, float]:
+    """min / max / mean over all voxels of one 3D volume (numpy, any shape).
+
+    Purpose:
+        Quick intensity sanity check when inspecting infer outputs; catches
+        collapsed predictions or scale mismatches vs target before plotting.
+    Effects:
+        Returns plain floats suitable for logging and JSON sidecars.
+    """
+    flat = np.asarray(volume, dtype=np.float64).ravel()
+    if flat.size == 0:
+        raise ValueError("volume_intensity_stats: empty array")
+    return {
+        "min": float(np.min(flat)),
+        "max": float(np.max(flat)),
+        "mean": float(np.mean(flat)),
+    }
 
 
 def psnr_from_mse(mse: float, data_range: float = 1.0) -> float:
@@ -108,15 +134,18 @@ def compute_full_metrics(
     target: torch.Tensor,
     mask: torch.Tensor,
     data_range: float = 1.0,
+    *,
+    training_loss_name: str | None = None,
+    training_loss_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """Compute every reporting metric for one batch (no gradients).
 
     Returned keys (all floats):
         mse, masked_mse, l1, masked_l1,
         psnr, masked_psnr, ssim, masked_ssim
-
-    When ``pred`` is smaller than ``target`` (e.g. ``SRCNN3DPatch`` valid conv),
-    ``target`` and ``mask`` are center-cropped to ``pred``'s spatial size first.
+    Optional extra keys when ``training_loss_name`` matches a parameterised
+    training objective (``dual_domain_masked_mse``, ``kspace_mse``, or
+    ``focal_frequency``) so validation ``val_<loss_name>`` matches the optimiser.
     """
     pred, target, mask = align_pred_target_mask(pred, target, mask)
     values: dict[str, float] = {}
@@ -132,6 +161,37 @@ def compute_full_metrics(
     values["masked_ssim"] = float(
         masked_local_ssim_3d(pred, target, mask, data_range=data_range).item()
     )
+    if training_loss_name == "dual_domain_masked_mse":
+        m = merge_dual_domain_kwargs(training_loss_kwargs)
+        values["dual_domain_masked_mse"] = float(
+            compute_dual_domain_masked_mse(
+                pred,
+                target,
+                mask,
+                alpha=m["alpha"],
+                beta=m["beta"],
+                kspace_high_freq_weight=m["kspace_high_freq_weight"],
+            ).item()
+        )
+    elif training_loss_name == "kspace_mse":
+        boost = float(
+            (training_loss_kwargs or {}).get("kspace_high_freq_weight", 0.0)
+        )
+        values["kspace_mse"] = float(
+            kspace_mse_loss(pred, target, mask, high_freq_boost=boost).item()
+        )
+    elif training_loss_name == "focal_frequency":
+        m = merge_ffl_kwargs(training_loss_kwargs)
+        values["focal_frequency"] = float(
+            focal_frequency_loss(
+                pred,
+                target,
+                mask,
+                alpha=m["alpha"],
+                log_matrix=m["log_matrix"],
+                batch_matrix=m["batch_matrix"],
+            ).item()
+        )
     return values
 
 
