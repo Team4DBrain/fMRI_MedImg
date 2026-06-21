@@ -1,13 +1,36 @@
-# fMRI Restoration Project — Data Pipeline
+# CAI-MedImg — fMRI Restoration Project
 
-CS/AI student project on the [IBC dataset](https://openneuro.org/datasets/ds002685/versions/2.0.0).
+CAI-MedImg is a modular medical-imaging project for testing different fMRI
+processing pipelines and comparing which approach gives better results.
+
+Each team member develops one pipeline component in a separate subfolder. The
+components should expose a simple interface so they can be combined and tested
+against each other in the full project. The main goal is to run different
+pipeline choices, evaluate their outputs, and keep the best-performing methods
+for the final system.
+
+This work uses the [IBC dataset](https://openneuro.org/datasets/ds002685/versions/2.0.0).
 We're training three models that take "imperfect" fMRI scans and produce cleaner versions:
 
 1. **Denoising model** — noisy → clean, same resolution
 2. **Spatial SR model** — low-res (3mm) → high-res (1.5mm)
 3. **Temporal SR model** — interpolate a missing volume from neighbors
 
-This repo contains the **data pipeline** (`src/data`) and a **spatial SR trainer** (`src/sr`): LR brain volumes → HR super-resolution with `srcnn3d` or `rcan3d`. Denoising and temporal SR are dataset-ready; training stacks for those are not included here yet.
+This repo contains the **data pipeline** (`src/data`), a **spatial SR trainer**
+(`src/sr`), and a **temporal interpolation module** (`data_interpolation/`).
+Denoising and temporal SR are dataset-ready in `src/data`; the standalone
+`data_interpolation/` package provides an alternate temporal-interpolation stack.
+Training stacks for denoising are not included here yet.
+
+## Project modules
+
+| Module | Purpose |
+|--------|---------|
+| `src/data/` | BIDS manifest, brain masks, PyTorch datasets (denoising, spatial SR, temporal SR) |
+| `src/sr/` | Spatial super-resolution training/eval/infer CLI (`srcnn3d`, `rcan3d`) |
+| `data_interpolation/` | Temporal fMRI interpolation — takes a 4D BOLD NIfTI and generates a new file with interpolated time frames |
+
+See [data_interpolation/README.md](data_interpolation/README.md) for setup and usage of the interpolation module.
 
 ## What's in this repo
 
@@ -29,6 +52,14 @@ src/sr/
   data.py         # train/val DataLoaders (subject split, SpatialSRDataset)
   model.py        # SRCNN3D, RCAN3D registry
   config.py       # defaults and validation
+
+data_interpolation/
+  main.py         # Entry point for temporal interpolation
+  train.py        # Training script
+  eval.py         # Evaluation script
+  src/            # Model, dataset, loss, inference utilities
+  configs/        # Default training config
+  notebooks/      # Quick tests and full training notebooks
 
 tests/
   test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
