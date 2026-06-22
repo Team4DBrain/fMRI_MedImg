@@ -1,13 +1,15 @@
 # fMRI Restoration Project — Data Pipeline
 
 CS/AI student project on the [IBC dataset](https://openneuro.org/datasets/ds002685/versions/2.0.0).
-We're training three models that take "imperfect" fMRI scans and produce cleaner versions:
+We're training models that take "imperfect" fMRI scans and produce cleaner versions:
 
 1. **Denoising model** — noisy → clean, same resolution
 2. **Spatial SR model** — low-res (3mm) → high-res (1.5mm)
 3. **Temporal SR model** — interpolate a missing volume from neighbors
+4. **Joint model** — noisy low-res → clean high-res, denoising + spatial SR in **one** network
 
-This repo currently contains the **data pipeline** only. Models will follow.
+This repo contains the **data pipeline** (`src/data/`) and the **joint model** (`src/joint/`, see
+the joint-model section below). The three standalone models above will follow.
 
 ## What's in this repo
 
@@ -25,6 +27,16 @@ src/data/
   datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR/Joint)
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
   degradation_noise.py    # Rician noise + Compose (for the denoising / joint models)
+
+src/joint/                # Joint denoise + spatial-SR model (consumes JointDataset)
+  __init__.py             # Public API: build_config, build_model, masked_* metrics
+  config.py               # ModelConfig/TrainConfig + "vm" (real) and "smoke" (local-test) profiles
+  model.py                # JointRCAN3D + architecture smoke (python -m src.joint.model)
+  losses.py               # mask-weighted Charbonnier + masked PSNR / 3D SSIM
+  train.py                # Training loop, overfit sanity, code smoke (python -m src.joint.train)
+  splits.py               # Subject-disjoint split + dataset/loader construction
+  run.py                  # Training launcher CLI (python -m src.joint.run)
+  eval.py                 # Checkpoint evaluator CLI (python -m src.joint.eval)
 
 tests/
   test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
@@ -344,6 +356,60 @@ default composition.
 The loss formulas above are illustrative — masked L1, SSIM, or other choices
 are all viable. Train/val/test splits in `subject_filter` are placeholders too;
 the group decides who's in which.
+
+## The joint model — `src/joint/`
+
+One 3D CNN that **denoises and spatially up-samples at once**: noisy LR `(1, 64, 64, 46)` →
+clean HR `(1, 128, 128, 93)`. It consumes `JointDataset` directly — no changes to the data layer.
+
+**Architecture** (`JointRCAN3D`): a 3D RCAN-style residual network — conv stem → residual groups
+with channel attention at LR scale → a factored upsampler (sub-pixel ×2 in-plane, then trilinear
+to the odd z = 93) → shallow HR refinement → linear head, plus a global skip that adds the
+trilinear-upsampled input so the network predicts the HR *residual*. Loss is brain-mask-weighted
+Charbonnier in HR space.
+
+**Designed for the VM (one H100), not a local GPU.** Two profiles select the same architecture at
+different sizes:
+
+- `vm` — the real model (~16M params), bf16 AMP, batch 8. This is what training uses.
+- `smoke` — a tiny instantiation (~1M params) for local code / wiring tests only.
+
+### Local checks (no training)
+
+```
+# architecture smoke — forward shape + gradient flow (tiny model)
+python -m src.joint.model
+
+# full code smoke; add --manifest to also overfit a few real volumes (the sanity gate)
+python -m src.joint.train --manifest <derivatives>/manifest.json
+```
+
+The overfit sanity asserts the model **beats a trilinear-upsampling baseline** (not merely that the
+loss drops) — evidence the SR body is actually learning, not just leaning on the global skip.
+
+### Training (on the VM)
+
+```
+python -m src.joint.run \
+    --manifest <derivatives>/manifest.json \
+    --profile vm --val <val subjects> --test <held-out test subjects> \
+    --ckpt-dir runs/joint01
+```
+
+Splits are **subject-disjoint** (no subject in two sets) — pick the val/test subjects on the VM's
+own manifest. Checkpoints store the full config + manifest hash + git commit. Run once with
+`--epochs 1` first as a dry-run to confirm the loop, bf16, and memory before the full schedule.
+
+### Evaluation
+
+```
+python -m src.joint.eval \
+    --manifest <derivatives>/manifest.json \
+    --ckpt runs/joint01/best.pt --subjects <test subjects>
+```
+
+Reports brain-masked PSNR / SSIM / Charbonnier, overall and per-subject. These are voxel-fidelity
+metrics only; fMRI-specific evaluation (tSNR, task-GLM preservation) is a later step.
 
 ## Design decisions worth knowing
 
