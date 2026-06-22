@@ -46,6 +46,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .degradation_noise import Compose, RicianNoise
 from .degradation_spatial import (
     SpatialDegradation,
     downsample_mask_to_lr,
@@ -491,6 +492,99 @@ class SpatialSRDataset(BaseFMRIDataset):
 
         return {
             "input": _to_tensor(lr).unsqueeze(0),
+            "target": _to_tensor(hr).unsqueeze(0),
+            "mask_hr": self._get_hr_mask(run_idx).unsqueeze(0),
+            "mask_lr": self._get_lr_mask(run_idx).unsqueeze(0),
+            "run_id": self.runs[run_idx]["run_id"],
+            "t": t,
+        }
+
+
+class JointDataset(SpatialSRDataset):
+    """Samples for the JOINT denoise + spatial-SR model.
+
+    Same sample structure as SpatialSRDataset (Option A: LR input, HR target,
+    plus HR and LR masks) EXCEPT the LR input is additionally corrupted with
+    noise. The model must both denoise and upsample.
+
+    The default degradation composes, in order:
+        1. k-space spatial downsampling  (clean HR -> clean LR), then
+        2. Rician noise on the LR volume (clean LR -> noisy LR).
+    The order is deliberate: thermal noise lives in the acquired
+    low-resolution k-space, so noise is applied AFTER downsampling. See
+    degradation_noise.py for the noise model and the sigma defaults.
+
+    The HR target stays clean (modulo the scanner's own intrinsic noise, which
+    is always present in real data — see degradation_noise.py).
+
+    Returns dict with:
+        input:    noisy LR volume, shape (1, kx, ky, kz)
+        target:   clean HR volume, shape (1, X, Y, Z)
+        mask_hr:  HR mask,         shape (1, X, Y, Z)
+        mask_lr:  LR mask,         shape (1, kx, ky, kz)
+
+    This subclasses SpatialSRDataset purely to reuse its LR-shape resolution,
+    LR-mask derivation, caching, and the construction-time degrade_fn probe. It
+    does NOT modify SpatialSRDataset, so the spatial-SR path used elsewhere is
+    unaffected.
+    """
+
+    def __init__(
+        self,
+        manifest_path,
+        subject_filter=None,
+        degrade_fn=None,
+        lr_shape: tuple[int, int, int] | None = None,
+        source_voxel_mm: float = 1.5,
+        target_voxel_mm: float = 3.0,
+        sigma_min: float = 0.03,
+        sigma_max: float = 0.10,
+        noise_seed: int | None = None,
+        check_files_exist: bool = True,
+        mask_cache_size: int = DEFAULT_MASK_CACHE_SIZE,
+    ):
+        """
+        Args (in addition to SpatialSRDataset's):
+            sigma_min, sigma_max: Rician noise std range, normalized units.
+                Used only when degrade_fn is None (the default composition).
+            noise_seed: seed for the Rician noise RNG (default None = fresh
+                entropy per call; see degradation_noise.RicianNoise).
+            degrade_fn: if given, REPLACES the default spatial+noise composition
+                entirely. The caller is then responsible for both the spatial
+                downsampling and the noise (and for matching lr_shape). If you
+                only want to change the noise level, leave degrade_fn=None and
+                set sigma_min/sigma_max instead.
+        """
+        if degrade_fn is None:
+            # Default joint degradation: spatial downsample THEN Rician noise.
+            degrade_fn = Compose([
+                make_spatial_degradation(
+                    source_voxel_mm=source_voxel_mm,
+                    target_voxel_mm=target_voxel_mm,
+                ),
+                RicianNoise(
+                    sigma_min=sigma_min, sigma_max=sigma_max, seed=noise_seed,
+                ),
+            ])
+        super().__init__(
+            manifest_path,
+            subject_filter=subject_filter,
+            degrade_fn=degrade_fn,
+            lr_shape=lr_shape,
+            source_voxel_mm=source_voxel_mm,
+            target_voxel_mm=target_voxel_mm,
+            check_files_exist=check_files_exist,
+            mask_cache_size=mask_cache_size,
+        )
+
+    def __getitem__(self, idx: int) -> dict:
+        run_idx, t = self.samples[idx]
+        hr = self._read_volume(run_idx, t)                  # clean HR (X, Y, Z)
+        noisy_lr = self.degrade_fn(hr)                      # spatial + noise -> LR
+        noisy_lr = _validate_degraded(noisy_lr, self.lr_shape, label="JointDataset")
+
+        return {
+            "input": _to_tensor(noisy_lr).unsqueeze(0),
             "target": _to_tensor(hr).unsqueeze(0),
             "mask_hr": self._get_hr_mask(run_idx).unsqueeze(0),
             "mask_lr": self._get_lr_mask(run_idx).unsqueeze(0),

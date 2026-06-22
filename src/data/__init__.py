@@ -4,6 +4,7 @@
 # tests and possible future re-introduction (e.g., if we want xy bbox cropping
 # down the line). compute_metadata and datasets do not import from here.
 from .cropping import compute_z_start, crop_z, update_affine_for_z_crop
+from .degradation_noise import Compose, RicianNoise, make_noise
 from .degradation_spatial import (
     SpatialDegradation,
     downsample_mask_to_lr,
@@ -39,4 +40,7 @@ __all__ = [
     "SpatialDegradation",
     "voxel_size_to_target_shape",
     "downsample_mask_to_lr",
+    "RicianNoise",
+    "Compose",
+    "make_noise",
 ]

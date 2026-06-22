@@ -22,12 +22,14 @@ src/data/
   masks.py                # Brain masking: SynthStrip (preferred) or percentile fallback
   normalize.py            # Per-run scalar normalization (volume / norm_ref)
   cropping.py             # Z-axis bbox-centered crop — UNUSED in no_crop_v1, kept for tests
-  datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR)
+  datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR/Joint)
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
+  degradation_noise.py    # Rician noise + Compose (for the denoising / joint models)
 
 tests/
   test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
   test_degradation_spatial.py   # Unit tests incl. k-space scale regression
+  test_degradation_noise.py     # Rician noise, Compose, JointDataset end-to-end
   test_reader.py                # VolumeReader and per-process cache
   test_datasets_synthetic.py    # End-to-end Datasets on a synthetic BIDS layout
 ```
@@ -280,6 +282,65 @@ for batch in train_loader:
     optimizer.zero_grad()
 ```
 
+#### Joint denoise + spatial SR — `JointDataset`
+
+For a single model that **denoises and upsamples at once**. Same structure as
+Spatial SR (Option A: LR input, HR target), except the LR input is also
+corrupted with noise. The default degradation composes, in order, k-space
+spatial downsampling **then** Rician noise — that order is deliberate (thermal
+noise lives in the acquired low-resolution k-space, so it is added *after*
+downsampling).
+
+```python
+from src.data.datasets import JointDataset
+from torch.utils.data import DataLoader
+
+train_ds = JointDataset(
+    "<out>/manifest.json",
+    subject_filter=["01", "04", "07"],
+    sigma_min=0.03, sigma_max=0.10,   # Rician noise std range (normalized units)
+    # noise_seed=None,                # default: fresh noise per sample (see below)
+)
+train_loader = DataLoader(train_ds, batch_size=4, num_workers=2, shuffle=True)
+```
+
+Each batch:
+
+| key       | shape                  | meaning                                   |
+|-----------|------------------------|-------------------------------------------|
+| `input`   | `(B, 1, 64, 64, 46)`   | **noisy** LR volume                       |
+| `target`  | `(B, 1, 128, 128, 93)` | clean HR volume                           |
+| `mask_hr` | `(B, 1, 128, 128, 93)` | brain mask at HR — for HR-domain loss     |
+| `mask_lr` | `(B, 1, 64, 64, 46)`   | brain mask at LR                          |
+
+The model takes `input` (noisy LR) and must produce the shape of `target`
+(clean HR) — denoising and upsampling in one pass. Compute loss in HR space
+weighted by `mask_hr`, same as Spatial SR.
+
+Noise model (`src/data/degradation_noise.py`):
+- **Rician**, not additive Gaussian. Gaussian noise on a magnitude image would
+  produce negative voxels that never occur in a real scan and that the model
+  could exploit as a trivial "tell". Rician noise is the magnitude of a
+  complex-Gaussian-corrupted signal — strictly non-negative, with a positive
+  background "floor" exactly like real MRI.
+- **sigma is in normalized units** (fraction of `norm_ref` ≈ a bright brain
+  voxel), so the default `U(0.03, 0.10)` means "3–10% of a bright brain voxel"
+  consistently across runs. That range is grounded in the MRI-denoising
+  literature (~1–9% of signal) and this dataset's measured in-brain tSNR
+  (~14–21 → ~5–7% intrinsic noise).
+- **RNG**: by default each sample gets fresh noise (so forked DataLoader workers
+  produce independent noise without a `worker_init_fn`). Pass `noise_seed=<int>`
+  for determinism — but note a fixed seed gives *every* sample the same noise
+  draw; for a fixed-but-varied validation set, derive a per-sample seed in your
+  training code.
+- The "clean" HR target still carries the scanner's own intrinsic noise (finite
+  tSNR), so the model learns to denoise down to that floor, not to a perfectly
+  noiseless image — standard for supervised denoising on real data.
+
+To customize, pass your own `degrade_fn` (a picklable callable, e.g. a
+`Compose([SpatialDegradation(...), RicianNoise(...)])`); it fully replaces the
+default composition.
+
 The loss formulas above are illustrative — masked L1, SSIM, or other choices
 are all viable. Train/val/test splits in `subject_filter` are placeholders too;
 the group decides who's in which.
@@ -308,6 +369,13 @@ the group decides who's in which.
   (output size / input size) to preserve mean intensity. There's a regression
   test for this in `tests/test_degradation_spatial.py`; if you touch the scale
   logic or the .real/.abs choice, run the tests.
+- **Noise model is Rician** (`degradation_noise.py`), applied in normalized
+  units. For the joint model, noise is composed *after* spatial downsampling
+  (`Compose([SpatialDegradation, RicianNoise])`) because thermal noise lives in
+  the acquired LR k-space. Rician (magnitude of complex-Gaussian-corrupted
+  signal) is used over additive Gaussian so output stays non-negative like a
+  real magnitude image. Default σ range `U(0.03, 0.10)` — see `JointDataset`
+  above for the grounding and the RNG/seed caveat.
 - **`indexed_gzip` is required** (pinned in `requirements.txt`). Without it,
   every random-access volume read decompresses the gzip stream from byte 0.
   nibabel picks it up automatically when present — no code change needed.
@@ -335,12 +403,17 @@ exceeds 0.55 (a rough sanity floor — whole-brain BOLD masks should be ~0.2-0.4
 of the native volume, so anything above 0.55 almost certainly contains
 non-brain tissue).
 
-### Stub degradations
-- `DenoisingDataset` requires you to pass a `degrade_fn`. None implemented yet —
-  the noise model is the denoising owner's call. (Group decided on a noise2noise
-  approach, so noise modeling may not be needed at all — TBD.)
-- `SpatialSRDataset` has a working degradation in `degradation_spatial.py`.
-- `TemporalSRDataset` has no degradation by design (see above).
+### Degradations — status per dataset
+- `SpatialSRDataset`: working k-space degradation in `degradation_spatial.py`.
+- `JointDataset`: working default degradation — spatial downsample then Rician
+  noise (`Compose([SpatialDegradation, RicianNoise])`), see `degradation_noise.py`.
+- `TemporalSRDataset`: no degradation by design (the sampling IS the degradation).
+- `DenoisingDataset`: still defaults to a `NotImplementedError` stub so a missing
+  decision can't slip silently into a run. A Rician noise model now exists
+  (`RicianNoise` / `make_noise` in `degradation_noise.py`) and can be passed as
+  its `degrade_fn`. The standalone denoiser's final noise choice is still the
+  denoising owner's call — the group floated a noise2noise approach, in which
+  case the supervised `degrade_fn` here may not be the path taken.
 
 ### Dtype heterogeneity in IBC
 IBC's BOLD files come in three on-disk dtypes across releases: **int16**,
