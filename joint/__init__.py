@@ -1,8 +1,8 @@
-"""Joint denoise + spatial super-resolution model (consumes src.data.JointDataset).
+"""Joint denoise + spatial super-resolution model (consumes data.JointDataset).
 
 Public API::
 
-    from src.joint import build_config, build_model
+    from joint import build_config, build_model
     cfg = build_config("vm")          # or "smoke" for local code tests
     model = build_model(cfg.model)    # JointRCAN3D: (B,1,64,64,46) -> (B,1,128,128,93)
 """

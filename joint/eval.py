@@ -1,6 +1,6 @@
 """Evaluate a trained joint model on a subject split (typically the held-out test).
 
-    python -m src.joint.eval \\
+    python -m joint.eval \\
         --manifest /srv/venvs/team4dbrain/derivatives/manifest.json \\
         --ckpt runs/joint01/best.pt --subjects 07 13
 

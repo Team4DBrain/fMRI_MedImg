@@ -2,7 +2,7 @@
 
 ## Quick start — run a whole scan through the trained joint model
 
-`src/joint/puppetmaster.py` is the one-call way to use the finished **joint denoise +
+`joint/puppetmaster.py` is the one-call way to use the finished **joint denoise +
 super-resolution model**. Hand it one whole BOLD run; get back the model's denoised, upscaled
 reconstruction as a 4D NIfTI that drops straight in over the original (same grid, affine, and TR).
 
@@ -14,14 +14,14 @@ cd ~/CAI-MedImg && source /srv/venvs/team4dbrain/setup_env.sh
 
 ```python
 # Python
-from src.joint.puppetmaster import run
+from joint.puppetmaster import run
 run("/srv/fMRI-data/sub-13_ses-16_task-PainMovie_dir-pa_bold.nii.gz",
     "/tmp/sub-13_painmovie_pred.nii.gz")
 ```
 
 ```bash
 # CLI — identical work
-python -m src.joint.puppetmaster \
+python -m joint.puppetmaster \
     -i /srv/fMRI-data/sub-13_ses-16_task-PainMovie_dir-pa_bold.nii.gz \
     -o /tmp/sub-13_painmovie_pred.nii.gz
 ```
@@ -48,14 +48,14 @@ We're training models that take "imperfect" fMRI scans and produce cleaner versi
 3. **Temporal SR model** — interpolate a missing volume from neighbors
 4. **Joint model** — noisy low-res → clean high-res, denoising + spatial SR in **one** network
 
-This repo contains the **data pipeline** (`src/data/`) and the **joint model** (`src/joint/`, see
+This repo contains the **data pipeline** (`data/`) and the **joint model** (`joint/`, see
 the joint-model section below). The three standalone models above will follow.
 
 ## What's in this repo
 
 ```
-src/data/
-  __init__.py             # Re-exports the public API (so `from src.data import …` works)
+data/
+  __init__.py             # Re-exports the public API (so `from data import …` works)
   _cli.py                 # Shared CLI helpers: team-VM default paths + arg validators
   build.py                # Wrapper: runs manifest + metadata in one go
   manifest.py             # Walk BIDS tree, parse filenames, build a JSON manifest
@@ -68,16 +68,16 @@ src/data/
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
   degradation_noise.py    # Rician noise + Compose (for the denoising / joint models)
 
-src/joint/                # Joint denoise + spatial-SR model (consumes JointDataset)
+joint/                # Joint denoise + spatial-SR model (consumes JointDataset)
   __init__.py             # Public API: build_config, build_model, masked_* metrics
   config.py               # ModelConfig/TrainConfig + "vm" (real) and "smoke" (local-test) profiles
-  model.py                # JointRCAN3D + architecture smoke (python -m src.joint.model)
+  model.py                # JointRCAN3D + architecture smoke (python -m joint.model)
   losses.py               # mask-weighted Charbonnier + masked PSNR / 3D SSIM
-  train.py                # Training loop, overfit sanity, code smoke (python -m src.joint.train)
+  train.py                # Training loop, overfit sanity, code smoke (python -m joint.train)
   splits.py               # Subject-disjoint split + dataset/loader construction
-  run.py                  # Training launcher CLI (python -m src.joint.run)
-  eval.py                 # Checkpoint evaluator CLI (python -m src.joint.eval)
-  puppetmaster.py         # Inference endpoint: whole run -> degrade -> model -> stacked 4D (python -m src.joint.puppetmaster)
+  run.py                  # Training launcher CLI (python -m joint.run)
+  eval.py                 # Checkpoint evaluator CLI (python -m joint.eval)
+  puppetmaster.py         # Inference endpoint: whole run -> degrade -> model -> stacked 4D (python -m joint.puppetmaster)
 
 tests/
   test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
@@ -117,7 +117,7 @@ the defaults cover `--bids-root` and `--out-dir`, so this is the whole
 invocation:
 
 ```
-python -m src.data.build --mask-method auto
+python -m data.build --mask-method auto
 ```
 
 Pass `--bids-root <path>` and/or `--out-dir <path>` to override the
@@ -179,9 +179,9 @@ If you want to inspect the manifest before committing to the slow metadata
 step, or only redo one stage. Defaults again cover the team VM paths:
 
 ```
-python -m src.data.manifest
+python -m data.manifest
 
-python -m src.data.compute_metadata --mask-method auto
+python -m data.compute_metadata --mask-method auto
 ```
 
 Override with `--bids-root`, `--out`, `--manifest`, `--derivatives-dir`
@@ -202,8 +202,8 @@ dict; the keys differ slightly per task — see below.
 #### Spatial SR — `SpatialSRDataset`
 
 ```python
-from src.data.datasets import SpatialSRDataset
-from src.data.degradation_spatial import make_spatial_degradation
+from data.datasets import SpatialSRDataset
+from data.degradation_spatial import make_spatial_degradation
 from torch.utils.data import DataLoader
 
 degrade = make_spatial_degradation(source_voxel_mm=1.5, target_voxel_mm=3.0)
@@ -255,7 +255,7 @@ for batch in train_loader:
 #### Denoising — `DenoisingDataset`
 
 ```python
-from src.data.datasets import DenoisingDataset
+from data.datasets import DenoisingDataset
 from torch.utils.data import DataLoader
 
 # You decide what counts as "noisy". Pass a function that takes a clean
@@ -303,7 +303,7 @@ No `degrade_fn` here. The sampler skips a timepoint and gives you its two
 neighbors as input — that's the degradation.
 
 ```python
-from src.data.datasets import TemporalSRDataset
+from data.datasets import TemporalSRDataset
 from torch.utils.data import DataLoader
 
 train_ds = TemporalSRDataset(
@@ -345,7 +345,7 @@ noise lives in the acquired low-resolution k-space, so it is added *after*
 downsampling).
 
 ```python
-from src.data.datasets import JointDataset
+from data.datasets import JointDataset
 from torch.utils.data import DataLoader
 
 train_ds = JointDataset(
@@ -370,7 +370,7 @@ The model takes `input` (noisy LR) and must produce the shape of `target`
 (clean HR) — denoising and upsampling in one pass. Compute loss in HR space
 weighted by `mask_hr`, same as Spatial SR.
 
-Noise model (`src/data/degradation_noise.py`):
+Noise model (`data/degradation_noise.py`):
 - **Rician**, not additive Gaussian. Gaussian noise on a magnitude image would
   produce negative voxels that never occur in a real scan and that the model
   could exploit as a trivial "tell". Rician noise is the magnitude of a
@@ -398,7 +398,7 @@ The loss formulas above are illustrative — masked L1, SSIM, or other choices
 are all viable. Train/val/test splits in `subject_filter` are placeholders too;
 the group decides who's in which.
 
-## The joint model — `src/joint/`
+## The joint model — `joint/`
 
 One 3D CNN that **denoises and spatially up-samples at once**: noisy LR `(1, 64, 64, 46)` →
 clean HR `(1, 128, 128, 93)`. It consumes `JointDataset` directly — no changes to the data layer.
@@ -419,10 +419,10 @@ different sizes:
 
 ```
 # architecture smoke — forward shape + gradient flow (tiny model)
-python -m src.joint.model
+python -m joint.model
 
 # full code smoke; add --manifest to also overfit a few real volumes (the sanity gate)
-python -m src.joint.train --manifest <derivatives>/manifest.json
+python -m joint.train --manifest <derivatives>/manifest.json
 ```
 
 The overfit sanity asserts the model **beats a trilinear-upsampling baseline** (not merely that the
@@ -431,7 +431,7 @@ loss drops) — evidence the SR body is actually learning, not just leaning on t
 ### Training (on the VM)
 
 ```
-python -m src.joint.run \
+python -m joint.run \
     --manifest <derivatives>/manifest.json \
     --profile vm --val <val subjects> --test <held-out test subjects> \
     --ckpt-dir runs/joint01
@@ -444,7 +444,7 @@ own manifest. Checkpoints store the full config + manifest hash + git commit. Ru
 ### Evaluation
 
 ```
-python -m src.joint.eval \
+python -m joint.eval \
     --manifest <derivatives>/manifest.json \
     --ckpt runs/joint01/best.pt --subjects <test subjects>
 ```

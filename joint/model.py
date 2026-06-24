@@ -210,7 +210,7 @@ def count_params(model: nn.Module) -> int:
 
 if __name__ == "__main__":
     # Minimal architecture smoke test (no pytest). Uses the tiny "smoke" config
-    # so it runs on a weak local GPU / CPU. Run: python -m src.joint.model
+    # so it runs on a weak local GPU / CPU. Run: python -m joint.model
     from .config import build_config
 
     cfg = build_config("smoke")
