@@ -31,19 +31,19 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from src.sr.checkpoint import (
+from sr.checkpoint import (
     best_epoch_path,
     find_latest_epoch,
     list_epoch_files,
     load_epoch,
     run_dir_for_checkpoint,
 )
-from src.sr.config import SRConfig, auto_device, from_json
-from src.sr.data import build_spatial_sr_dataset, resolve_dataset_sample
-from src.sr.forward import model_forward
-from src.sr.infer import extract_slice, format_sample_table, infer_one, list_samples, select_sample
-from src.sr.models import build_model
-from src.sr.losses import (
+from sr.config import SRConfig, auto_device, from_json
+from sr.data import build_spatial_sr_dataset, resolve_dataset_sample
+from sr.forward import model_forward
+from sr.infer import extract_slice, format_sample_table, infer_one, list_samples, select_sample
+from sr.models import build_model
+from sr.losses import (
     kspace_mse_loss,
     masked_mse_loss,
     merge_dual_domain_kwargs,
@@ -446,7 +446,7 @@ class FixedDebugSample:
         Drives mask figures and evolution PNGs under ``<run_dir>/debug/``.
     Influences:
         Edit ``FIXED_DEBUG_SAMPLES`` when the manifest changes; run
-        ``python -m src.sr debug --populate-runs`` to refresh all runs.
+        ``python -m sr debug --populate-runs`` to refresh all runs.
     """
 
     key: str
@@ -936,7 +936,7 @@ def _log_fixed_sample_coverage(manifest_path: Path, available: list[FixedDebugSa
     if not available:
         print(
             f"[debug] warning: none of the fixed debug samples are in {manifest_path}. "
-            "Edit FIXED_DEBUG_SAMPLES in src/sr/debug.py if the manifest differs."
+            "Edit FIXED_DEBUG_SAMPLES in sr/debug.py if the manifest differs."
         )
     elif len(available) < len(FIXED_DEBUG_SAMPLES):
         missing = [s.key for s in FIXED_DEBUG_SAMPLES if s not in available]
@@ -1205,7 +1205,7 @@ def _resolve_voxel_sizes(
 
 
 def run_debug(args: argparse.Namespace) -> None:
-    """Entry point for ``python -m src.sr debug ...``."""
+    """Entry point for ``python -m sr debug ...``."""
     selection_filters = {
         "subject": args.subject,
         "session": args.session,

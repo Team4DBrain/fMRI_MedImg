@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.data.cropping import compute_z_start, crop_z, update_affine_for_z_crop
+from data.cropping import compute_z_start, crop_z, update_affine_for_z_crop
 
 
 def _make_mask(z_native, z_lo, z_hi, shape_xy=(8, 8)):

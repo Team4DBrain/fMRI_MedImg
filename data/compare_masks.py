@@ -33,7 +33,7 @@ def compare_masks(
     """Compare percentile vs SynthStrip masks across all *_bold.nii.gz under data_root.
 
     Args:
-        project_root: path to the repo root (containing src/). Added to sys.path.
+        project_root: path to the repo root. Added to sys.path.
         data_root: directory to search for *_bold.nii.gz files (recursive).
         max_files: if set, only process the first N files. None = all.
         output_dir: where to save the PNG comparisons.
@@ -49,12 +49,12 @@ def compare_masks(
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-    from src.data.masks import (
+    from data.masks import (
         _compute_percentile_mask,
         _compute_synthstrip_mask,
         find_synthstrip_executable,
     )
-    from src.data.reader import VolumeReader
+    from data.reader import VolumeReader
 
     files_to_check = sorted(data_root.rglob("*_bold.nii.gz"))
     if max_files is not None:

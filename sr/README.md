@@ -1,4 +1,4 @@
-# `src/sr` — Spatial Super-Resolution
+# `sr` — Spatial Super-Resolution
 
 Minimal, modular 3D SR pipeline for fMRI volumes. Four commands, one
 config dataclass, one checkpoint format. No automatic post-training
@@ -7,7 +7,7 @@ analysis — the user composes plots, comparisons, and reports themselves.
 ## Layout
 
 ```
-src/sr/
+sr/
 ├── config.py       # SRConfig dataclass, defaults, JSON IO, validate
 ├── models.py       # SRCNN3D, RCAN3D, MODEL_REGISTRY, build_model
 ├── losses.py       # mse, masked_mse, kspace_mse, dual_domain_masked_mse, registries
@@ -18,7 +18,7 @@ src/sr/
 ├── train.py        # train(config, resume_dir=None)
 ├── infer.py        # evaluate, infer_one, list_samples, make_slice_figure
 ├── debug.py        # masks, prediction error, baseline comparison, loss curve
-└── cli.py + __main__.py   # `python -m src.sr ...`
+└── cli.py + __main__.py   # `python -m sr ...`
 ```
 
 Each module owns one responsibility. To swap a loss, model, optimizer or
@@ -30,7 +30,7 @@ via the CLI — no edits to `train.py` required.
 | Field | Default |
 |---|---|
 | `manifest_path` | `/srv/venvs/team4dbrain/derivatives/manifest.json` |
-| `run_root` | `src/sr/runs` |
+| `run_root` | `sr/runs` |
 | `model_name` | `srcnn3d` |
 | `output_patch_shape` | `(128, 128, 93)` |
 | `source_voxel_mm` -> `target_voxel_mm` | `1.5 -> 3.0` |
@@ -45,7 +45,7 @@ via the CLI — no edits to `train.py` required.
 ## Run artifacts
 
 ```
-src/sr/runs/<model_name>/<timestamp>/
+sr/runs/<model_name>/<timestamp>/
 ├── config.json         # written once at start of run, source of truth
 ├── split.json          # written once, resolved train/val sample split
 ├── metrics.json        # rewritten atomically every epoch (plain JSON)
@@ -65,10 +65,10 @@ those are user-side compositions.
 
 ```bash
 # Train from scratch (uses every default)
-python -m src.sr train
+python -m sr train
 
 # Train with custom knobs
-python -m src.sr train \
+python -m sr train \
   --model-name rcan3d \
   --model-kwargs '{"n_feats": 48, "n_resgroups": 3}' \
   --loss-name masked_l1 \
@@ -79,43 +79,43 @@ python -m src.sr train \
   --epochs 20 --batch-size 4 --lr 1e-3
 
 # Dual-domain (masked image MSE + orthonormal 3D FFT k-space MSE)
-python -m src.sr train \
+python -m sr train \
   --loss-name dual_domain_masked_mse \
   --loss-kwargs '{"alpha": 0.5, "beta": 0.5, "kspace_high_freq_weight": 0.5}'
 
 # Focal Frequency Loss (dynamic k-space weighting, ICCV 2021)
-python -m src.sr train \
+python -m sr train \
   --loss-name focal_frequency \
   --loss-kwargs '{"alpha": 1.0, "log_matrix": false, "batch_matrix": false}'
 
-python -m src.sr train --resume-dir src/sr/runs/srcnn3d/20260511_120000
+python -m sr train --resume-dir sr/runs/srcnn3d/20260511_120000
 
 # Evaluate a checkpoint on its saved val split
-python -m src.sr eval \
-  --checkpoint src/sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+python -m sr eval \
+  --checkpoint sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
   --report ./report.json
 
 # List samples available in the manifest used by a checkpoint
-python -m src.sr infer \
-  --checkpoint src/sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+python -m sr infer \
+  --checkpoint sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
   --list-samples
 
 # Infer one sample, save a slice figure
-python -m src.sr infer \
-  --checkpoint src/sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+python -m sr infer \
+  --checkpoint sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
   --subject 01 --session 00 --task ArchiStandard --direction ap --t 12 \
   --axis coronal --slice-level 0.4 \
   --save-png ./infer_preview.png \
   --save-npy ./infer_pred.npy
 
 # Debug: masks + degradation (no checkpoint)
-python -m src.sr debug \
+python -m sr debug \
   --subject 01 --session 03 --task HcpEmotion --direction ap --t 0 \
   --save-png ./debug_masks.png
 
 # Debug: prediction error vs ground truth + trilinear baseline
-python -m src.sr debug \
-  --checkpoint src/sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+python -m sr debug \
+  --checkpoint sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
   --subject 01 --session 03 --task HcpEmotion --direction ap --t 0 \
   --figure both --error-map abs --mask-errors \
   --save-dir ./debug_out --plot-loss-curve
@@ -167,7 +167,7 @@ in the same directory; the metrics history is preserved and appended.
 
 ```python
 import json, matplotlib.pyplot as plt
-history = json.loads(open("src/sr/runs/srcnn3d/<run>/metrics.json").read())
+history = json.loads(open("sr/runs/srcnn3d/<run>/metrics.json").read())
 epochs = [h["epoch"] for h in history]
 plt.plot(epochs, [h["train_loss"] for h in history], label="train")
 plt.plot(epochs, [h.get("val_masked_mse") for h in history], label="val")
@@ -178,7 +178,7 @@ To inspect any saved epoch:
 
 ```python
 import torch
-state = torch.load("src/sr/runs/srcnn3d/<run>/epochs/epoch_007.pt", map_location="cpu")
+state = torch.load("sr/runs/srcnn3d/<run>/epochs/epoch_007.pt", map_location="cpu")
 print(state["best_epoch_number"], state["best_val_loss"])
 print(state["metrics_history"][-1])
 ```

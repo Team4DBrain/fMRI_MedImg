@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from src.sr.losses import (
+from sr.losses import (
     compute_dual_domain_masked_mse,
     focal_frequency_loss,
     kspace_mse_loss,

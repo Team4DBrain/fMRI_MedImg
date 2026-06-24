@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from src.sr.losses import (
+from sr.losses import (
     compute_dual_domain_masked_mse,
     focal_frequency_loss,
     kspace_mse_loss,
@@ -36,7 +36,7 @@ from src.sr.losses import (
     merge_ffl_kwargs,
     mse_loss,
 )
-from src.sr.shape_utils import align_pred_target_mask
+from sr.shape_utils import align_pred_target_mask
 
 
 def volume_intensity_stats(volume: np.ndarray) -> dict[str, float]:

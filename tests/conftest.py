@@ -8,8 +8,8 @@ import nibabel as nib
 import numpy as np
 import pytest
 
-from src.data.compute_metadata import compute_all
-from src.data.manifest import build_manifest, write_manifest
+from data.compute_metadata import compute_all
+from data.manifest import build_manifest, write_manifest
 
 UNIFORM_Z = 24
 TARGET_SHAPE = (32, 32, UNIFORM_Z)

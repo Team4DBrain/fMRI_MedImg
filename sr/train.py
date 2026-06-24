@@ -31,7 +31,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from src.sr.checkpoint import (
+from sr.checkpoint import (
     EpochState,
     capture_rng_state,
     find_latest_epoch,
@@ -41,8 +41,8 @@ from src.sr.checkpoint import (
     save_epoch,
     write_metrics_json,
 )
-from src.sr.components import build_optimizer, build_scheduler, step_scheduler
-from src.sr.config import (
+from sr.components import build_optimizer, build_scheduler, step_scheduler
+from sr.config import (
     SRConfig,
     auto_device,
     from_json,
@@ -51,17 +51,17 @@ from src.sr.config import (
     to_json,
     validate,
 )
-from src.sr.data import build_loaders, write_split_json
-from src.sr.losses import resolve_loss
-from src.sr.metrics import average_metric_dicts, compute_full_metrics
-from src.sr.forward import model_forward
-from src.sr.debug import (
+from sr.data import build_loaders, write_split_json
+from sr.losses import resolve_loss
+from sr.metrics import average_metric_dicts, compute_full_metrics
+from sr.forward import model_forward
+from sr.debug import (
     ensure_run_debug_layout,
     finalize_run_debug,
     safe_update_run_debug_after_epoch,
 )
-from src.sr.models import build_model, count_parameters
-from src.sr.shape_utils import align_pred_target_mask
+from sr.models import build_model, count_parameters
+from sr.shape_utils import align_pred_target_mask
 
 
 BANNER = "=" * 60

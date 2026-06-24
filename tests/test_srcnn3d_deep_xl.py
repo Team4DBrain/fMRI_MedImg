@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from src.sr.config import SRConfig, validate
-from src.sr.models import MODEL_REGISTRY, SRCNN3DDeepXL, build_model, count_parameters
+from sr.config import SRConfig, validate
+from sr.models import MODEL_REGISTRY, SRCNN3DDeepXL, build_model, count_parameters
 
 
 def test_forward_output_shape_matches_config() -> None:
@@ -19,7 +19,7 @@ def test_forward_output_shape_matches_config() -> None:
 def test_defaults_are_larger_than_srcnn3d_deep() -> None:
     shape = (128, 128, 93)
     xl = SRCNN3DDeepXL(shape)
-    from src.sr.models import SRCNN3DDeep
+    from sr.models import SRCNN3DDeep
 
     deep = SRCNN3DDeep(shape)
     assert count_parameters(xl) > count_parameters(deep)

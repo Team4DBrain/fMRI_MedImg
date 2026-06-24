@@ -132,7 +132,7 @@ class BaseFMRIDataset(Dataset):
             raise RuntimeError(
                 f"Manifest pipeline marker is {manifest.get('pipeline')!r}, "
                 f"expected {ACCEPTED_PIPELINE!r}. Re-run the data build "
-                f"(`python -m src.data.build ...`) to regenerate the manifest "
+                f"(`python -m data.build ...`) to regenerate the manifest "
                 f"and masks under the current pipeline."
             )
 

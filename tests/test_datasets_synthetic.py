@@ -21,17 +21,17 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from src.data.compute_metadata import compute_all
-from src.data.datasets import (
+from data.compute_metadata import compute_all
+from data.datasets import (
     DenoisingDataset,
     SpatialSRDataset,
     TemporalSRDataset,
 )
-from src.data.degradation_spatial import (
+from data.degradation_spatial import (
     SpatialDegradation,
     make_spatial_degradation,
 )
-from src.data.manifest import build_manifest, write_manifest
+from data.manifest import build_manifest, write_manifest
 
 
 def _stable_seed(name: str) -> int:
@@ -410,8 +410,8 @@ def test_inconsistent_run_shape_rejected(synthetic_pipeline):
 
 def test_compute_all_skips_when_metadata_complete(synthetic_pipeline, monkeypatch):
     """Second call to compute_all (without overwrite) must not call read_full."""
-    from src.data import compute_metadata as cm
-    from src.data import reader as reader_mod
+    from data import compute_metadata as cm
+    from data import reader as reader_mod
 
     manifest_path, _ = synthetic_pipeline
     derivatives_dir = manifest_path.parent

@@ -30,7 +30,7 @@ from torch.optim.lr_scheduler import (
     StepLR,
 )
 
-from src.sr.config import SRConfig
+from sr.config import SRConfig
 
 OPTIMIZER_REGISTRY: dict[str, type[Optimizer]] = {
     "adam": torch.optim.Adam,

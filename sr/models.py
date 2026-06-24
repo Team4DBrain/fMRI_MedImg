@@ -51,7 +51,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from src.sr.config import SRConfig
+from sr.config import SRConfig
 
 
 class SRCNN3D(nn.Module):
@@ -297,7 +297,7 @@ class SRCNN3DPatch(nn.Module):
         crops only; ``output_patch_shape`` still sets full-volume HR grid size.
     How to change safely:
         Keep kernel sizes 9/1/5 and padding=0 so ``SRCNN3D_PATCH_RECEPTIVE_SHRINK``
-        stays in sync with ``src.sr.shape_utils``.
+        stays in sync with ``sr.shape_utils``.
     """
 
     def __init__(self, output_patch_shape: tuple[int, int, int]) -> None:

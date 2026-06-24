@@ -10,7 +10,7 @@ Effects:
     JSON form lands in the run directory and is the single source of truth
     when a run is resumed.
 Influences:
-    CLI flags in ``src.sr.cli`` override defaults at construction time.
+    CLI flags in ``sr.cli`` override defaults at construction time.
     ``validate(...)`` is called once before any expensive work to fail fast
     on inconsistent values.
 How to change safely:
@@ -31,7 +31,15 @@ import numpy as np
 import torch
 
 DEFAULT_MANIFEST_PATH = Path("/srv/venvs/team4dbrain/derivatives/manifest.json")
-DEFAULT_RUN_ROOT = Path("src/sr/runs")
+DEFAULT_RUN_ROOT = Path("sr/runs")
+
+
+def resolve_run_root(stored: str | Path) -> Path:
+    """Map legacy run-root strings from pre-move runs without editing their JSON."""
+    p = Path(stored)
+    if p.as_posix() == "sr/runs":
+        return Path("sr/runs")
+    return p
 DEFAULT_OUTPUT_SHAPE: tuple[int, int, int] = (128, 128, 93)
 DEFAULT_PATCH_HR_SHAPE: tuple[int, int, int] = (48, 48, 48)
 # Must match valid 9-1-5 shrink in SRCNN3DPatch (+1 so output has >=1 voxel).
@@ -142,7 +150,7 @@ def _config_from_dict(raw: dict[str, Any]) -> SRConfig:
     if "manifest_path" in kwargs:
         kwargs["manifest_path"] = Path(kwargs["manifest_path"])
     if "run_root" in kwargs:
-        kwargs["run_root"] = Path(kwargs["run_root"])
+        kwargs["run_root"] = resolve_run_root(kwargs["run_root"])
     if "output_patch_shape" in kwargs:
         kwargs["output_patch_shape"] = tuple(kwargs["output_patch_shape"])
     if "patch_hr_shape" in kwargs:
@@ -154,7 +162,7 @@ def _config_from_dict(raw: dict[str, Any]) -> SRConfig:
 
 def _validate_loss_kwargs(config: SRConfig) -> None:
     """Range-check keys in ``loss_kwargs`` for parameterised objectives."""
-    from src.sr.losses import merge_dual_domain_kwargs, merge_ffl_kwargs
+    from sr.losses import merge_dual_domain_kwargs, merge_ffl_kwargs
 
     raw = config.loss_kwargs
     if raw is not None and not isinstance(raw, dict):
@@ -190,9 +198,9 @@ def validate(config: SRConfig) -> None:
     Performs registry lookups via late imports to avoid a circular import
     chain (``models``/``losses``/``components`` all read ``SRConfig`` types).
     """
-    from src.sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
-    from src.sr.losses import loss_names_for_validation
-    from src.sr.models import MODEL_REGISTRY
+    from sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
+    from sr.losses import loss_names_for_validation
+    from sr.models import MODEL_REGISTRY
 
     if config.batch_size < 1:
         raise ValueError("batch_size must be >= 1")
@@ -263,7 +271,7 @@ def seed_everything(seed: int, deterministic: bool) -> None:
     """Seed Python/NumPy/torch and toggle deterministic backends.
 
     Calling this once in the main process is enough; DataLoader workers
-    are seeded separately via ``worker_init_fn`` in ``src.sr.data``.
+    are seeded separately via ``worker_init_fn`` in ``sr.data``.
     """
     random.seed(seed)
     np.random.seed(seed)

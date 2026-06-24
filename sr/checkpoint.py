@@ -11,7 +11,7 @@ Effects:
 Influences:
     Resume correctness depends on which fields are captured. RNG state
     covers Python/NumPy/torch CPU/torch CUDA; DataLoader worker order is
-    still bound to ``seed + worker_id`` (see ``src.sr.data``).
+    still bound to ``seed + worker_id`` (see ``sr.data``).
 How to change safely:
     Add new fields to ``EpochState`` and ``_state_to_payload``/
     ``_payload_to_state`` together. Never silently drop a field from the

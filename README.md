@@ -7,12 +7,12 @@ We're training three models that take "imperfect" fMRI scans and produce cleaner
 2. **Spatial SR model** — low-res (3mm) → high-res (1.5mm)
 3. **Temporal SR model** — interpolate a missing volume from neighbors
 
-This repo contains the **data pipeline** (`src/data`) and a **spatial SR trainer** (`src/sr`): LR brain volumes → HR super-resolution with `srcnn3d` or `rcan3d`. Denoising and temporal SR are dataset-ready; training stacks for those are not included here yet.
+This repo contains the **data pipeline** (`data/`) and a **spatial SR trainer** (`sr/`): LR brain volumes → HR super-resolution with `srcnn3d` or `rcan3d`. Denoising and temporal SR are dataset-ready; training stacks for those are not included here yet.
 
 ## What's in this repo
 
 ```
-src/data/
+data/
   build.py                # Wrapper: runs manifest + metadata in one go
   manifest.py             # Walk BIDS tree, parse filenames, build a JSON manifest
   compute_metadata.py     # Compute brain mask + norm_ref + tSNR per run
@@ -23,12 +23,13 @@ src/data/
   datasets.py             # PyTorch Dataset classes (Denoising/SpatialSR/TemporalSR)
   degradation_spatial.py  # k-space truncation for spatial SR (Option A)
 
-src/sr/
-  run.py          # CLI: train, eval, infer
-  training.py     # masked MSE / SSIM metrics, checkpoints, TensorBoard
-  data.py         # train/val DataLoaders (subject split, SpatialSRDataset)
-  model.py        # SRCNN3D, RCAN3D registry
+sr/
+  cli.py          # CLI: train, eval, infer, debug (`python -m sr`)
+  train.py        # training loop, checkpoints, TensorBoard
+  data.py         # train/val DataLoaders (sample split, SpatialSRDataset)
+  models.py       # SRCNN3D, RCAN3D registry
   config.py       # defaults and validation
+  runs/           # checkpoints (not committed)
 
 tests/
   test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
@@ -59,7 +60,7 @@ next to the masks.
 Single command that runs both data-prep stages in order:
 
 ```
-python -m src.data.build \
+python -m data.build \
     --bids-root /srv/fMRI-data \
     --out-dir <out> \
     --mask-method auto
@@ -97,11 +98,11 @@ If you want to inspect the manifest before committing to the slow metadata
 step, or only redo one stage:
 
 ```
-python -m src.data.manifest \
+python -m data.manifest \
     --bids-root /srv/fMRI-data \
     --out <out>/manifest.json
 
-python -m src.data.compute_metadata \
+python -m data.compute_metadata \
     --manifest <out>/manifest.json \
     --derivatives-dir <out> \
     --mask-method auto
@@ -109,35 +110,26 @@ python -m src.data.compute_metadata \
 
 `build.py` just calls these two in order.
 
-### Spatial SR training (CLI, `src/sr`)
+### Spatial SR training (CLI, `sr/`)
 
-With an enriched `manifest.json` (from `compute_metadata`) and masks on disk, you can train and evaluate **3mm → 1.5mm** spatial super-resolution from the repo root. Training uses **mask-weighted MSE** on HR voxels; validation logs **masked MSE, PSNR, and local 3D SSIM**. Checkpoints and TensorBoard logs go under `src/sr/runs/<model_name>/<timestamp>/` (`config.json`, `split.json`, `metrics_summary.json`, `best.pt`, `final.pt`, etc.).
-
-**Train/val split:** the default split needs **at least two subjects** in the manifest (subjects are shuffled with `train_split`). For a single-subject manifest, configure explicit subject lists in code via `DEFAULT_CONFIG` / a small script, or extend the CLI when you add more subjects.
+With an enriched `manifest.json` (from `compute_metadata`) and masks on disk, you can train and evaluate **3mm → 1.5mm** spatial super-resolution from the repo root. Training uses **mask-weighted MSE** on HR voxels; validation logs **masked MSE, PSNR, and local 3D SSIM**. Checkpoints and TensorBoard logs go under `sr/runs/<model_name>/<timestamp>/` (`config.json`, `split.json`, `metrics.json`, `epochs/best.pt`, etc.).
 
 ```bash
 # Train (example)
-python -m src.sr.run train --manifest-path ./manifest.json --model-name srcnn3d
-python -m src.sr.run train --manifest-path ./manifest.json --model-name rcan3d --epochs 20 --batch-size 4
+python -m sr train --model-name srcnn3d
+python -m sr train --model-name rcan3d --epochs 20 --batch-size 4
 
-# Evaluate on the held-out val split; writes eval_report.json in cwd unless overridden
-python -m src.sr.run eval \
-  --manifest-path ./manifest.json \
-  --checkpoint-path ./src/sr/runs/srcnn3d/<timestamp>/best.pt
-python -m src.sr.run eval \
-  --manifest-path ./manifest.json \
-  --checkpoint-path ./src/sr/runs/srcnn3d/<timestamp>/best.pt \
-  --eval-report ./runs/eval_val.json
+# Evaluate on the held-out val split
+python -m sr eval \
+  --checkpoint sr/runs/srcnn3d/<timestamp>/epochs/best.pt
 
-# Single-sample inference + optional numpy export
-python -m src.sr.run infer \
-  --manifest-path ./manifest.json \
-  --checkpoint-path ./src/sr/runs/srcnn3d/<timestamp>/best.pt \
-  --inference-index 0 \
-  --save-output-npy ./pred_hr.npy
+# Single-sample inference + optional PNG export
+python -m sr infer \
+  --checkpoint sr/runs/srcnn3d/<timestamp>/epochs/best.pt \
+  --sample-index 0
 ```
 
-Useful flags: `--device cpu|cuda`, `--train-split`, `--output-shape D H W`, `--lr`, `--seed`, `--run-root`. Full module reference: [src/sr/README.md](src/sr/README.md).
+Useful flags: `--manifest-path`, `--train-split`, `--loss-name`, `--run-root`, `--resume-dir`. Full module reference: [sr/README.md](sr/README.md).
 
 ### Using the data in your training code
 
@@ -152,8 +144,8 @@ dict; the keys differ slightly per task — see below.
 #### Spatial SR — `SpatialSRDataset`
 
 ```python
-from src.data.datasets import SpatialSRDataset
-from src.data.degradation_spatial import make_spatial_degradation
+from data.datasets import SpatialSRDataset
+from data.degradation_spatial import make_spatial_degradation
 from torch.utils.data import DataLoader
 
 degrade = make_spatial_degradation(source_voxel_mm=1.5, target_voxel_mm=3.0)
@@ -205,7 +197,7 @@ for batch in train_loader:
 #### Denoising — `DenoisingDataset`
 
 ```python
-from src.data.datasets import DenoisingDataset
+from data.datasets import DenoisingDataset
 from torch.utils.data import DataLoader
 
 # You decide what counts as "noisy". Pass a function that takes a clean
@@ -253,7 +245,7 @@ No `degrade_fn` here. The sampler skips a timepoint and gives you its two
 neighbors as input — that's the degradation.
 
 ```python
-from src.data.datasets import TemporalSRDataset
+from data.datasets import TemporalSRDataset
 from torch.utils.data import DataLoader
 
 train_ds = TemporalSRDataset(

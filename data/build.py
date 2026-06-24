@@ -1,17 +1,17 @@
 """Run the full data preparation pipeline: manifest build + metadata compute.
 
 This is a convenience wrapper that runs both stages in order. The two stages
-also exist as standalone commands (`src.data.manifest` and
-`src.data.compute_metadata`) if you want to run them separately — useful when
+also exist as standalone commands (`data.manifest` and
+`data.compute_metadata`) if you want to run them separately — useful when
 debugging or when you only need to redo one stage.
 
 Usage:
-    python -m src.data.build \\
+    python -m data.build \\
         --bids-root /path/to/ibc_raw \\
         --out-dir /path/to/derivatives
 
     # Override expected z (default 93 — drops the IBC z=84 ses-00/01 anomaly)
-    python -m src.data.build \\
+    python -m data.build \\
         --bids-root /path/to/ibc_raw \\
         --out-dir /path/to/derivatives \\
         --target-z 93

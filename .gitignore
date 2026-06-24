@@ -213,10 +213,8 @@ __marimo__/
 # Flake8
 .flake8
 
-data/
-
 manifest.json
 
-# Primarily added for src/sr/runs (can be changed if needed)
-src/*/runs/*
+# Primarily added for sr/runs (can be changed if needed)
+sr/runs/*
 

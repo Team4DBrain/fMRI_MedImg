@@ -6,7 +6,7 @@ NIfTI headers (not data). Produces a JSON manifest with one entry per run.
 Does NOT compute brain masks or metadata — that's compute_metadata.py's job.
 
 Run from the command line:
-    python -m src.data.manifest --bids-root /path/to/ibc_raw --out manifest.json
+    python -m data.manifest --bids-root /path/to/ibc_raw --out manifest.json
 
 By default, only runs whose native z dimension equals --require-z (default 93)
 are kept; non-conforming runs are logged and dropped. This screens out the IBC

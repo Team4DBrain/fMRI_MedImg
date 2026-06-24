@@ -16,7 +16,7 @@ Pipeline shape:
   - target_z is fixed at the manifest's require_z. Mismatch is a hard error.
 
 Run from the command line:
-    python -m src.data.compute_metadata --manifest manifest.json \
+    python -m data.compute_metadata --manifest manifest.json \
         --derivatives-dir /path/to/derivatives
 
 Idempotent: if a mask already exists with the right shape AND norm_ref/tSNR are

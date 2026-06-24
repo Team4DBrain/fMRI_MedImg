@@ -1,10 +1,10 @@
-"""Command-line entry point. ``python -m src.sr <command> ...``.
+"""Command-line entry point. ``python -m sr <command> ...``.
 
 Purpose:
     Convert CLI flags into an ``SRConfig`` (or load one from disk) and
     dispatch to ``train``, ``evaluate`` or ``infer_one``. Every flag has
     a default sourced from ``SRConfig`` so a fresh user can start with
-    ``python -m src.sr train`` alone.
+    ``python -m sr train`` alone.
 Effects:
     For ``train``: creates a new run directory or resumes an existing one.
     For ``eval``: prints validation metrics, optionally writes a report.
@@ -27,9 +27,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from src.sr.config import SRConfig
-from src.sr.debug import add_debug_arguments, run_debug
-from src.sr.infer import (
+from sr.config import SRConfig
+from sr.debug import add_debug_arguments, run_debug
+from sr.infer import (
     evaluate,
     format_sample_table,
     infer_one,
@@ -38,10 +38,10 @@ from src.sr.infer import (
     make_slice_figure,
     select_sample,
 )
-from src.sr.losses import loss_names_for_validation
-from src.sr.models import MODEL_REGISTRY
-from src.sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
-from src.sr.train import train
+from sr.losses import loss_names_for_validation
+from sr.models import MODEL_REGISTRY
+from sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
+from sr.train import train
 
 
 # Build a "default config" sentinel once so resume-mode can detect when the
@@ -228,7 +228,7 @@ def _add_infer_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m src.sr",
+        prog="python -m sr",
         description="Spatial super-resolution CLI (train / eval / infer / debug).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -362,8 +362,8 @@ def _run_infer(args: argparse.Namespace) -> None:
         manifest = args.manifest_path
         if manifest is None:
             # Honor the checkpoint's saved manifest when no override is given.
-            from src.sr.checkpoint import run_dir_for_checkpoint
-            from src.sr.config import from_json as _from_json
+            from sr.checkpoint import run_dir_for_checkpoint
+            from sr.config import from_json as _from_json
 
             run_dir = run_dir_for_checkpoint(args.checkpoint)
             manifest = _from_json(run_dir / "config.json").manifest_path
@@ -385,8 +385,8 @@ def _run_infer(args: argparse.Namespace) -> None:
 
     manifest = args.manifest_path
     if manifest is None:
-        from src.sr.checkpoint import run_dir_for_checkpoint
-        from src.sr.config import from_json as _from_json
+        from sr.checkpoint import run_dir_for_checkpoint
+        from sr.config import from_json as _from_json
 
         run_dir = run_dir_for_checkpoint(args.checkpoint)
         manifest = _from_json(run_dir / "config.json").manifest_path

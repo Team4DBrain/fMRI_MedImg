@@ -26,12 +26,12 @@ from typing import Any
 import numpy as np
 import torch
 
-from src.sr.checkpoint import load_epoch, run_dir_for_checkpoint
-from src.sr.config import SRConfig, auto_device, from_json
-from src.sr.data import build_loaders, build_spatial_sr_dataset, resolve_dataset_sample
-from src.sr.metrics import average_metric_dicts, compute_full_metrics, volume_intensity_stats
-from src.sr.models import build_model
-from src.sr.forward import model_forward
+from sr.checkpoint import load_epoch, run_dir_for_checkpoint
+from sr.config import SRConfig, auto_device, from_json
+from sr.data import build_loaders, build_spatial_sr_dataset, resolve_dataset_sample
+from sr.metrics import average_metric_dicts, compute_full_metrics, volume_intensity_stats
+from sr.models import build_model
+from sr.forward import model_forward
 
 
 AXIS_TO_INDEX: dict[str, int] = {"sagittal": 0, "coronal": 1, "axial": 2}

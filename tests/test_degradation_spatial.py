@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.data.degradation_spatial import (
+from data.degradation_spatial import (
     downsample_mask_to_lr,
     kspace_downsample_3d,
     make_spatial_degradation,

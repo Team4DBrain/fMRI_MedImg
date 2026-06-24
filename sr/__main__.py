@@ -1,4 +1,4 @@
-"""Entry point so users can run the SR CLI as ``python -m src.sr``.
+"""Entry point so users can run the SR CLI as ``python -m sr``.
 
 Why this file exists:
     Python looks for ``<package>/__main__.py`` when invoked with ``python -m``.
@@ -6,7 +6,7 @@ Why this file exists:
     without going through the module-execution path.
 """
 
-from src.sr.cli import main
+from sr.cli import main
 
 if __name__ == "__main__":
     main()

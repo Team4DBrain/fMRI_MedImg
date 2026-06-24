@@ -6,13 +6,13 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
-from src.sr.config import SRConfig, validate
-from src.sr.data import build_loaders, resolve_sample_split
-from src.sr.forward import model_forward
-from src.sr.metrics import compute_full_metrics
-from src.sr.models import SRCNN3D_PATCH_RECEPTIVE_SHRINK, SRCNN3DPatch
-from src.sr.patch_data import PatchTrainingDataset, hr_to_lr_crop
-from src.sr.shape_utils import align_pred_target_mask, center_crop_spatial
+from sr.config import SRConfig, validate
+from sr.data import build_loaders, resolve_sample_split
+from sr.forward import model_forward
+from sr.metrics import compute_full_metrics
+from sr.models import SRCNN3D_PATCH_RECEPTIVE_SHRINK, SRCNN3DPatch
+from sr.patch_data import PatchTrainingDataset, hr_to_lr_crop
+from sr.shape_utils import align_pred_target_mask, center_crop_spatial
 
 
 class _FakeVolumeDataset(Dataset):
@@ -111,8 +111,8 @@ def test_model_forward_patch_uses_target_shape():
 
 def test_build_loaders_patch_train_full_val(synthetic_pipeline):
     """Train loader expands patches; val loader keeps one sample per volume."""
-    from src.data.datasets import SpatialSRDataset
-    from src.data.degradation_spatial import make_spatial_degradation
+    from data.datasets import SpatialSRDataset
+    from data.degradation_spatial import make_spatial_degradation
 
     manifest_path, _ = synthetic_pipeline
     patch_shape = (16, 16, 13)

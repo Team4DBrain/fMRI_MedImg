@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.data.padding import (
+from data.padding import (
     center_pad_mask,
     center_pad_volume,
     compute_pad_widths,

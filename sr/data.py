@@ -27,10 +27,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from src.data.datasets import SpatialSRDataset
-from src.data.degradation_spatial import make_spatial_degradation
-from src.sr.config import SRConfig
-from src.sr.patch_data import PatchTrainingDataset
+from data.datasets import SpatialSRDataset
+from data.degradation_spatial import make_spatial_degradation
+from sr.config import SRConfig
+from sr.patch_data import PatchTrainingDataset
 
 
 def build_spatial_sr_dataset(

@@ -11,7 +11,7 @@ import nibabel as nib
 import numpy as np
 import pytest
 
-from src.data.reader import VolumeReader, clear_reader_cache, get_reader
+from data.reader import VolumeReader, clear_reader_cache, get_reader
 
 
 @pytest.fixture
