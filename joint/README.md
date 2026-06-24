@@ -1,5 +1,45 @@
 # fMRI Restoration Project — Data Pipeline
 
+## Quick start — run a whole scan through the trained joint model
+
+`src/joint/puppetmaster.py` is the one-call way to use the finished **joint denoise +
+super-resolution model**. Hand it one whole BOLD run; get back the model's denoised, upscaled
+reconstruction as a 4D NIfTI that drops straight in over the original (same grid, affine, and TR).
+
+From the repo root on the VM, with the env active:
+
+```bash
+cd ~/CAI-MedImg && source /srv/venvs/team4dbrain/setup_env.sh
+```
+
+```python
+# Python
+from src.joint.puppetmaster import run
+run("/srv/fMRI-data/sub-13_ses-16_task-PainMovie_dir-pa_bold.nii.gz",
+    "/tmp/sub-13_painmovie_pred.nii.gz")
+```
+
+```bash
+# CLI — identical work
+python -m src.joint.puppetmaster \
+    -i /srv/fMRI-data/sub-13_ses-16_task-PainMovie_dir-pa_bold.nii.gz \
+    -o /tmp/sub-13_painmovie_pred.nii.gz
+```
+
+Per timepoint it runs normalize → degrade (k-space truncation + Rician noise) → forward pass →
+denormalize, then stacks along time. Worth knowing:
+
+- **Input must be one of the 46 runs in `manifest_big`** — that's where the run's `norm_ref` is
+  looked up. For a brand-new run, add it to a manifest (with a mask + `norm_ref`) first.
+- It's a **round-trip on full-res IBC data** — `model(degrade(HR))` — a demo/eval of the model, not
+  an enhancer for arbitrary external low-res scans (the model only knows our synthetic degradation).
+- Noise is **fresh random each call**, so reruns aren't bit-identical (mimics real thermal noise).
+
+Hardcoded shared locations (on the VM): weights `/srv/venvs/team4dbrain/joint_model/best.pt`
+(the 4M model), manifest `/srv/venvs/team4dbrain/derivatives/manifest_big.json`.
+
+---
+
 CS/AI student project on the [IBC dataset](https://openneuro.org/datasets/ds002685/versions/2.0.0).
 We're training models that take "imperfect" fMRI scans and produce cleaner versions:
 
@@ -37,6 +77,7 @@ src/joint/                # Joint denoise + spatial-SR model (consumes JointData
   splits.py               # Subject-disjoint split + dataset/loader construction
   run.py                  # Training launcher CLI (python -m src.joint.run)
   eval.py                 # Checkpoint evaluator CLI (python -m src.joint.eval)
+  puppetmaster.py         # Inference endpoint: whole run -> degrade -> model -> stacked 4D (python -m src.joint.puppetmaster)
 
 tests/
   test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
