@@ -16,7 +16,7 @@ sr/
 ├── data.py         # build_loaders, dataset split, seeded workers
 ├── checkpoint.py   # EpochState save/load, find_latest_epoch
 ├── train.py        # train(config, resume_dir=None)
-├── infer.py        # evaluate, infer_one, list_samples, make_slice_figure
+├── infer.py        # evaluate, infer_one, infer_nifti, previews, list_samples
 ├── debug.py        # masks, prediction error, baseline comparison, loss curve
 └── cli.py + __main__.py   # `python -m sr ...`
 ```
@@ -53,13 +53,15 @@ sr/runs/<model_name>/<timestamp>/
 └── epochs/
     ├── epoch_001.pt    # full EpochState (model + opt + sched + RNG + history)
     ├── epoch_002.pt
+    ├── best.pt         # rolling best val checkpoint (written when val improves)
     └── ...
 ```
 
 `epoch_NNN.pt` is fully self-contained: kill the process at any point and
 resume from the last successfully-written epoch with zero information
-loss. There is no `final.pt`, no `best.pt`, no `metrics_summary.json` —
-those are user-side compositions.
+loss. `epochs/best.pt` is updated whenever validation improves; NIfTI
+infer with `--model-name` resolves to `best.pt` when present, otherwise
+the latest `epoch_NNN.pt`.
 
 ## CLI
 
@@ -97,17 +99,64 @@ python -m sr eval \
 
 # List samples available in the manifest used by a checkpoint
 python -m sr infer \
-  --checkpoint sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+  --checkpoint sr/runs/srcnn3d/<run>/epochs/best.pt \
   --list-samples
 
-# Infer one sample, save a slice figure
+# Infer one manifest sample (metrics + optional figures)
 python -m sr infer \
-  --checkpoint sr/runs/srcnn3d/<run>/epochs/epoch_010.pt \
+  --checkpoint sr/runs/srcnn3d/<run>/epochs/best.pt \
   --subject 01 --session 00 --task ArchiStandard --direction ap --t 12 \
+  --preview \
   --axis coronal --slice-level 0.4 \
-  --save-png ./infer_preview.png \
+  --save-png ./infer_single_slice.png \
   --save-npy ./infer_pred.npy
 
+# Infer a standalone NIfTI (3D or 4D; writes HR volume)
+python -m sr infer \
+  --input /path/to/vol.nii.gz \
+  --model-name rcan3d \
+  --run-root output \
+  --output ~/results/ \
+  --preview
+
+# Same, but pin a specific checkpoint instead of auto-resolving best/latest
+python -m sr infer \
+  --input /path/to/vol.nii.gz \
+  --checkpoint output/rcan3d/<run>/epochs/best.pt \
+  --output ~/results/vol_sr.nii.gz \
+  --preview --slice-level 0.5
+```
+
+### `infer` modes
+
+| Mode | Required flags | Writes |
+|------|----------------|--------|
+| NIfTI file | `--input`, `--model-name` (or `--checkpoint`) | `<stem>_sr.nii.gz` (HR `128×128×93` by default) |
+| Manifest sample | `--checkpoint`, at least one selector (`--subject`, …) | Metrics to stdout; optional PNG/NPY |
+| List samples | `--checkpoint` or `--manifest-path`, `--list-samples` | Sample table only |
+
+**NIfTI input behaviour**
+
+- HR-native volumes (`128×128×93` at 1.5 mm) are k-space degraded to LR
+  internally, then super-resolved. LR-native volumes (`64×64×46` at 3 mm)
+  are fed to the model directly.
+- `--output` may be a file path or a directory (e.g. `~/results/`); a
+  directory receives `<input_stem>_sr.nii.gz`.
+- 4D inputs use timepoint `t=0` unless `--t` is set.
+
+**Preview (`--preview`)**
+
+- Off by default. Pass `--preview` to write a multi-axis PNG montage
+  (axial / coronal / sagittal).
+- Rows: Input (LR), SR output, and Ground truth (HR) when GT is available
+  (HR NIfTI inputs and manifest samples). LR-only NIfTI inputs omit the GT
+  row.
+- NIfTI infer writes `<output_stem>.png` beside the output NIfTI.
+  Manifest infer writes `infer_<subject>_<session>_<task>_<direction>_t<t>.png`
+  in the current directory.
+- `--save-png` adds an extra single-axis figure (`--axis`, `--slice-level`).
+
+```bash
 # Debug: masks + degradation (no checkpoint)
 python -m sr debug \
   --subject 01 --session 03 --task HcpEmotion --direction ap --t 0 \
@@ -150,7 +199,7 @@ built-in trilinear upsampling baseline.
 - K-space magnitude diff when training with `kspace_mse` / `dual_domain_masked_mse`
 - Side-by-side error maps for `epoch_001.pt` vs `epoch_N.pt`
 - Error histograms in-mask vs out-of-mask
-- Multi-slice montage (several `--slice-level` values)
+- Multi-slice montage (`--preview`, or several `--slice-level` values with `--save-png`)
 - TensorBoard batch scalars under `run_dir/tb/`
 
 ## Resume contract

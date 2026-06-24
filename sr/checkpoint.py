@@ -257,6 +257,80 @@ def find_latest_epoch(run_dir: Path) -> Path | None:
     return files[-1] if files else None
 
 
+def list_run_dirs_for_model(model_name: str, run_root: Path) -> list[Path]:
+    """Return timestamped run directories for ``model_name``, oldest first."""
+    model_dir = Path(run_root) / model_name
+    if not model_dir.is_dir():
+        return []
+    return sorted(
+        candidate.resolve()
+        for candidate in model_dir.iterdir()
+        if candidate.is_dir() and (candidate / "config.json").is_file()
+    )
+
+
+def resolve_checkpoint_for_model(
+    model_name: str,
+    *,
+    run_root: Path | None = None,
+    run_dir: Path | None = None,
+    checkpoint: Path | None = None,
+) -> Path:
+    """Pick a checkpoint for ``model_name`` when the user did not pass one explicitly.
+
+    Resolution order for an explicit ``run_dir``: ``epochs/best.pt``, else the
+    latest ``epoch_NNN.pt``. Without ``run_dir``, use the newest run directory
+    under ``run_root/<model_name>/`` with the same checkpoint preference.
+    """
+    if checkpoint is not None:
+        ckpt = Path(checkpoint)
+        config_path = run_dir_for_checkpoint(ckpt) / "config.json"
+        from sr.config import from_json
+
+        saved_name = from_json(config_path).model_name
+        if saved_name != model_name:
+            raise ValueError(
+                f"--model-name {model_name!r} disagrees with checkpoint run "
+                f"config model_name={saved_name!r} ({config_path})."
+            )
+        return ckpt
+
+    candidate_runs: list[Path]
+    if run_dir is not None:
+        candidate_runs = [Path(run_dir).resolve()]
+    else:
+        from sr.config import SRConfig
+
+        root = Path(run_root or SRConfig().run_root)
+        candidate_runs = list_run_dirs_for_model(model_name, root)
+        if not candidate_runs:
+            raise FileNotFoundError(
+                f"No training runs found for model {model_name!r} under {root / model_name}. "
+                "Train first or pass --checkpoint / --run-dir."
+            )
+        candidate_runs = [candidate_runs[-1]]
+
+    run_path = candidate_runs[0]
+    from sr.config import from_json
+
+    saved_name = from_json(run_path / "config.json").model_name
+    if saved_name != model_name:
+        raise ValueError(
+            f"--model-name {model_name!r} disagrees with {run_path}/config.json "
+            f"model_name={saved_name!r}."
+        )
+
+    best = best_epoch_path(run_path)
+    if best.is_file():
+        return best
+    latest = find_latest_epoch(run_path)
+    if latest is not None:
+        return latest
+    raise FileNotFoundError(
+        f"No checkpoints found under {run_path / 'epochs'}. Train or resume first."
+    )
+
+
 def write_metrics_json(run_dir: Path, history: list[dict[str, Any]]) -> Path:
     """Write the metric history as plain JSON, atomically.
 

@@ -26,12 +26,22 @@ from typing import Any
 import numpy as np
 import torch
 
-from sr.checkpoint import load_epoch, run_dir_for_checkpoint
+from sr.checkpoint import (
+    load_epoch,
+    resolve_checkpoint_for_model,
+    run_dir_for_checkpoint,
+)
 from sr.config import SRConfig, auto_device, from_json
 from sr.data import build_loaders, build_spatial_sr_dataset, resolve_dataset_sample
 from sr.metrics import average_metric_dicts, compute_full_metrics, volume_intensity_stats
 from sr.models import build_model
 from sr.forward import model_forward
+
+from data.degradation_spatial import (
+    make_spatial_degradation,
+    voxel_size_to_target_shape,
+)
+from data.normalize import denormalize, normalize
 
 
 AXIS_TO_INDEX: dict[str, int] = {"sagittal": 0, "coronal": 1, "axial": 2}
@@ -247,13 +257,292 @@ def evaluate(
 
 
 # ---------------------------------------------------------------------------
+# NIfTI file inference (no manifest)
+# ---------------------------------------------------------------------------
+
+
+def default_sr_output_path(input_path: Path) -> Path:
+    """Return ``<input_stem>_sr.nii.gz`` next to the source file."""
+    input_path = Path(input_path)
+    name = input_path.name
+    if name.endswith(".nii.gz"):
+        stem = name[: -len(".nii.gz")]
+    elif name.endswith(".nii"):
+        stem = name[: -len(".nii")]
+    else:
+        stem = input_path.stem
+    return input_path.with_name(f"{stem}_sr.nii.gz")
+
+
+def _looks_like_nifti_file(path: Path) -> bool:
+    name = path.name
+    return name.endswith(".nii.gz") or name.endswith(".nii")
+
+
+def resolve_sr_output_path(input_path: Path, output_path: Path | None) -> Path:
+    """Resolve ``--output`` to a concrete ``.nii.gz`` file path.
+
+    If ``output_path`` is omitted, writes beside the input. If it is an existing
+    directory, a trailing slash path, or a path without a NIfTI extension, the
+    default ``<stem>_sr.nii.gz`` name is placed inside that directory.
+    """
+    default_file = default_sr_output_path(input_path)
+    if output_path is None:
+        return default_file
+
+    out = Path(output_path).expanduser()
+    if out.exists() and out.is_dir():
+        return out / default_file.name
+    if str(output_path).rstrip().endswith(("/", "\\")):
+        out.mkdir(parents=True, exist_ok=True)
+        return out / default_file.name
+    if not _looks_like_nifti_file(out):
+        out.mkdir(parents=True, exist_ok=True)
+        return out / default_file.name
+    return out
+
+
+def default_sr_preview_path(nifti_output_path: Path) -> Path:
+    """Return a PNG preview path beside the SR NIfTI (``.nii.gz`` -> ``.png``)."""
+    path = Path(nifti_output_path)
+    name = path.name
+    if name.endswith(".nii.gz"):
+        return path.with_name(name[: -len(".nii.gz")] + ".png")
+    if name.endswith(".nii"):
+        return path.with_name(name[: -len(".nii")] + ".png")
+    return path.with_suffix(".png")
+
+
+def _lr_shape_for_config(config: SRConfig) -> tuple[int, int, int]:
+    return voxel_size_to_target_shape(
+        tuple(config.output_patch_shape),
+        config.source_voxel_mm,
+        config.target_voxel_mm,
+    )
+
+
+def _prepare_lr_volume(
+    volume: np.ndarray,
+    norm_ref: float,
+    config: SRConfig,
+) -> tuple[np.ndarray, str, np.ndarray | None]:
+    """Normalize and optionally degrade a NIfTI volume to model LR input.
+
+    Skips k-space degradation when the file is already at the simulated LR
+    grid (e.g. 64×64×46 for 3 mm). Applies degradation when it matches the
+    configured HR grid (e.g. 128×128×93 at 1.5 mm).
+
+    Returns ``(lr, mode, ground_truth)`` where ``ground_truth`` is the
+    normalized HR volume when degradation was applied, else ``None``.
+    """
+    shape = tuple(int(s) for s in volume.shape)
+    hr_shape = tuple(int(s) for s in config.output_patch_shape)
+    lr_shape = _lr_shape_for_config(config)
+
+    if shape == lr_shape:
+        return normalize(volume, norm_ref), "lr_native", None
+
+    if shape == hr_shape:
+        degrade = make_spatial_degradation(
+            source_voxel_mm=config.source_voxel_mm,
+            target_voxel_mm=config.target_voxel_mm,
+        )
+        hr_clean = normalize(volume, norm_ref)
+        return degrade(hr_clean), "hr_degraded", hr_clean
+
+    raise ValueError(
+        f"Input shape {shape} is neither the expected HR shape {hr_shape} "
+        f"nor the LR shape {lr_shape} for "
+        f"{config.source_voxel_mm}mm -> {config.target_voxel_mm}mm. "
+        "Pass native-resolution HR (degraded internally) or pre-downsampled LR."
+    )
+
+
+def _load_nifti_volume(path: Path, *, t: int | None) -> tuple[np.ndarray, "nibabel.Nifti1Image"]:
+    import nibabel as nib
+
+    img = nib.load(str(path))
+    data = np.asarray(img.dataobj, dtype=np.float32)
+    if data.ndim == 3:
+        volume = data
+    elif data.ndim == 4:
+        time_idx = 0 if t is None else int(t)
+        if not 0 <= time_idx < data.shape[3]:
+            raise ValueError(
+                f"t={time_idx} out of range [0, {data.shape[3]}) for 4D input {path}"
+            )
+        volume = data[..., time_idx]
+        if t is None:
+            print(f"[infer] 4D input: using timepoint t=0 of {data.shape[3]} (pass --t to override)")
+    else:
+        raise ValueError(f"Expected 3D or 4D NIfTI, got shape {data.shape} from {path}")
+    return np.ascontiguousarray(volume), img
+
+
+def _norm_ref_from_volume(volume: np.ndarray, percentile: float = 98.0) -> float:
+    """Scalar normalization for standalone NIfTI (no brain mask on disk)."""
+    ref = float(np.percentile(volume, percentile))
+    if ref <= 0:
+        raise ValueError(
+            "Could not derive a positive norm_ref from the input volume; "
+            "check that the NIfTI contains brain BOLD data."
+        )
+    return ref
+
+
+@torch.no_grad()
+def infer_nifti(
+    checkpoint_path: Path,
+    input_path: Path,
+    output_path: Path | None = None,
+    *,
+    t: int | None = None,
+    norm_ref: float | None = None,
+    write_preview: bool = False,
+    preview_path: Path | None = None,
+    slice_level: float = 0.5,
+) -> dict[str, Any]:
+    """Super-resolve one 3D/4D NIfTI and write ``<stem>_sr.nii.gz`` by default.
+
+    HR-native files are k-space degraded to LR before inference unless the
+    volume is already at the LR grid. LR-native files are fed to the model
+    directly.
+    """
+    input_path = Path(input_path)
+    output_path = resolve_sr_output_path(input_path, output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    model, config, device = _load_model_from_checkpoint(checkpoint_path)
+    volume, img = _load_nifti_volume(input_path, t=t)
+
+    ref = float(norm_ref) if norm_ref is not None else _norm_ref_from_volume(volume)
+    lr, input_mode, ground_truth = _prepare_lr_volume(volume, ref, config)
+    if input_mode == "lr_native":
+        print("[infer] input already at LR resolution; skipping degradation")
+    else:
+        print("[infer] applied k-space degradation (HR -> LR)")
+
+    inputs = torch.from_numpy(lr).unsqueeze(0).unsqueeze(0).to(device)
+    target_shape = tuple(config.output_patch_shape)
+    target = torch.zeros(
+        (1, 1, *target_shape), device=device, dtype=inputs.dtype
+    )
+    pred = model_forward(model, inputs, target, config.model_name)
+    prediction_np = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
+    prediction_phys = denormalize(prediction_np, ref)
+
+    import nibabel as nib
+
+    out_img = nib.Nifti1Image(
+        prediction_phys.astype(np.float32),
+        affine=img.affine,
+        header=img.header.copy(),
+    )
+    nib.save(out_img, str(output_path))
+    print(f"[infer] wrote NIfTI -> {output_path}")
+
+    preview_path: Path | None = None
+    if write_preview:
+        preview_path = Path(preview_path) if preview_path is not None else default_sr_preview_path(
+            output_path
+        )
+        make_sr_output_preview(
+            input_lr=lr,
+            prediction_vol=prediction_np,
+            ground_truth_vol=ground_truth,
+            output_path=preview_path,
+            slice_level=slice_level,
+        )
+
+    volume_stats = {
+        "input": volume_intensity_stats(lr),
+        "prediction": volume_intensity_stats(prediction_np),
+    }
+    if ground_truth is not None:
+        volume_stats["target"] = volume_intensity_stats(ground_truth)
+    print(f"[infer] checkpoint   = {checkpoint_path}")
+    print(f"[infer] input        = {input_path}")
+    print(f"[infer] output       = {output_path}")
+    print(f"[infer] norm_ref     = {ref:.6f}")
+    print(f"[infer] input.shape  = {lr.shape}")
+    print(f"[infer] output.shape = {prediction_np.shape}")
+    print_volume_intensity_stats(volume_stats)
+
+    return {
+        "input_path": str(input_path),
+        "output_path": str(output_path),
+        "norm_ref": ref,
+        "input_lr": lr,
+        "ground_truth": ground_truth,
+        "prediction": prediction_np,
+        "prediction_physical": prediction_phys,
+        "volume_stats": volume_stats,
+        "preview_path": str(preview_path) if preview_path is not None else None,
+    }
+
+
+def make_sr_output_preview(
+    input_lr: np.ndarray,
+    prediction_vol: np.ndarray,
+    *,
+    ground_truth_vol: np.ndarray | None = None,
+    output_path: Path,
+    slice_level: float = 0.5,
+) -> None:
+    """Save an LR / SR / (optional GT) montage across axial, coronal, sagittal."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError(
+            "matplotlib is required to visualize SR output. Install matplotlib "
+            "or omit --preview."
+        ) from exc
+
+    if not 0.0 <= slice_level <= 1.0:
+        raise ValueError(f"slice_level must be in [0, 1], got {slice_level}")
+
+    axes_names = ("axial", "coronal", "sagittal")
+    rows: list[tuple[str, np.ndarray]] = [
+        ("Input (LR)", input_lr),
+        ("SR output", prediction_vol),
+    ]
+    if ground_truth_vol is not None:
+        rows.append(("Ground truth (HR)", ground_truth_vol))
+
+    fig, axes = plt.subplots(len(rows), 3, figsize=(15, 4.5 * len(rows)))
+    if len(rows) == 1:
+        axes = np.array([axes])
+    for row_idx, (row_label, volume) in enumerate(rows):
+        for col, axis in enumerate(axes_names):
+            slice_img, slice_idx = extract_slice(
+                volume, axis=axis, slice_level=slice_level
+            )
+            axes[row_idx, col].imshow(slice_img, cmap="gray", origin="lower")
+            axes[row_idx, col].set_title(f"{row_label}\n{axis} z={slice_idx}")
+            axes[row_idx, col].axis("off")
+    fig.suptitle("Spatial super-resolution preview", fontsize=14)
+    fig.tight_layout()
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[infer] wrote preview -> {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Single-sample inference
 # ---------------------------------------------------------------------------
 
 
 def print_volume_intensity_stats(volume_stats: dict[str, dict[str, float]]) -> None:
-    """Print min/max/mean for input, prediction, and target (from ``infer_one``)."""
+    """Print min/max/mean for volumes present in ``volume_stats``."""
     for label in ("input", "prediction", "target"):
+        if label not in volume_stats:
+            continue
         s = volume_stats[label]
         print(
             f"[infer] {label:>12}  min={s['min']:.6f}  "
@@ -321,14 +610,14 @@ def infer_one(
 def make_slice_figure(
     input_vol: np.ndarray,
     prediction_vol: np.ndarray,
-    target_vol: np.ndarray,
+    target_vol: np.ndarray | None = None,
     *,
     axis: str,
     slice_level: float,
     output_path: Path | None = None,
     show: bool = False,
 ) -> None:
-    """Render input/prediction/target side-by-side at one slice.
+    """Render input/prediction/(optional target) side-by-side at one slice.
 
     ``slice_level`` is a relative position in [0, 1]; 0.5 means center.
     Each panel's title states the axis, the resolved slice index and the
@@ -350,12 +639,17 @@ def make_slice_figure(
     if not 0.0 <= slice_level <= 1.0:
         raise ValueError(f"slice_level must be in [0, 1], got {slice_level}")
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-    panels = [
+    fig, axes = plt.subplots(1, 3 if target_vol is not None else 2, figsize=(14, 5))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+    panels: list[tuple[str, tuple[np.ndarray, int]]] = [
         ("Input (LR)", extract_slice(input_vol, axis=axis, slice_level=slice_level)),
         ("Prediction", extract_slice(prediction_vol, axis=axis, slice_level=slice_level)),
-        ("Target (HR)", extract_slice(target_vol, axis=axis, slice_level=slice_level)),
     ]
+    if target_vol is not None:
+        panels.append(
+            ("Target (HR)", extract_slice(target_vol, axis=axis, slice_level=slice_level))
+        )
     for ax, (title, (image, idx)) in zip(axes, panels):
         ax.imshow(image, cmap="gray")
         ax.set_title(f"{title}\n{axis} slice={idx} (level={slice_level:.2f})")

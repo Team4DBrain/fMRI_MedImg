@@ -30,14 +30,19 @@ from typing import Any
 from sr.config import SRConfig
 from sr.debug import add_debug_arguments, run_debug
 from sr.infer import (
+    default_sr_output_path,
     evaluate,
     format_sample_table,
+    infer_nifti,
     infer_one,
+    make_sr_output_preview,
     print_volume_intensity_stats,
     list_samples,
     make_slice_figure,
+    resolve_sr_output_path,
     select_sample,
 )
+from sr.checkpoint import resolve_checkpoint_for_model
 from sr.losses import loss_names_for_validation
 from sr.models import MODEL_REGISTRY
 from sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
@@ -193,7 +198,42 @@ def _add_eval_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_infer_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=None,
+        help="3D/4D NIfTI to super-resolve (writes HR NIfTI; requires --model-name).",
+    )
+    parser.add_argument(
+        "--model-name",
+        choices=sorted(MODEL_REGISTRY),
+        default=None,
+        help="Model to use with --input (resolves checkpoint from latest run).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output NIfTI path (default: <input_stem>_sr.nii.gz beside the input).",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Training run directory when resolving --model-name (default: latest run).",
+    )
+    parser.add_argument(
+        "--run-root",
+        type=Path,
+        default=None,
+        help="Run root scanned for --model-name when --run-dir is omitted.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Checkpoint .pt (required for manifest infer; optional with --input).",
+    )
     parser.add_argument(
         "--manifest-path",
         type=Path,
@@ -220,9 +260,19 @@ def _add_infer_arguments(parser: argparse.ArgumentParser) -> None:
         "--slice-level",
         type=float,
         default=0.5,
-        help="Relative slice level in [0, 1] (default: 0.5 = center).",
+        help="Relative slice level in [0, 1] for preview PNGs (default: 0.5 = center).",
     )
-    parser.add_argument("--save-png", type=Path, default=None)
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Write an LR vs SR preview PNG (with ground truth when available).",
+    )
+    parser.add_argument(
+        "--save-png",
+        type=Path,
+        default=None,
+        help="Optional extra single-slice figure path (in addition to --preview).",
+    )
     parser.add_argument("--save-npy", type=Path, default=None)
 
 
@@ -358,10 +408,50 @@ def _run_eval(args: argparse.Namespace) -> None:
 
 
 def _run_infer(args: argparse.Namespace) -> None:
+    if args.input is not None:
+        if args.model_name is None:
+            raise SystemExit("--model-name is required when using --input.")
+        checkpoint = resolve_checkpoint_for_model(
+            args.model_name,
+            run_root=args.run_root,
+            run_dir=args.run_dir,
+            checkpoint=args.checkpoint,
+        )
+        output_path = resolve_sr_output_path(args.input, args.output)
+        result = infer_nifti(
+            checkpoint,
+            args.input,
+            output_path,
+            t=args.t,
+            write_preview=args.preview,
+            slice_level=args.slice_level,
+        )
+        if args.save_png is not None:
+            make_slice_figure(
+                input_vol=result["input_lr"],
+                prediction_vol=result["prediction"],
+                target_vol=result.get("ground_truth"),
+                axis=args.axis,
+                slice_level=args.slice_level,
+                output_path=args.save_png,
+                show=False,
+            )
+        if args.save_npy is not None:
+            import numpy as np
+
+            path = Path(args.save_npy)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(path, result["prediction"])
+            print(f"[infer] wrote prediction npy -> {path}")
+        return
+
     if args.list_samples:
+        if args.checkpoint is None and args.manifest_path is None:
+            raise SystemExit(
+                "--list-samples requires --checkpoint or --manifest-path."
+            )
         manifest = args.manifest_path
         if manifest is None:
-            # Honor the checkpoint's saved manifest when no override is given.
             from sr.checkpoint import run_dir_for_checkpoint
             from sr.config import from_json as _from_json
 
@@ -369,6 +459,11 @@ def _run_infer(args: argparse.Namespace) -> None:
             manifest = _from_json(run_dir / "config.json").manifest_path
         print(format_sample_table(list_samples(manifest)))
         return
+
+    if args.checkpoint is None:
+        raise SystemExit(
+            "Manifest-based infer requires --checkpoint (or use --input for NIfTI files)."
+        )
 
     selection_filters = {
         "subject": args.subject,
@@ -379,7 +474,7 @@ def _run_infer(args: argparse.Namespace) -> None:
     }
     if all(value is None for value in selection_filters.values()):
         raise SystemExit(
-            "infer requires either --list-samples or at least one selector "
+            "infer requires --input, --list-samples, or at least one selector "
             "(--subject/--session/--task/--direction/--t). See --help."
         )
 
@@ -408,6 +503,19 @@ def _run_infer(args: argparse.Namespace) -> None:
     print_volume_intensity_stats(result["volume_stats"])
     for key in sorted(result["metrics"]):
         print(f"[infer] {key:>14} = {result['metrics'][key]:.6f}")
+
+    if args.preview:
+        preview_name = (
+            f"infer_{chosen['subject']}_{chosen['session']}_{chosen['task']}_"
+            f"{chosen['direction']}_t{chosen['t']}.png"
+        )
+        make_sr_output_preview(
+            input_lr=result["input"],
+            prediction_vol=result["prediction"],
+            ground_truth_vol=result["target"],
+            output_path=Path(preview_name),
+            slice_level=args.slice_level,
+        )
 
     if args.save_npy is not None:
         import numpy as np

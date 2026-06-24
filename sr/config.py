@@ -83,10 +83,10 @@ class SRConfig:
     train_split: float = 0.8
 
     # Training loop
-    batch_size: int = 15
+    batch_size: int = 5
     num_epochs: int = 20
     num_workers: int = 0
-    log_interval: int = 10
+    log_interval: int = 1
 
     # Loss + optimizer + scheduler (modular: swap names, kwargs stay JSON)
     loss_name: str = "masked_mse"
