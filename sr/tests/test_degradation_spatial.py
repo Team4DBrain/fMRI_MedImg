@@ -3,9 +3,9 @@ sanity test for kspace_downsample_3d — this is the regression test for the
 "LR is 64x too bright" bug.
 
 Run:
-    python -m pytest tests/test_degradation_spatial.py -v
+    python -m pytest sr/tests/test_degradation_spatial.py -v
 or simply:
-    python tests/test_degradation_spatial.py
+    python sr/tests/test_degradation_spatial.py
 """
 
 from __future__ import annotations

@@ -55,6 +55,7 @@ sr/
   models.py       # SRCNN3D, RCAN3D registry
   config.py       # defaults and validation
   runs/           # checkpoints (not committed)
+  tests/          # Unit and integration tests (data pipeline + SR)
 
 data_interpolation/
   main.py         # Entry point for temporal interpolation
@@ -69,16 +70,9 @@ Denoising/
   apply_denoise_3d.py     # Inference on NIfTI volumes
   model.py                # 3D U-Net architecture
   mri_unet.pth            # Pretrained weights
-
-tests/
-  test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
-  test_degradation_spatial.py   # Unit tests incl. k-space scale regression
-  test_reader.py                # VolumeReader and per-process cache
-  test_datasets_synthetic.py    # End-to-end Datasets on a synthetic BIDS layout
-  sr/                           # SR models, metrics, reproducibility helpers
 ```
 
-Run the tests with `python -m pytest tests/ -v`.
+Run the tests with `python -m pytest sr/tests/ -v`.
 
 ## How it works
 
@@ -342,7 +336,7 @@ the group decides who's in which.
 - **k-space LR scale**: `kspace_downsample_3d` takes the real part of the IFFT
   (not magnitude — see the function's docstring for why) and scales by `M/N`
   (output size / input size) to preserve mean intensity. There's a regression
-  test for this in `tests/test_degradation_spatial.py`; if you touch the scale
+  test for this in `sr/tests/test_degradation_spatial.py`; if you touch the scale
   logic or the .real/.abs choice, run the tests.
 - **`indexed_gzip` is required** (pinned in `requirements.txt`). Without it,
   every random-access volume read decompresses the gzip stream from byte 0.
