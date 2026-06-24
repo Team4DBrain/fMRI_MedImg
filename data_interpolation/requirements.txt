@@ -1,0 +1,7 @@
+torch>=2.1
+numpy>=1.24
+nibabel>=5.0
+PyYAML>=6.0
+matplotlib>=3.7
+scipy>=1.10
+tqdm>=4.65

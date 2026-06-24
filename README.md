@@ -1,13 +1,38 @@
-# fMRI Restoration Project — Data Pipeline
+# CAI-MedImg — fMRI Restoration Project
 
-CS/AI student project on the [IBC dataset](https://openneuro.org/datasets/ds002685/versions/2.0.0).
+CAI-MedImg is a modular medical-imaging project for testing different fMRI
+processing pipelines and comparing which approach gives better results.
+
+Each team member develops one pipeline component in a separate subfolder. The
+components should expose a simple interface so they can be combined and tested
+against each other in the full project. The main goal is to run different
+pipeline choices, evaluate their outputs, and keep the best-performing methods
+for the final system.
+
+This work uses the [IBC dataset](https://openneuro.org/datasets/ds002685/versions/2.0.0).
 We're training three models that take "imperfect" fMRI scans and produce cleaner versions:
 
 1. **Denoising model** — noisy → clean, same resolution
 2. **Spatial SR model** — low-res (3mm) → high-res (1.5mm)
 3. **Temporal SR model** — interpolate a missing volume from neighbors
 
-This repo contains the **data pipeline** (`data/`) and a **spatial SR trainer** (`sr/`): LR brain volumes → HR super-resolution with `srcnn3d` or `rcan3d`. Denoising and temporal SR are dataset-ready; training stacks for those are not included here yet.
+This repo contains the **data pipeline** (`data/`), a **spatial SR trainer**
+(`sr/`), a **temporal interpolation module** (`data_interpolation/`), and a
+**denoising stack** (`Denoising/`). LR brain volumes → HR super-resolution
+uses `srcnn3d` or `rcan3d`. Denoising and temporal SR are dataset-ready in
+`data/`; `data_interpolation/` provides a standalone temporal-interpolation
+stack; `Denoising/` includes a trained U-Net and inference scripts.
+
+## Project modules
+
+| Module | Purpose |
+|--------|---------|
+| `data/` | BIDS manifest, brain masks, PyTorch datasets (denoising, spatial SR, temporal SR) |
+| `sr/` | Spatial super-resolution training/eval/infer CLI (`srcnn3d`, `rcan3d`) |
+| `data_interpolation/` | Temporal fMRI interpolation — takes a 4D BOLD NIfTI and generates a new file with interpolated time frames |
+| `Denoising/` | 3D U-Net denoising — training and inference on fMRI volumes |
+
+See [data_interpolation/README.md](data_interpolation/README.md) for setup and usage of the interpolation module.
 
 ## What's in this repo
 
@@ -30,6 +55,20 @@ sr/
   models.py       # SRCNN3D, RCAN3D registry
   config.py       # defaults and validation
   runs/           # checkpoints (not committed)
+
+data_interpolation/
+  main.py         # Entry point for temporal interpolation
+  train.py        # Training script
+  eval.py         # Evaluation script
+  src/            # Model, dataset, loss, inference utilities
+  configs/        # Default training config
+  notebooks/      # Quick tests and full training notebooks
+
+Denoising/
+  train.py                # U-Net training
+  apply_denoise_3d.py     # Inference on NIfTI volumes
+  model.py                # 3D U-Net architecture
+  mri_unet.pth            # Pretrained weights
 
 tests/
   test_cropping.py              # Z-bbox crop, affine update (covers the unused cropping.py)
