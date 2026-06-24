@@ -28,6 +28,11 @@ Naming convention for SRCNN-family variants:
                          skip and small-init head (~280k params). More
                          expressive than ``srcnn3d`` but also more
                          expensive per voxel.
+    ``srcnn3d_deep_xl`` - configurable width/depth extension of
+                         ``srcnn3d_deep`` for full-volume 3D MRI
+                         (``128x128x93`` at batch 2--3). Defaults
+                         ``n_feats=80``, ``n_feat_layers=5`` (~785k
+                         params, comparable to a mid-size ``RCAN3D``).
     Future variants should follow ``srcnn3d_<distinctive-feature>`` (e.g.
     ``srcnn3d_attn``) so users can scan the registry without reading code.
 How to change safely:
@@ -188,6 +193,90 @@ class SRCNN3DDeep(nn.Module):
         return x_up + self.recon(h)
 
 
+class SRCNN3DDeepXL(nn.Module):
+    """Wide/deep SRCNN-3D for full-volume MRI at higher capacity than ``SRCNN3DDeep``.
+
+    Purpose:
+        Lift representational capacity when ``SRCNN3DDeep`` plateaus on
+        whole-brain volumes, without switching to the RCAN residual-group
+        design. Keeps the same trilinear baseline + global residual skip and
+        LeakyReLU(0.1) stack, but exposes width (``n_feats``) and extractor
+        depth (``n_feat_layers``) as constructor kwargs.
+    Effects:
+        Output shape always equals ``output_patch_shape``. ``forward`` returns
+        ``trilinear(x) + recon(features)`` with the same small-init head as
+        the other SRCNN-family models, so training still starts at the
+        trilinear baseline.
+    Influences:
+        Activation memory scales as ``batch * n_feats * D * H * W``. For the
+        default IBC grid ``(128, 128, 93)`` and ``batch_size=3``, ``n_feats=80``
+        uses ~1.5 GB per feature map (vs ~1.2 GB for ``SRCNN3DDeep`` at 64
+        channels and ~0.9 GB for ``RCAN3D`` at 48 channels). Defaults target
+        ~785k parameters -- near a successful ``RCAN3D`` run with
+        ``n_feats=48``, ``n_resgroups=2``, ``n_resblocks=3`` (~940k) while
+        staying inside the same VRAM envelope at ``batch_size=2--3``.
+        Widen ``n_feats`` first for expressiveness; add ``n_feat_layers`` when
+        you need a larger receptive field (each extra ``3^3`` layer adds 2
+        voxels of RF). If VRAM is tight, drop ``batch_size`` before shrinking
+        ``n_feats`` below 64.
+    How to change safely:
+        Register a new key if you change defaults in a breaking way. Tune
+        ``map_feats`` only when you want a narrower mapping bottleneck; when
+        omitted it is ``n_feats // 2``, matching the 64->32 ratio in
+        ``SRCNN3DDeep``.
+    """
+
+    def __init__(
+        self,
+        output_patch_shape: tuple[int, int, int],
+        n_feats: int = 80,
+        n_feat_layers: int = 5,
+        map_feats: int | None = None,
+    ) -> None:
+        super().__init__()
+        if n_feats < 16:
+            raise ValueError("n_feats must be >= 16")
+        if n_feat_layers < 2:
+            raise ValueError("n_feat_layers must be >= 2")
+        self.output_patch_shape = tuple(output_patch_shape)
+        self.n_feats = n_feats
+        self.n_feat_layers = n_feat_layers
+        map_ch = map_feats if map_feats is not None else n_feats // 2
+        if map_ch < 1:
+            raise ValueError("map_feats must be >= 1")
+
+        feature_layers: list[nn.Module] = [
+            nn.Conv3d(1, n_feats, kernel_size=3, padding=1)
+        ]
+        for _ in range(n_feat_layers - 1):
+            feature_layers.append(
+                nn.Conv3d(n_feats, n_feats, kernel_size=3, padding=1)
+            )
+        self.feature = nn.Sequential(*feature_layers)
+        self.map = nn.Conv3d(n_feats, map_ch, kernel_size=3, padding=1)
+        self.recon = nn.Conv3d(map_ch, 1, kernel_size=5, padding=2)
+
+        for module in self.modules():
+            if isinstance(module, nn.Conv3d):
+                nn.init.kaiming_normal_(
+                    module.weight, a=0.1, mode="fan_in", nonlinearity="leaky_relu"
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.normal_(self.recon.weight, mean=0.0, std=0.001)
+        nn.init.zeros_(self.recon.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_up = F.interpolate(
+            x, size=self.output_patch_shape, mode="trilinear", align_corners=False
+        )
+        h = x_up
+        for layer in self.feature:
+            h = F.leaky_relu(layer(h), negative_slope=0.1)
+        h = F.leaky_relu(self.map(h), negative_slope=0.1)
+        return x_up + self.recon(h)
+
+
 # Valid 9-1-5 convolutions shrink each spatial dim by this many voxels.
 SRCNN3D_PATCH_RECEPTIVE_SHRINK = 12
 
@@ -335,6 +424,7 @@ MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "srcnn3d": SRCNN3D,
     "srcnn3d_patch": SRCNN3DPatch,
     "srcnn3d_deep": SRCNN3DDeep,
+    "srcnn3d_deep_xl": SRCNN3DDeepXL,
     "rcan3d": RCAN3D,
 }
 
