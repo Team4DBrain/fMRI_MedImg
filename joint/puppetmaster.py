@@ -8,12 +8,12 @@ NIfTI that is a voxel- and time-aligned drop-in for the input.
 Two ways to call it — identical work either way:
 
     # Python
-    from src.joint.puppetmaster import run
+    from joint.puppetmaster import run
     run("/srv/fMRI-data/sub-13_ses-16_task-PainMovie_dir-pa_bold.nii.gz",
         "/tmp/sub-13_painmovie_pred.nii.gz")
 
     # CLI
-    python -m src.joint.puppetmaster \
+    python -m joint.puppetmaster \
         --input  /srv/fMRI-data/sub-13_ses-16_task-PainMovie_dir-pa_bold.nii.gz \
         --output /tmp/sub-13_painmovie_pred.nii.gz
 
@@ -42,9 +42,9 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from src.data.degradation_noise import Compose, RicianNoise
-from src.data.degradation_spatial import make_spatial_degradation
-from src.data.reader import get_reader
+from data.degradation_noise import Compose, RicianNoise
+from data.degradation_spatial import make_spatial_degradation
+from data.reader import get_reader
 
 from .eval import load_checkpoint
 

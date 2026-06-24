@@ -2,14 +2,14 @@
 
 Example (subjects are placeholders — choose the held-out split on the VM)::
 
-    python -m src.joint.run \\
+    python -m joint.run \\
         --manifest /srv/venvs/team4dbrain/derivatives/manifest.json \\
         --profile vm --val 06 14 --test 07 13 \\
         --ckpt-dir runs/joint01
 
 Wires manifest + subject split -> JointDataset loaders -> train(). The test
 subjects are held out entirely here (never loaded); evaluate them afterwards with
-``python -m src.joint.eval``.
+``python -m joint.eval``.
 """
 from __future__ import annotations
 

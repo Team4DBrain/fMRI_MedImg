@@ -23,7 +23,7 @@ from pathlib import Path
 
 from torch.utils.data import DataLoader
 
-from src.data.datasets import JointDataset
+from data.datasets import JointDataset
 
 from .config import Config
 

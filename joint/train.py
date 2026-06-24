@@ -2,11 +2,11 @@
 
 Quick local code smoke (no data needed)::
 
-    python -m src.joint.train
+    python -m joint.train
 
 Add a real-data overfit sanity check (a few JointDataset volumes)::
 
-    python -m src.joint.train --manifest ../_local_derivatives/manifest.json
+    python -m joint.train --manifest ../_local_derivatives/manifest.json
 
 Real training is driven by ``train(cfg, train_loader, val_loader)`` — on the VM,
 build the subject-disjoint train/val loaders and call it. The overfit sanity
@@ -362,7 +362,7 @@ def _smoke():
 
     # (d) real-data overfit sanity (only if a manifest is given)
     if args.manifest:
-        from src.data.datasets import JointDataset
+        from data.datasets import JointDataset
         ds = JointDataset(
             args.manifest,
             source_voxel_mm=cfg.train.source_voxel_mm,
