@@ -42,6 +42,7 @@ from data.degradation_spatial import (
     voxel_size_to_target_shape,
 )
 from data.normalize import denormalize, normalize
+from data.reader import get_reader
 
 
 AXIS_TO_INDEX: dict[str, int] = {"sagittal": 0, "coronal": 1, "axial": 2}
@@ -358,6 +359,33 @@ def _prepare_lr_volume(
     )
 
 
+def _nifti_is_4d(path: Path) -> bool:
+    """Return True when ``path`` is a 4D NIfTI (header-only check)."""
+    import nibabel as nib
+
+    return len(nib.load(str(path)).shape) == 4
+
+
+def _write_nifti_output(
+    data: np.ndarray,
+    in_img: "nibabel.Nifti1Image",
+    output_path: Path,
+) -> None:
+    """Write a 3D/4D NIfTI drop-in with the input's affine, zooms, and TR."""
+    import nibabel as nib
+
+    out_img = nib.Nifti1Image(data.astype(np.float32), in_img.affine)
+    out_img.header.set_zooms(in_img.header.get_zooms())
+    try:
+        out_img.header.set_xyzt_units(*in_img.header.get_xyzt_units())
+    except Exception:
+        pass
+    out_img.header.set_data_dtype(np.float32)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(out_img, str(output_path))
+
+
 def _load_nifti_volume(path: Path, *, t: int | None) -> tuple[np.ndarray, "nibabel.Nifti1Image"]:
     import nibabel as nib
 
@@ -366,14 +394,17 @@ def _load_nifti_volume(path: Path, *, t: int | None) -> tuple[np.ndarray, "nibab
     if data.ndim == 3:
         volume = data
     elif data.ndim == 4:
-        time_idx = 0 if t is None else int(t)
+        if t is None:
+            raise ValueError(
+                f"4D input {path} requires --t for single-volume infer, or omit --t "
+                "to process the full run."
+            )
+        time_idx = int(t)
         if not 0 <= time_idx < data.shape[3]:
             raise ValueError(
                 f"t={time_idx} out of range [0, {data.shape[3]}) for 4D input {path}"
             )
         volume = data[..., time_idx]
-        if t is None:
-            print(f"[infer] 4D input: using timepoint t=0 of {data.shape[3]} (pass --t to override)")
     else:
         raise ValueError(f"Expected 3D or 4D NIfTI, got shape {data.shape} from {path}")
     return np.ascontiguousarray(volume), img
@@ -391,6 +422,120 @@ def _norm_ref_from_volume(volume: np.ndarray, percentile: float = 98.0) -> float
 
 
 @torch.no_grad()
+def _infer_nifti_4d_run(
+    model: torch.nn.Module,
+    config: SRConfig,
+    device: str,
+    input_path: Path,
+    output_path: Path,
+    *,
+    norm_ref: float | None = None,
+    write_preview: bool = False,
+    preview_path: Path | None = None,
+    slice_level: float = 0.5,
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    """Super-resolve every timepoint in a 4D HR BOLD run and stack the result."""
+    import nibabel as nib
+
+    reader = get_reader(input_path)
+    hr_shape = tuple(int(s) for s in config.output_patch_shape)
+    if reader.shape3d != hr_shape:
+        raise ValueError(
+            f"4D full-run infer expects HR spatial shape {hr_shape}, got "
+            f"{reader.shape3d}. LR-native 4D runs are not supported; pass --t "
+            "for single-volume infer on one timepoint."
+        )
+
+    T = reader.n_volumes
+    in_img = nib.load(str(input_path))
+    ref = (
+        float(norm_ref)
+        if norm_ref is not None
+        else _norm_ref_from_volume(reader.read_mean())
+    )
+
+    target_shape = tuple(config.output_patch_shape)
+    target = torch.zeros((1, 1, *target_shape), device=device, dtype=torch.float32)
+
+    X, Y, Z = hr_shape
+    out = np.zeros((X, Y, Z, T), dtype=np.float32)
+    preview_lr: np.ndarray | None = None
+    preview_pred: np.ndarray | None = None
+    preview_gt: np.ndarray | None = None
+    preview_t = T // 2 if write_preview else None
+
+    print(
+        f"[infer] 4D run: {T} volumes | norm_ref={ref:.6f} | "
+        f"device={device} | checkpoint={checkpoint_path.name}",
+        flush=True,
+    )
+    print("[infer] applied k-space degradation (HR -> LR) per timepoint")
+
+    for t_idx in range(T):
+        hr_vol = reader.read_volume(t_idx).astype(np.float32)
+        lr, _, ground_truth = _prepare_lr_volume(hr_vol, ref, config)
+        inputs = torch.from_numpy(lr).unsqueeze(0).unsqueeze(0).to(device)
+        pred = model_forward(model, inputs, target, config.model_name)
+        pred_np = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
+        out[..., t_idx] = denormalize(pred_np, ref)
+
+        if preview_t is not None and t_idx == preview_t:
+            preview_lr = lr
+            preview_pred = pred_np
+            preview_gt = ground_truth
+
+        if (t_idx + 1) % 50 == 0 or t_idx + 1 == T:
+            print(f"[infer]   {t_idx + 1}/{T}", flush=True)
+
+    _write_nifti_output(out, in_img, output_path)
+    print(f"[infer] wrote NIfTI -> {output_path}  shape={out.shape}")
+
+    preview_out: Path | None = None
+    if write_preview and preview_lr is not None and preview_pred is not None:
+        preview_out = (
+            Path(preview_path)
+            if preview_path is not None
+            else default_sr_preview_path(output_path)
+        )
+        make_sr_output_preview(
+            input_lr=preview_lr,
+            prediction_vol=preview_pred,
+            ground_truth_vol=preview_gt,
+            output_path=preview_out,
+            slice_level=slice_level,
+        )
+        if preview_t is not None:
+            print(f"[infer] preview from timepoint t={preview_t}")
+
+    volume_stats = {
+        "input": volume_intensity_stats(preview_lr if preview_lr is not None else lr),
+        "prediction": volume_intensity_stats(
+            preview_pred if preview_pred is not None else pred_np
+        ),
+    }
+    if preview_gt is not None:
+        volume_stats["target"] = volume_intensity_stats(preview_gt)
+
+    print(f"[infer] checkpoint   = {checkpoint_path}")
+    print(f"[infer] input        = {input_path}")
+    print(f"[infer] output       = {output_path}")
+    print(f"[infer] norm_ref     = {ref:.6f}")
+    print(f"[infer] output.shape = {out.shape}")
+    print_volume_intensity_stats(volume_stats)
+
+    return {
+        "input_path": str(input_path),
+        "output_path": str(output_path),
+        "norm_ref": ref,
+        "prediction_physical": out,
+        "volume_stats": volume_stats,
+        "preview_path": str(preview_out) if preview_out is not None else None,
+        "n_volumes": T,
+    }
+
+
+@torch.no_grad()
 def infer_nifti(
     checkpoint_path: Path,
     input_path: Path,
@@ -402,17 +547,31 @@ def infer_nifti(
     preview_path: Path | None = None,
     slice_level: float = 0.5,
 ) -> dict[str, Any]:
-    """Super-resolve one 3D/4D NIfTI and write ``<stem>_sr.nii.gz`` by default.
+    """Super-resolve a 3D/4D NIfTI and write ``<stem>_sr.nii.gz`` by default.
 
-    HR-native files are k-space degraded to LR before inference unless the
-    volume is already at the LR grid. LR-native files are fed to the model
-    directly.
+    3D inputs and ``4D + --t`` produce one HR volume. A 4D input with no
+    ``--t`` processes every timepoint and writes a stacked 4D drop-in.
     """
     input_path = Path(input_path)
     output_path = resolve_sr_output_path(input_path, output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     model, config, device = _load_model_from_checkpoint(checkpoint_path)
+
+    if t is None and _nifti_is_4d(input_path):
+        return _infer_nifti_4d_run(
+            model,
+            config,
+            device,
+            input_path,
+            output_path,
+            norm_ref=norm_ref,
+            write_preview=write_preview,
+            preview_path=preview_path,
+            slice_level=slice_level,
+            checkpoint_path=Path(checkpoint_path),
+        )
+
     volume, img = _load_nifti_volume(input_path, t=t)
 
     ref = float(norm_ref) if norm_ref is not None else _norm_ref_from_volume(volume)
@@ -431,14 +590,7 @@ def infer_nifti(
     prediction_np = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
     prediction_phys = denormalize(prediction_np, ref)
 
-    import nibabel as nib
-
-    out_img = nib.Nifti1Image(
-        prediction_phys.astype(np.float32),
-        affine=img.affine,
-        header=img.header.copy(),
-    )
-    nib.save(out_img, str(output_path))
+    _write_nifti_output(prediction_phys, img, output_path)
     print(f"[infer] wrote NIfTI -> {output_path}")
 
     preview_path: Path | None = None

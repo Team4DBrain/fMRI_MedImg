@@ -111,7 +111,22 @@ python -m sr infer \
   --save-png ./infer_single_slice.png \
   --save-npy ./infer_pred.npy
 
-# Infer a standalone NIfTI (3D or 4D; writes HR volume)
+# Infer a whole 4D BOLD run (all timepoints → stacked 4D output)
+python -m sr infer \
+  --input /path/to/sub-01_bold.nii.gz \
+  --model-name rcan3d \
+  --run-root output \
+  --output ~/results/sub-01_bold_sr.nii.gz
+
+# Infer one timepoint from a 4D file (3D output)
+python -m sr infer \
+  --input /path/to/sub-01_bold.nii.gz \
+  --checkpoint output/rcan3d/<run>/epochs/best.pt \
+  --t 12 \
+  --output ~/results/sub-01_t012_sr.nii.gz \
+  --preview
+
+# Infer a standalone 3D volume
 python -m sr infer \
   --input /path/to/vol.nii.gz \
   --model-name rcan3d \
@@ -119,7 +134,7 @@ python -m sr infer \
   --output ~/results/ \
   --preview
 
-# Same, but pin a specific checkpoint instead of auto-resolving best/latest
+# Pin a specific checkpoint instead of auto-resolving best/latest
 python -m sr infer \
   --input /path/to/vol.nii.gz \
   --checkpoint output/rcan3d/<run>/epochs/best.pt \
@@ -131,7 +146,9 @@ python -m sr infer \
 
 | Mode | Required flags | Writes |
 |------|----------------|--------|
-| NIfTI file | `--input`, `--model-name` (or `--checkpoint`) | `<stem>_sr.nii.gz` (HR `128×128×93` by default) |
+| NIfTI file (3D) | `--input`, `--model-name` (or `--checkpoint`) | `<stem>_sr.nii.gz` (HR `128×128×93` by default) |
+| NIfTI file (4D, no `--t`) | `--input`, `--model-name` (or `--checkpoint`) | Full 4D stack `(128,128,93,T)` — time-aligned drop-in |
+| NIfTI file (4D + `--t`) | `--input`, `--t`, checkpoint | One HR volume (3D) for that timepoint |
 | Manifest sample | `--checkpoint`, at least one selector (`--subject`, …) | Metrics to stdout; optional PNG/NPY |
 | List samples | `--checkpoint` or `--manifest-path`, `--list-samples` | Sample table only |
 
@@ -139,10 +156,14 @@ python -m sr infer \
 
 - HR-native volumes (`128×128×93` at 1.5 mm) are k-space degraded to LR
   internally, then super-resolved. LR-native volumes (`64×64×46` at 3 mm)
-  are fed to the model directly.
+  are fed to the model directly on single-volume infer; full 4D runs require HR input.
 - `--output` may be a file path or a directory (e.g. `~/results/`); a
   directory receives `<input_stem>_sr.nii.gz`.
-- 4D inputs use timepoint `t=0` unless `--t` is set.
+- **4D default:** omit `--t` to process every timepoint (lazy per-volume reads,
+  progress every 50 volumes). Pass `--t N` for one timepoint only.
+- Compared to `joint/puppetmaster.py`: SR uses spatial degradation only (no
+  Rician noise), resolves checkpoints flexibly, and derives `norm_ref` from
+  the run's temporal mean unless overridden.
 
 **Preview (`--preview`)**
 
@@ -151,6 +172,7 @@ python -m sr infer \
 - Rows: Input (LR), SR output, and Ground truth (HR) when GT is available
   (HR NIfTI inputs and manifest samples). LR-only NIfTI inputs omit the GT
   row.
+- Full 4D runs: preview is rendered from the **middle timepoint** only.
 - NIfTI infer writes `<output_stem>.png` beside the output NIfTI.
   Manifest infer writes `infer_<subject>_<session>_<task>_<direction>_t<t>.png`
   in the current directory.

@@ -202,7 +202,7 @@ def _add_infer_arguments(parser: argparse.ArgumentParser) -> None:
         "--input",
         type=Path,
         default=None,
-        help="3D/4D NIfTI to super-resolve (writes HR NIfTI; requires --model-name).",
+        help="3D/4D NIfTI to super-resolve. 4D without --t processes the full run.",
     )
     parser.add_argument(
         "--model-name",
@@ -249,7 +249,12 @@ def _add_infer_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", default=None)
     parser.add_argument("--task", default=None)
     parser.add_argument("--direction", choices=["ap", "pa"], default=None)
-    parser.add_argument("--t", type=int, default=None, help="Timepoint index in the run.")
+    parser.add_argument(
+        "--t",
+        type=int,
+        default=None,
+        help="Timepoint index. For 4D NIfTI: omit to process all volumes; set to infer one slice only.",
+    )
     parser.add_argument(
         "--axis",
         choices=["axial", "coronal", "sagittal"],
@@ -265,7 +270,8 @@ def _add_infer_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--preview",
         action="store_true",
-        help="Write an LR vs SR preview PNG (with ground truth when available).",
+        help="Write an LR vs SR preview PNG (with ground truth when available). "
+        "For full 4D runs, preview uses the middle timepoint only.",
     )
     parser.add_argument(
         "--save-png",
