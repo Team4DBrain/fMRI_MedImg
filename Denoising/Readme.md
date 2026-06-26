@@ -1,34 +1,35 @@
-# MRI fMRI/DWI Denoising Module (All-in-One Pipeline)
+# MRI fMRI/DWI Denoising Module (Inference Endpoint)
 
-Dieses GitHub-Modul bietet eine vollautomatische, speicherschonende **Noise2Noise Deep-Learning-Pipeline** zur hocheffizienten Rauschunterdrückung in funktionellen und strukturellen MRT-Daten (fMRI/DWI).
+Dieses GitHub-Modul bietet eine vollautomatische, speicherschonende **Deep-Learning-Pipeline (Inferenz)** zur hocheffizienten Rauschunterdrückung in funktionellen und strukturellen MRT-Daten (fMRI/DWI).
 
-Das gesamte Modul ist in einer einzigen Datei (`pipeline_api.py`) gekapselt. Es akzeptiert Gehirn-Scans in jeglicher Auflösung, standardisiert sie vollautomatisch im Arbeitsspeicher auf eine feste Ziel-Dimension von **128 x 128 x 93 Voxeln**, trainiert ein integriertes U-Net und exportiert die bereinigten Daten fehlerfrei.
+Das Modul (`pipeline_api.py`) ist als reiner Produktions-Endpoint konzipiert. Es lädt ein vortrainiertes U-Net und wendet es auf den gesamten 4D-Scan an, wobei die **originale native Scanner-Auflösung und Geometrie (Affine/Header)** zu 100 % erhalten bleiben.
 
 ---
 
 ## 🚀 Kern-Features
-1. **Zentrales All-in-One Modul:** Die gesamte Architektur (U-Net), Logik (Noise2Noise) und Vorverarbeitung liegen in einer einzigen Datei. Die Gruppe muss nichts konfigurieren oder verschieben.
-2. **Automatische Standardisierung:** Egal welche Dimensionen die Rohdaten eurer Gruppenmitglieder haben (z. B. `228x228x132`), das Modul interpoliert sie vor dem Training exakt auf **128 x 128 x 93** für Input und Output.
-3. **RAM-Protection (Lazy Loading):** Durch selektiven Zugriff auf das erste 3D-Volumen via `dataobj` wird verhindert, dass Python bei großen 4D-Dateien abstürzt (Speicherbedarf sinkt von ~10.2 GB auf wenige Megabyte).
-4. **Anker-Training:** Das Modell wechselt im Trainings-Loop intelligent zwischen einer festen mittleren anatomischen Schicht (Schicht 65) und Zufallsschichten, um strukturelle Geometrien perfekt zu erhalten.
+1. **Reiner Inference-Endpoint:** Strikt vom Training getrennt. Das Modul lädt fertige Gewichte (`.pth`) und entrauscht die Daten verlässlich, ohne jemals in einen Trainings-Loop zu fallen oder Modellgewichte zu überschreiben.
+2. **Native Auflösung & Geometrie:** Kein künstliches Resizing (Stauchen/Strecken). Das 2D CNN passt sich dynamisch an jede Eingangsgröße an. Die Ausgangsdatei übernimmt exakt die Dimensionen sowie die originalen Header- und Affine-Metadaten des Scanners.
+3. **Full 4D-Processing & RAM-Protection:** Verarbeitet iterativ *jeden einzelnen Zeitpunkt (T)* des 4D-Scans. Durch schichtweises Laden der Volumes (`dataobj`) und die Deaktivierung der Gradientenberechnung (`torch.no_grad()`) bleibt der Arbeitsspeicher-Bedarf selbst bei riesigen Dateien minimal.
+4. **Per-Volume Normalisierung:** Nutzt das 99. Perzentil zur dynamischen Kontrastanpassung jedes Volumens, um Helligkeitsschwankungen über die Zeitachse perfekt auszugleichen.
 
 ---
 
 ## 📦 Voraussetzungen (Requirements)
 
-Stellt sicher, dass die benötigten Pakete in eurer Python-Umgebung (oder `.venv`) installiert sind:
+Stellt sicher, dass die benötigten Pakete in eurer Python-Umgebung installiert sind:
 ```bash
-pip install nibabel scipy torch numpy
+pip install nibabel torch numpy
 
 
 
-from pipeline_api import run_mri_denoising_pipeline
 
-# Startet das Laden, Resizing, Training und den sauberen Export mit einem Befehl:
-output_file = run_mri_denoising_pipeline(
-    input_path_run1='data/raw/sub-01_ses-0p9mm_dir-AP_run-01_part-mag_dwi.nii.gz',
-    input_path_run2='data/raw/sub-01_ses-0p9mm_dir-AP_run-02_part-mag_dwi.nii.gz', # Optional
-    output_path='sub-01_denoised_full.nii.gz'
+from pipeline_api import denoise_run
+
+# Startet die Inference-Pipeline auf den rohen Scanner-Daten:
+output_file = denoise_run(
+    input_path='data/raw/sub-01_ses-00_task-ArchiSocial_dir-ap_bold.nii.gz',
+    output_path='sub-01_denoised_full.nii.gz',
+    weights_path='mri_unet_robust.pth' # Die vorab trainierte Modell-Datei
 )
 
-print(f"Das bereinigte 128x128x93 Volumen wurde gespeichert unter: {output_file}")
+print(f"Das bereinigte 4D-MRT wurde erfolgreich gespeichert unter: {output_file}")
