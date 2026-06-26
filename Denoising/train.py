@@ -1,117 +1,214 @@
+import os
+import glob
 import nibabel as nib
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from scipy.ndimage import zoom, gaussian_filter
+from scipy.ndimage import zoom
 from model import SimpleUNet
 
-def train_and_export():
-    path1 = 'data/raw/sub-01_ses-0p9mm_dir-AP_run-01_part-mag_dwi.nii.gz'
-    path2 = 'data/raw/sub-01_ses-0p9mm_dir-AP_run-02_part-mag_dwi.nii.gz'
-    output_name = 'sub-01_denoised_full.nii.gz'
+def train_on_real_pairs():
+    print("\n=========================================================================")
+    print("🧠 STARTE ECHTES NOISE2NOISE PAAR-TRAINING (AP <-> PA & Run1 <-> Run2)")
+    print("=========================================================================")
 
-    print("--- Phase 1: Daten speicherschonend laden und auf 128x128x93 skalieren ---")
-    img1_obj = nib.load(path1)
-    img2_obj = nib.load(path2)
+    # --- Kugelsicherer Pfad & Speicherort ---
+    data_dir = r"C:\Users\sugie\mri_project\data\raw"
+    weights_path = 'mri_unet_robust.pth'
+
+    print(f"-> Suche Daten im festen Ordner: {data_dir}")
+
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"Der Ordner {data_dir} existiert nicht. Bitte Pfad prüfen!")
+
+    # --- Phase 1: Perfekte Paare finden ---
+    all_files = glob.glob(os.path.join(data_dir, '*.nii*'))
+    print(f"-> HABE {len(all_files)} MRT-DATEIEN IN DIESEM ORDNER GEFUNDEN.")
+
+    if len(all_files) == 0:
+        print("\n⚠️ STOPP: Der Ordner ist komplett leer! Die Bilder liegen wahrscheinlich woanders.")
+        return
+        
+    training_pairs = []
     
-    # SPEICHER-RETTUNG: Lade NUR das erste 3D-Volumen (Index 0) direkt von der Festplatte,
-    # anstatt die vollen 10.2 GB in den RAM zu knallen!
-    print("Lese erstes 3D-Volumen der Rohdaten...")
-    if len(img1_obj.shape) == 4:
-        data1 = np.asanyarray(img1_obj.dataobj[:, :, :, 0])
-        data2 = np.asanyarray(img2_obj.dataobj[:, :, :, 0])
+    for file1 in all_files:
+        file2 = None
+        f1_lower = file1.lower()
+        
+        if 'dir-ap' in f1_lower:
+            target_name = os.path.basename(file1).lower().replace('dir-ap', 'dir-pa')
+            for possible_match in all_files:
+                if os.path.basename(possible_match).lower() == target_name:
+                    file2 = possible_match
+                    break
+                    
+        elif 'run-01' in f1_lower:
+            target_name = os.path.basename(file1).lower().replace('run-01', 'run-02')
+            for possible_match in all_files:
+                if os.path.basename(possible_match).lower() == target_name:
+                    file2 = possible_match
+                    break
+
+        if file2:
+            pair = (file1, file2)
+            if pair not in training_pairs and (file2, file1) not in training_pairs:
+                training_pairs.append(pair)
+
+    print(f"-> {len(training_pairs)} perfekte MRT-Paare für das Training gefunden!")
+
+    # --- Phase 2: Modell und Hardware vorbereiten ---
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SimpleUNet().to(device)
+
+    if os.path.exists(weights_path):
+        print(f"\n-> 📂 Lade existierende Gewichte: '{weights_path}'")
+        model.load_state_dict(torch.load(weights_path, map_location=device))
     else:
-        data1 = img1_obj.get_fdata()
-        data2 = img2_obj.get_fdata()
-    
-    print(f"Originale Dimensionen des extrahierten Volumens: {data1.shape}")
-    
-    # Hier erzwingen wir deine Wunsch-Größe für Input & Output
-    target_shape = (128, 128, 93)
-    zoom_factors = [t / o for t, o in zip(target_shape, data1.shape)]
-    
-    print("Skaliere Daten im Zwischenspeicher auf 128 x 128 x 93...")
-    volume1_resized = zoom(data1, zoom_factors, order=1)
-    volume2_resized = zoom(data2, zoom_factors, order=1)
-    
-    height, width, depth = volume1_resized.shape
-    print(f"Ziel-Dimensionen erreicht: {height}x{width}x{depth}")
-    
-    # Zufallsbereich für die Slices (angepasst an die neue Tiefe 93)
-    z_min, z_max = 30, 80 
+        print("\n-> 🆕 Keine Basis gefunden. Lerne von Null an.")
 
-    model = SimpleUNet()
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)
+    optimizer = optim.Adam(model.parameters(), lr=0.0003)
     criterion = nn.L1Loss()
+    model.train()
 
-    def norm_func(x, p_val=None): 
-        if p_val is None:
-            p_val = np.percentile(x, 99)
+    def norm_func(x): 
+        p_val = np.percentile(x, 99)
         if p_val == 0: p_val = 1
         return np.clip(x, 0, p_val) / p_val, p_val
 
-    print("\n--- Phase 2: Stabiles Training (Anker + Zufall) ---")
-    for epoch in range(1001):
-        optimizer.zero_grad()
-        
-        if epoch % 2 == 0:
-            z_active = 65 
-        else:
-            z_active = np.random.randint(z_min, z_max)
-            
-        raw_a = volume1_resized[:, :, z_active]
-        raw_b = volume2_resized[:, :, z_active]
+    target_shape = (128, 128, 93)
 
-        n_a, _ = norm_func(raw_a)
-        n_b, _ = norm_func(raw_b)
-        
-        input_tensor = torch.from_numpy(n_a).unsqueeze(0).unsqueeze(0).float()
-        target_tensor = torch.from_numpy(n_b).unsqueeze(0).unsqueeze(0).float()
-
-        output = model(input_tensor)
-        
-        if np.random.rand() > 0.5:
-            output = torch.flip(output, [2])
-            target_tensor = torch.flip(target_tensor, [2])
-            
-        loss = criterion(output, target_tensor)
-        loss.backward()
-        optimizer.step()
-        
-        if epoch % 101 == 0:
-            mode = "ANKER" if epoch % 2 == 0 else "ZUFALL"
-            print(f"Epoche {epoch} | {mode} | Schicht {z_active} | Loss: {loss.item():.6f}")
-
-    torch.save(model.state_dict(), 'mri_unet_robust.pth')
-
-    print("\n--- Phase 3: Export mit Globaler Normalisierung ---")
-    denoised_3d = np.zeros((height, width, depth), dtype=np.float32)
+    # =================================================================================
+    # TEIL 1: DER GARANTIERTE 100% DURCHLAUF (Sequenziell)
+    # =================================================================================
+    print("\n🚀 TEIL 1 STARTE: Sequenzieller Durchlauf (Jedes Volume wird exakt 1x gelernt)")
     
-    anchor_data = volume1_resized[:, :, 65]
-    _, global_p = norm_func(anchor_data)
-
-    model.eval()
-    with torch.no_grad():
-        for z in range(depth):
-            curr_slice = volume1_resized[:, :, z]
-            s_norm, _ = norm_func(curr_slice, p_val=global_p)
+    for pair_idx, (path_a, path_b) in enumerate(training_pairs):
+        name_a = os.path.basename(path_a)
+        print(f"\n   -> Lese gesamtes Paar [{pair_idx+1}/{len(training_pairs)}]: {name_a.split('_dir')[0]}...")
+        
+        try:
+            img_a = nib.load(path_a)
+            img_b = nib.load(path_b)
             
-            inp = torch.from_numpy(s_norm).unsqueeze(0).unsqueeze(0).float()
-            out = model(inp)
+            num_volumes = min(img_a.shape[3] if len(img_a.shape) == 4 else 1, 
+                              img_b.shape[3] if len(img_b.shape) == 4 else 1)
             
-            denoised_3d[:, :, z] = out.squeeze().numpy() * global_p
+            # Zähler für die Epochen
+            epochen_pro_paar = 0
             
-            if z % 20 == 0:
-                print(f"Export Schicht {z}/{depth} (Scale: {global_p:.1f})")
+            # Gehe rigoros von Volume 0 bis Ende durch
+            for v in range(num_volumes):
+                vol_a = np.asanyarray(img_a.dataobj[:, :, :, v]) if len(img_a.shape) == 4 else img_a.get_fdata()
+                vol_b = np.asanyarray(img_b.dataobj[:, :, :, v]) if len(img_b.shape) == 4 else img_b.get_fdata()
+                
+                zoom_factors_a = [t / o for t, o in zip(target_shape, vol_a.shape)]
+                zoom_factors_b = [t / o for t, o in zip(target_shape, vol_b.shape)]
+                
+                res_a = zoom(vol_a, zoom_factors_a, order=1)
+                res_b = zoom(vol_b, zoom_factors_b, order=1)
+                
+                for epoch in range(4):
+                    optimizer.zero_grad()
+                    z_active = np.random.randint(20, 80) 
+                    
+                    n_a, _ = norm_func(res_a[:, :, z_active])
+                    n_b, _ = norm_func(res_b[:, :, z_active])
+                    
+                    if np.random.rand() > 0.5:
+                        in_t = torch.from_numpy(n_a).unsqueeze(0).unsqueeze(0).float().to(device)
+                        tar_t = torch.from_numpy(n_b).unsqueeze(0).unsqueeze(0).float().to(device)
+                    else:
+                        in_t = torch.from_numpy(n_b).unsqueeze(0).unsqueeze(0).float().to(device)
+                        tar_t = torch.from_numpy(n_a).unsqueeze(0).unsqueeze(0).float().to(device)
+                    
+                    if np.random.rand() > 0.5:
+                        in_t = torch.flip(in_t, [2])
+                        tar_t = torch.flip(tar_t, [2])
+                        
+                    out = model(in_t)
+                    loss = criterion(out, tar_t)
+                    loss.backward()
+                    optimizer.step()
+                    epochen_pro_paar += 1
+            
+            # Sichern nach jedem komplett gelesenen Paar + Saubere Ausgabe
+            torch.save(model.state_dict(), weights_path)
+            print(f"   💾 PAAR {pair_idx+1} ABGESCHLOSSEN: {epochen_pro_paar} Epochen trainiert. (Letzter Loss: {loss.item():.6f})")
+            
+        except Exception as e:
+            print(f"      ❌ Fehler beim Verarbeiten von {name_a}: {e}")
+            continue
 
-    print("\n--- Phase 4: Post-Processing (Final Smoothing) ---")
-    denoised_3d = gaussian_filter(denoised_3d, sigma=0.5)
+    print("\n✅ TEIL 1 ERFOLGREICH BEENDET: Das Netz hat nun das gesamte Dataset gesehen!")
 
-    new_affine = np.eye(4)
-    final_img = nib.Nifti1Image(denoised_3d, new_affine)
-    nib.save(final_img, output_name)
-    print(f"\nERFOLG! Datei abgespeichert unter: {output_name} mit Größe {denoised_3d.shape}")
+
+    # =================================================================================
+    # TEIL 2: DER ENDLOSE ZUFALLS-LOOP (Zur Perfektionierung)
+    # =================================================================================
+    print("\n🚀 TEIL 2 STARTE: Endloser Zufalls-Loop (Abbruch jederzeit mit STRG+C)")
+    global_loop = 1
+    
+    while True:
+        print(f"\n🌀 ZUFALLS-RUNDE {global_loop}")
+        np.random.shuffle(training_pairs) 
+        
+        for pair_idx, (path_a, path_b) in enumerate(training_pairs):
+            name_a = os.path.basename(path_a)
+            epochen_pro_paar = 0
+            
+            try:
+                img_a = nib.load(path_a)
+                img_b = nib.load(path_b)
+                
+                num_volumes = min(img_a.shape[3] if len(img_a.shape) == 4 else 1, 
+                                  img_b.shape[3] if len(img_b.shape) == 4 else 1)
+                
+                volumes_to_sample = min(5, num_volumes)
+                random_vols = np.random.choice(num_volumes, volumes_to_sample, replace=False)
+                
+                for v in random_vols:
+                    vol_a = np.asanyarray(img_a.dataobj[:, :, :, v]) if len(img_a.shape) == 4 else img_a.get_fdata()
+                    vol_b = np.asanyarray(img_b.dataobj[:, :, :, v]) if len(img_b.shape) == 4 else img_b.get_fdata()
+                    
+                    zoom_factors_a = [t / o for t, o in zip(target_shape, vol_a.shape)]
+                    zoom_factors_b = [t / o for t, o in zip(target_shape, vol_b.shape)]
+                    
+                    res_a = zoom(vol_a, zoom_factors_a, order=1)
+                    res_b = zoom(vol_b, zoom_factors_b, order=1)
+                    
+                    for epoch in range(4):
+                        optimizer.zero_grad()
+                        z_active = np.random.randint(20, 80)
+                        
+                        n_a, _ = norm_func(res_a[:, :, z_active])
+                        n_b, _ = norm_func(res_b[:, :, z_active])
+                        
+                        if np.random.rand() > 0.5:
+                            in_t = torch.from_numpy(n_a).unsqueeze(0).unsqueeze(0).float().to(device)
+                            tar_t = torch.from_numpy(n_b).unsqueeze(0).unsqueeze(0).float().to(device)
+                        else:
+                            in_t = torch.from_numpy(n_b).unsqueeze(0).unsqueeze(0).float().to(device)
+                            tar_t = torch.from_numpy(n_a).unsqueeze(0).unsqueeze(0).float().to(device)
+                        
+                        if np.random.rand() > 0.5:
+                            in_t = torch.flip(in_t, [2])
+                            tar_t = torch.flip(tar_t, [2])
+                            
+                        out = model(in_t)
+                        loss = criterion(out, tar_t)
+                        loss.backward()
+                        optimizer.step()
+                        epochen_pro_paar += 1
+                        
+                print(f"      -> Paar {pair_idx+1} aktualisiert: {epochen_pro_paar} Epochen trainiert (Loss: {loss.item():.6f})")
+                        
+            except Exception as e:
+                pass 
+        
+        torch.save(model.state_dict(), weights_path)
+        print(f"   💾 RUNDE {global_loop} BEENDET & GESICHERT.")
+        global_loop += 1
 
 if __name__ == "__main__":
-    train_and_export()
+    train_on_real_pairs()
