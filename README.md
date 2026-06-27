@@ -162,10 +162,14 @@ comparable. Needs `matplotlib` (skipped with a message if missing).
 ## Robustness
 
 Every endpoint call is wrapped in a **soft check**: a non-zero exit, missing output,
-or timeout is captured (which step + a stderr tail) into `metrics.json`
-(`pipeline_failures`) and the run stops cleanly with exit code 1 — never a silent
-crash or half-written output. Evaluation and slides are best-effort and won't bring
-down a run that otherwise produced an output.
+or timeout is captured into `metrics.json` (`pipeline_failures`) and the run stops
+cleanly with exit code 1 — never a silent crash. On failure the harness also:
+- names the artifact **`final_FAILED.nii.gz`** (never `final.nii.gz`),
+- saves the failed step's **full** stdout/stderr to **`FAILED_step<N>_<name>.log`** at the
+  output-dir top level (path also recorded in `metrics.json` → `failure_log`), and
+- **keeps `work/`** (all intermediates + per-step logs) regardless of `--keep-intermediates`.
+
+Evaluation and slides are best-effort and won't bring down a run that produced an output.
 
 > **Known wiring risk (sr):** `sr`'s inference loads its config from a checkpoint's
 > *run-directory* (`config.json`); the shipped weights are loose files in `models/`.

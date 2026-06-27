@@ -594,14 +594,29 @@ def main(argv=None):
             break
         cur = out_path
 
-    # 5) finalize. On failure the artifact is named *_INCOMPLETE so it can't be
-    #    mistaken for a successful result.
+    # 5) finalize. On failure the artifact is named *_FAILED so it can't be
+    #    mistaken for a success, the failed step's FULL log is promoted to the
+    #    output dir, and work/ is kept regardless of --keep-intermediates (step 8).
     incomplete = bool(failures)
-    for stale in ("final.nii.gz", "final_INCOMPLETE.nii.gz"):
+    for stale in ("final.nii.gz", "final_FAILED.nii.gz"):
         (out_dir / stale).unlink(missing_ok=True)
-    final_name = "final_INCOMPLETE.nii.gz" if incomplete else "final.nii.gz"
+    for old_log in out_dir.glob("FAILED_*.log"):
+        old_log.unlink(missing_ok=True)
+    final_name = "final_FAILED.nii.gz" if incomplete else "final.nii.gz"
     final_path = out_dir / final_name
     shutil.copyfile(cur, final_path)
+    failure_log = None
+    if incomplete:
+        f = failures[-1]
+        src_log = work / f"step{f['step_index']:02d}_{f['step']}.log"
+        failure_log = f"FAILED_step{f['step_index']:02d}_{f['step']}.log"
+        try:
+            if src_log.is_file():
+                shutil.copyfile(src_log, out_dir / failure_log)   # full stdout+stderr
+            else:                                 # command-build failure etc. -> no step log
+                (out_dir / failure_log).write_text(f.get("detail", "no log captured"))
+        except Exception:
+            pass
 
     # 6) evaluate + slides (best-effort; never crash the run over a metric/figure)
     try:
@@ -614,6 +629,7 @@ def main(argv=None):
                                           else "identity/reference" if cur == ref_path else str(cur.name)))
     if failures:
         metrics["pipeline_failures"] = failures
+        metrics["failure_log"] = failure_log
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     try:
@@ -630,14 +646,14 @@ def main(argv=None):
         "degradation_params": params, "incomplete": incomplete,
     }, indent=2))
 
-    if args.keep_intermediates == "no":
-        shutil.rmtree(work, ignore_errors=True)
+    if args.keep_intermediates == "no" and not failures:
+        shutil.rmtree(work, ignore_errors=True)   # on failure keep work/ (all logs + intermediates)
 
     print(f"\n[orch] DONE -> {out_dir}")
     print(f"[orch] metrics: { {k: v for k, v in metrics.items() if k != 'notes'} }")
     if failures:
-        print("[orch] NOTE: pipeline had failures (see metrics.json); "
-              f"artifact written as {final_name}.")
+        print(f"[orch] NOTE: pipeline FAILED (see metrics.json + {failure_log}); "
+              f"artifact written as {final_name}; work/ kept for debugging.")
         sys.exit(1)
 
 
