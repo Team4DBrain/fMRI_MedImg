@@ -177,7 +177,7 @@ def interpolate_file(
     input_path: str | Path,
     output_path: str | Path,
     *,
-    weights: str | Path = "checkpoints/pretrained/model_weights.pt",
+    weights: str | Path = Path(__file__).resolve().parent.parent.parent / "weights" / "temporal" / "model_weights.pt",
     norm_mode: str = "zscore",
     device: str | None = None,
     base_channels: int = 32,
