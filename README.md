@@ -49,11 +49,11 @@ Each run writes a directory:
 |---|---|---|
 | `--input`, `-i` | — | input 4D BOLD run (`.nii.gz`), full-resolution (128×128×93×T) |
 | `--output`, `-o` | — | output **directory** (created) |
-| `--steps` | *(empty)* | ordered endpoint steps from `{denoise, sr, joint, interp}`. Repeat a name to run it twice. Empty = degrade-only baseline. |
+| `--steps` | *(empty)* | ordered endpoint steps from `{denoise, sr, joint, interp}`. Repeat a name to run it twice. Empty = identity passthrough (no steps, **no degradation**; `final` == `reference`) — a harness sanity check, not a degraded baseline. |
 | `--degrade-once` | `yes` | `yes` = Architecture A (degrade once, fair). `no` = Architecture B (black-box chain). |
 | `--truncate` | `0` | take N consecutive frames from a **random** valid start (0 = whole run). |
 | `--seed` | `0` | seeds the truncation start **and** the degradation noise (reproducible). |
-| `--sr-model` | `rcan3d` | SR model key (`rcan3d` or `srcnn3d_deep`); resolves `models/sr_<key>_*_best.pt`. |
+| `--sr-model` | `rcan3d` | SR model key (e.g. `rcan3d`, `srcnn3d_deep`); resolves `models/sr_<key>_*_best.pt` (no enum validation — an unknown key fails at lookup). |
 | `--interp-mode` | `fill-gaps` | interp output mode. `fill-gaps` = only synthetic frames (T−1); `insert` = originals + synthetic (2T−1). |
 | `--keep-intermediates` | `yes` | keep `work/` (degraded + per-step runs). `no` deletes it at the end. |
 
@@ -70,15 +70,16 @@ chosen steps. Degradation is **conditional on the steps**:
 - applied **spatial-then-noise** when both.
 
 So `denoise sr` and `joint` both see the *same* noisy low-res input → an
-apples-to-apples comparison. `joint`/`sr` run in their **LR-native** mode here (they
-detect the pre-degraded input and skip a second degradation).
+apples-to-apples comparison. Here `joint`/`sr` run **LR-native** (selected purely by
+input shape, 64×64×46): `joint` detects the LR input and skips its internal degradation;
+`sr` is a pure SR model that just upsamples — so neither degrades a second time.
 
 | `--steps` | spatial? | noise? | what the first stage receives |
 |---|---|---|---|
-| `joint` | ✅ | ✅ | noisy LR (64³) |
-| `denoise sr` | ✅ | ✅ | noisy LR (64³) → denoise → SR |
-| `sr` | ✅ | ❌ | clean LR (64³) |
-| `denoise` | ❌ | ✅ | noisy HR (128³) |
+| `joint` | ✅ | ✅ | noisy LR (64×64×46) |
+| `denoise sr` | ✅ | ✅ | noisy LR (64×64×46) → denoise → SR |
+| `sr` | ✅ | ❌ | clean LR (64×64×46) |
+| `denoise` | ❌ | ✅ | noisy HR (128×128×93) |
 | `interp` | ❌ | ❌ | clean HR (no spatial/noise degrade) |
 
 ### B — black-box chain (`no`)
@@ -99,7 +100,8 @@ each endpoint's own and not seed-controlled.)
 | `interp` | `data_interpolation` | temporal interpolation | preserves space, changes T |
 
 Steps run in the order listed, chaining each output into the next input. The
-orchestrator tracks resolution across the handoff. **Meaningful** pipelines:
+orchestrator does **not** reshape between steps — each endpoint auto-detects its own
+input resolution (joint/sr key off HR 128×128×93 vs LR 64×64×46). **Meaningful** pipelines:
 `joint`, `sr`, `denoise sr` (the cascade), `denoise`, `interp`, and combinations
 with `interp` for temporal work. Nonsensical chains (e.g. `sr sr`) will run but
 double-process — read `metrics.json`/slides before trusting any exotic combo.
@@ -119,7 +121,11 @@ It is passed **explicitly** to `joint` (`--norm-ref`) and `sr` (`infer_nifti
 norm_ref=`) so both use the **identical, training-faithful** scale. `denoise`
 self-normalizes internally (per-slice percentile — colleague code) but denormalizes
 back to physical units, so its output is still comparable. Eval normalizes by this
-`norm_ref`, so PSNR/SSIM are in the same units as the training/eval numbers.
+`norm_ref`, so PSNR/SSIM are in the same units as the training/eval numbers. It is
+always a **whole-run** quantity — truncation does not change it. The degradation
+parameters (Rician σ range, voxel sizes, HR shape) are read from the **joint
+checkpoint config** at runtime, so the orchestrator's degradation can't drift from
+what the models trained on.
 
 ---
 
@@ -146,7 +152,8 @@ trying to reconstruct it.
 ## Slides
 
 `<output>/slides/t###.png`: montages at a few timepoints × a few axial slices, with
-columns **degraded input** (Architecture A only) | **pipeline output** | **reference**.
+columns **degraded input** (only when the orchestrator actually degraded — Architecture A with a
+spatial/noise step) | **pipeline output** | **reference**.
 Intensity is windowed to the reference's 99.5th percentile so the panels are
 comparable. Needs `matplotlib` (skipped with a message if missing).
 
