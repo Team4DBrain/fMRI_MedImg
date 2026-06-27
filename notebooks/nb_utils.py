@@ -483,3 +483,393 @@ def bar_compare(df, metric: str = "psnr_db", save_path: str | Path | None = None
     if save_path:
         fig.savefig(str(save_path), dpi=120)
     return fig
+
+
+# ===========================================================================
+# Pipeline trial helpers — leave-out evaluation with pre/post spatial steps
+# ===========================================================================
+
+_DEGRADE_SPATIAL = None
+_DEGRADE_NOISE   = None
+
+
+def _get_degradation():
+    global _DEGRADE_SPATIAL, _DEGRADE_NOISE
+    if _DEGRADE_SPATIAL is None:
+        for p in (str(REPO_ROOT),):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        from data.degradation_spatial import SpatialDegradation
+        from data.degradation_noise import RicianNoise
+        _DEGRADE_SPATIAL = SpatialDegradation(source_voxel_mm=1.5, target_voxel_mm=3.0)
+        _DEGRADE_NOISE   = RicianNoise(sigma_min=0.05, sigma_max=0.05, seed=0)
+    return _DEGRADE_SPATIAL, _DEGRADE_NOISE
+
+
+@dataclass
+class TrialModels:
+    """All pre-loaded models for pipeline trials. Build with load_trial_models()."""
+    interp:       object
+    sr_model:     object
+    sr_config:    object
+    sr_device:    object
+    denoiser:     object
+    den_device:   object
+    joint_model:  object
+    joint_cfg:    object
+    joint_device: object
+
+
+def load_trial_models(cfg) -> TrialModels:
+    """Load every model once. Call at the start of the trials notebook."""
+    import torch
+    for p in (str(REPO_ROOT), str(INTERP_DIR)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    # 1. Temporal interpolation
+    interp = load_interpolator(cfg)
+
+    # 2. Spatial SR (RCAN3D checkpoint)
+    sr_ckpts = sorted((REPO_ROOT / "weights" / "sr").glob("sr_rcan3d_*_best.pt"))
+    if not sr_ckpts:
+        raise FileNotFoundError("No sr_rcan3d_*_best.pt found in weights/sr/")
+    from sr.infer import _load_model_from_checkpoint
+    sr_model, sr_config, sr_device = _load_model_from_checkpoint(sr_ckpts[-1])
+
+    # 3. Denoiser (SimpleUNet, slice-by-slice)
+    den_dir = str(REPO_ROOT / "Denoising")
+    if den_dir not in sys.path:
+        sys.path.insert(0, den_dir)
+    from model import SimpleUNet
+    den_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    denoiser = SimpleUNet().to(den_device)
+    denoiser.load_state_dict(torch.load(
+        str(REPO_ROOT / "weights" / "denoiser" / "mri_unet_robust.pth"),
+        map_location=den_device, weights_only=True))
+    denoiser.eval()
+
+    # 4. Joint denoise+SR
+    from joint.eval import load_checkpoint as _joint_load
+    jw = REPO_ROOT / "weights" / "joint" / "best.pt"
+    if not jw.exists():
+        jw = Path("/srv/venvs/team4dbrain/joint_model/best.pt")
+    joint_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    joint_model, joint_cfg, _ = _joint_load(str(jw), joint_device)
+
+    print(f"[load_trial_models] interp={interp.device}  sr={sr_device}  "
+          f"denoise={den_device}  joint={joint_device}")
+    return TrialModels(
+        interp=interp,
+        sr_model=sr_model, sr_config=sr_config, sr_device=sr_device,
+        denoiser=denoiser, den_device=den_device,
+        joint_model=joint_model, joint_cfg=joint_cfg, joint_device=joint_device,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-volume operations (numpy → numpy, no file I/O)
+# ---------------------------------------------------------------------------
+
+def _predict_pair(
+    models: TrialModels,
+    v_a: np.ndarray,
+    v_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run the interp model on two neighbor volumes in XYZ order.
+    Returns (pred, naive) in XYZ physical units.
+    """
+    import torch
+    from src.inference import normalize_pair
+
+    interp = models.interp
+    a_dhw = np.ascontiguousarray(v_a.T)   # XYZ → DHW
+    b_dhw = np.ascontiguousarray(v_b.T)
+
+    a_n, b_n, mu, sigma = normalize_pair(a_dhw, b_dhw, interp.norm_mode)
+    inp = torch.from_numpy(np.stack([a_n, b_n])[None].astype(np.float32)).to(interp.device)
+
+    with torch.no_grad():
+        raw = interp.model(inp)
+        pred_n  = (0.5 * (inp[:, 0:1] + inp[:, 1:2]) + raw) if interp.residual else raw
+        naive_n =  0.5 * (inp[:, 0:1] + inp[:, 1:2])
+
+    def _back(t):
+        return np.ascontiguousarray((t.squeeze().cpu().numpy() * sigma + mu).T)  # DHW→XYZ
+
+    return _back(pred_n), _back(naive_n)
+
+
+def _sr_vol(vol_lr: np.ndarray, models: TrialModels, norm_ref: float | None = None) -> np.ndarray:
+    """Super-resolve a 3D LR numpy volume → HR numpy via the SR checkpoint."""
+    import torch
+    from sr.forward import model_forward
+
+    ref = norm_ref or (float(np.percentile(vol_lr, 98)) or 1.0)
+    inputs = torch.from_numpy(vol_lr.astype(np.float32) / ref).unsqueeze(0).unsqueeze(0).to(models.sr_device)
+    dummy  = torch.zeros((1, 1, 1, 1, 1), device=models.sr_device, dtype=inputs.dtype)
+    pred   = model_forward(models.sr_model, inputs, dummy, models.sr_config.model_name)
+    return pred.squeeze(0).squeeze(0).detach().cpu().numpy() * ref
+
+
+def _joint_vol(vol_lr: np.ndarray, models: TrialModels, norm_ref: float | None = None) -> np.ndarray:
+    """Denoise+super-resolve a 3D LR numpy volume → HR numpy via the joint model."""
+    import torch
+
+    ref = norm_ref or (float(np.percentile(vol_lr, 98)) or 1.0)
+    x   = torch.from_numpy(np.ascontiguousarray(vol_lr.astype(np.float32) / ref))[None, None].to(models.joint_device)
+    with torch.no_grad():
+        out = models.joint_model(x)[0, 0].cpu().numpy()
+    return out * ref
+
+
+def _denoise_vol(vol: np.ndarray, models: TrialModels) -> np.ndarray:
+    """Denoise a 3D numpy volume slice-by-slice using the U-Net denoiser."""
+    import torch
+
+    X, Y, Z = vol.shape
+    out = np.zeros_like(vol, dtype=np.float32)
+    p   = float(np.percentile(vol, 99)) or 1.0
+    with torch.no_grad():
+        for z in range(Z):
+            s = np.clip(vol[:, :, z], 0, p) / p
+            inp = torch.from_numpy(s.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(models.den_device)
+            out[:, :, z] = models.denoiser(inp).cpu().squeeze().numpy() * p
+    return out
+
+
+def _apply_steps(
+    vol: np.ndarray,
+    steps: list[str],
+    models: TrialModels,
+    norm_ref: float,
+) -> np.ndarray:
+    """Apply a sequence of named processing steps to a 3D volume."""
+    deg_spatial, deg_noise = _get_degradation()
+    for step in steps:
+        if   step == "spatial": vol = deg_spatial(vol)
+        elif step == "noise":   vol = deg_noise(vol)
+        elif step == "sr":      vol = _sr_vol(vol, models, norm_ref)
+        elif step == "joint":   vol = _joint_vol(vol, models, norm_ref)
+        elif step == "denoise": vol = _denoise_vol(vol, models)
+        else: raise ValueError(f"Unknown step {step!r}. Valid: spatial, noise, sr, joint, denoise")
+    return vol
+
+
+# ---------------------------------------------------------------------------
+# Leave-out trial
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrialResult:
+    """One leave-out interpolation trial — all volumes in XYZ physical units."""
+    name:       str
+    label:      str
+    t:          int
+    gt:         np.ndarray   # clean HR ground truth
+    pred:       np.ndarray   # model prediction (after post-steps)
+    naive:      np.ndarray   # naive average  (after post-steps)
+    pre_steps:  list
+    post_steps: list
+    metrics:    dict
+
+    @property
+    def error(self):       return np.abs(self.gt - self.pred)
+
+    @property
+    def naive_error(self): return np.abs(self.gt - self.naive)
+
+
+def run_trial(
+    bold_path:  str | Path,
+    t:          int,
+    pre_steps:  list[str],
+    post_steps: list[str],
+    models:     TrialModels,
+    name:       str = "trial",
+    label:      str = "",
+    norm_ref:   float | None = None,
+) -> TrialResult:
+    """Hold out frame t, process its two neighbours, interpolate, post-process.
+
+    pre_steps  — applied to each neighbour BEFORE interpolation (e.g. ["spatial"])
+    post_steps — applied to the interpolated frame AFTER  (e.g. ["sr"])
+    GT is always the clean HR frame at position t.
+    """
+    import nibabel as nib
+
+    data = nib.load(str(bold_path)).get_fdata(dtype=np.float32)
+    T    = data.shape[-1]
+    if not (1 <= t < T - 1):
+        raise IndexError(f"t={t} must be an interior frame (1 .. {T-2})")
+
+    gt     = data[..., t]
+    v_prev = data[..., t - 1].copy()
+    v_next = data[..., t + 1].copy()
+    ref    = norm_ref or (float(np.percentile(data.mean(-1), 98)) or 1.0)
+
+    p_prev = _apply_steps(v_prev, pre_steps,  models, ref)
+    p_next = _apply_steps(v_next, pre_steps,  models, ref)
+
+    pred_raw, naive_raw = _predict_pair(models, p_prev, p_next)
+
+    pred  = _apply_steps(pred_raw,  post_steps, models, ref)
+    naive = _apply_steps(naive_raw, post_steps, models, ref)
+
+    dr    = float(np.percentile(gt, 99.5)) or 1.0
+    mse_m = float(np.mean((pred  - gt) ** 2))
+    mse_n = float(np.mean((naive - gt) ** 2))
+    l1_m  = float(np.mean(np.abs(pred  - gt)))
+    l1_n  = float(np.mean(np.abs(naive - gt)))
+
+    def _psnr(mse): return float(10 * np.log10(dr ** 2 / max(mse, 1e-12)))
+
+    return TrialResult(
+        name=name, label=label or name, t=t,
+        gt=gt, pred=pred, naive=naive,
+        pre_steps=pre_steps, post_steps=post_steps,
+        metrics=dict(model_l1=l1_m, naive_l1=l1_n,
+                     model_psnr=_psnr(mse_m), naive_psnr=_psnr(mse_n),
+                     model_beats=l1_m < l1_n),
+    )
+
+
+def sweep_trial(
+    bold_path:  str | Path,
+    pre_steps:  list[str],
+    post_steps: list[str],
+    models:     TrialModels,
+    name:       str = "trial",
+    label:      str = "",
+    stride:     int = 10,
+    norm_ref:   float | None = None,
+) -> list[dict]:
+    """Sweep run_trial over interior timepoints; return list of metric dicts."""
+    import nibabel as nib
+    T  = nib.load(str(bold_path)).shape[-1]
+    ts = list(range(1, T - 1, stride))
+    rows = []
+    for i, t in enumerate(ts):
+        print(f"  {name}: t={t} ({i+1}/{len(ts)})", end="\r", flush=True)
+        r = run_trial(bold_path, t, pre_steps, post_steps, models,
+                      name=name, label=label, norm_ref=norm_ref)
+        rows.append({"t": t, **r.metrics})
+    print(f"  {name}: done ({len(ts)} frames)          ")
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Visualization for trials
+# ---------------------------------------------------------------------------
+
+def show_trial(result: TrialResult, *, title: str = "", save_path=None):
+    """Tri-planar GT / Predicted / |Error model| / |Error naive| figure."""
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
+    gt, pred, naive = result.gt, result.pred, result.naive
+    err_m, err_n    = result.error, result.naive_error
+    m = result.metrics
+
+    cx, cy, cz = [s // 2 for s in gt.shape]
+    vmax = float(np.percentile(gt, 99.5)) or 1.0
+    emax = float(np.percentile(np.maximum(err_m, err_n), 99)) or 1.0
+
+    planes = [
+        (gt[cx,:,:].T, pred[cx,:,:].T, err_m[cx,:,:].T, err_n[cx,:,:].T, "Sagittal"),
+        (gt[:,cy,:].T, pred[:,cy,:].T, err_m[:,cy,:].T, err_n[:,cy,:].T, "Coronal"),
+        (gt[:,:,cz].T, pred[:,:,cz].T, err_m[:,:,cz].T, err_n[:,:,cz].T, "Axial"),
+    ]
+
+    fig = plt.figure(figsize=(18, 12))
+    gs  = gridspec.GridSpec(3, 4, figure=fig, wspace=0.04, hspace=0.12)
+
+    col_titles = ["Ground Truth", "Predicted", "|Error| model", "|Error| naive"]
+    for col, ct in enumerate(col_titles):
+        fig.add_subplot(gs[0, col]).set_title(ct, fontsize=11, fontweight="bold", pad=6)
+
+    for row, (g, p, em, en, plane) in enumerate(planes):
+        specs = [(g,"gray",0,vmax),(p,"gray",0,vmax),(em,"hot",0,emax),(en,"hot",0,emax)]
+        for col, (d, cmap, vmin_, vmax_) in enumerate(specs):
+            ax = fig.add_subplot(gs[row, col])
+            im = ax.imshow(d, cmap=cmap, vmin=vmin_, vmax=vmax_, origin="lower", aspect="auto")
+            ax.axis("off")
+            if col == 0:
+                ax.set_ylabel(plane, fontsize=9, labelpad=4)
+            if col >= 2 and row == 2:
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    beat   = "✓ beats naive" if m["model_beats"] else "✗ loses to naive"
+    suptit = (
+        f"{title}  (t={result.t})\n"
+        f"PSNR  model={m['model_psnr']:.2f} dB  naive={m['naive_psnr']:.2f} dB   |   "
+        f"L1  model={m['model_l1']:.4f}  naive={m['naive_l1']:.4f}   |   {beat}"
+    )
+    fig.suptitle(suptit, fontsize=10, y=1.01)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(str(save_path), dpi=120, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+def sweep_plot(sweeps: dict, *, title: str = "", save_path=None):
+    """Line plots of PSNR and L1 over time for multiple pipeline variants."""
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    for name, rows in sweeps.items():
+        df = pd.DataFrame(rows)
+        axes[0].plot(df["t"], df["model_psnr"], label=name, lw=2)
+        axes[1].plot(df["t"], df["model_l1"],   label=name, lw=2)
+    for ax, (yl, tt) in zip(axes, [("PSNR (dB)", "PSNR over time"), ("L1", "L1 over time")]):
+        ax.set_xlabel("t"); ax.set_ylabel(yl); ax.set_title(tt)
+        ax.legend(fontsize=8, loc="best"); ax.grid(alpha=0.3)
+    if title:
+        fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(str(save_path), dpi=120, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+def pipelines_summary(sweeps: dict, *, save_path=None):
+    """Bar charts + summary DataFrame for all pipeline variants."""
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    rows = []
+    for name, mlist in sweeps.items():
+        df = pd.DataFrame(mlist)
+        rows.append(dict(
+            pipeline        = name,
+            mean_psnr       = round(df["model_psnr"].mean(), 3),
+            mean_l1         = round(df["model_l1"].mean(), 4),
+            pct_beats_naive = round(df["model_beats"].mean() * 100, 1),
+        ))
+    summary = pd.DataFrame(rows).set_index("pipeline")
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, (col, yl, color) in zip(axes, [
+        ("mean_psnr",       "Mean PSNR (dB)",    "#4C72B0"),
+        ("mean_l1",         "Mean L1",            "#DD8452"),
+        ("pct_beats_naive", "% Frames > Naive",   "#55A868"),
+    ]):
+        vals = summary[col]
+        bars = ax.bar(range(len(vals)), vals.values, color=color, alpha=0.85, width=0.6)
+        ax.set_xticks(range(len(vals)))
+        ax.set_xticklabels(vals.index, rotation=35, ha="right", fontsize=8)
+        ax.set_ylabel(yl); ax.set_title(yl); ax.grid(axis="y", alpha=0.3)
+        for bar, val in zip(bars, vals.values):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + vals.max() * 0.01,
+                    f"{val:.2f}", ha="center", va="bottom", fontsize=8)
+    fig.suptitle("Pipeline Comparison — Leave-out Evaluation (GT = real held-out frame)",
+                 fontsize=13, y=1.02)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(str(save_path), dpi=120, bbox_inches="tight")
+    plt.show()
+    return fig, summary
