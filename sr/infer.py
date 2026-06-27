@@ -381,16 +381,51 @@ def _nifti_is_4d(path: Path) -> bool:
     return len(nib.load(str(path)).shape) == 4
 
 
+def _hr_output_metadata_from_lr(
+    in_img: "nibabel.Nifti1Image",
+    config: SRConfig,
+) -> tuple[np.ndarray, tuple[float, ...]]:
+    """Derive HR-space affine and voxel zooms from an LR input header.
+
+    Purpose:
+        LR-native 4D infer writes HR-shaped data; the output affine must
+        reflect HR voxel size while preserving FOV (same pattern as joint
+        puppetmaster). Callers may overwrite the affine afterward.
+    Effect:
+        Scales the 3x3 voxel-to-world block by source/target mm ratio and
+        sets spatial zooms to ``config.source_voxel_mm`` plus the input TR.
+    """
+    out_affine = in_img.affine.copy()
+    out_affine[:3, :3] = in_img.affine[:3, :3] * (
+        config.source_voxel_mm / config.target_voxel_mm
+    )
+    sv = float(config.source_voxel_mm)
+    in_zooms = in_img.header.get_zooms()
+    tr = float(in_zooms[3]) if len(in_zooms) > 3 else 0.0
+    zooms: tuple[float, ...] = (sv, sv, sv, tr) if tr > 0 else (sv, sv, sv)
+    return out_affine, zooms
+
+
 def _write_nifti_output(
     data: np.ndarray,
     in_img: "nibabel.Nifti1Image",
     output_path: Path,
+    *,
+    out_affine: np.ndarray | None = None,
+    out_zooms: tuple[float, ...] | None = None,
 ) -> None:
-    """Write a 3D/4D NIfTI drop-in with the input's affine, zooms, and TR."""
+    """Write a 3D/4D NIfTI drop-in with affine, zooms, and TR.
+
+    When ``out_affine`` / ``out_zooms`` are omitted, copies them from
+    ``in_img`` (HR round-trip drop-in). LR-native 4D infer passes derived
+    HR metadata so the written grid matches ``data`` spatial dimensions.
+    """
     import nibabel as nib
 
-    out_img = nib.Nifti1Image(data.astype(np.float32), in_img.affine)
-    out_img.header.set_zooms(in_img.header.get_zooms())
+    affine = in_img.affine if out_affine is None else out_affine
+    zooms = in_img.header.get_zooms() if out_zooms is None else out_zooms
+    out_img = nib.Nifti1Image(data.astype(np.float32), affine)
+    out_img.header.set_zooms(zooms)
     try:
         out_img.header.set_xyzt_units(*in_img.header.get_xyzt_units())
     except Exception:
@@ -450,16 +485,28 @@ def _infer_nifti_4d_run(
     slice_level: float = 0.5,
     checkpoint_path: Path,
 ) -> dict[str, Any]:
-    """Super-resolve every timepoint in a 4D HR BOLD run and stack the result."""
+    """Super-resolve every timepoint in a 4D BOLD run and stack the result.
+
+    HR input (``output_patch_shape``): degrade each volume internally, then SR.
+    LR input (derived LR grid from config voxel sizes): feed volumes straight
+    to the model without degradation.
+    """
     import nibabel as nib
 
     reader = get_reader(input_path)
     hr_shape = tuple(int(s) for s in config.output_patch_shape)
-    if reader.shape3d != hr_shape:
+    lr_shape = _lr_shape_for_config(config)
+    shape3d = reader.shape3d
+
+    if shape3d == hr_shape:
+        input_mode = "hr_degraded"
+    elif shape3d == lr_shape:
+        input_mode = "lr_native"
+    else:
         raise ValueError(
-            f"4D full-run infer expects HR spatial shape {hr_shape}, got "
-            f"{reader.shape3d}. LR-native 4D runs are not supported; pass --t "
-            "for single-volume infer on one timepoint."
+            f"4D full-run infer expects HR spatial shape {hr_shape} or LR "
+            f"shape {lr_shape}, got {shape3d}. "
+            f"({config.source_voxel_mm}mm -> {config.target_voxel_mm}mm)"
         )
 
     T = reader.n_volumes
@@ -485,11 +532,14 @@ def _infer_nifti_4d_run(
         f"device={device} | checkpoint={checkpoint_path.name}",
         flush=True,
     )
-    print("[infer] applied k-space degradation (HR -> LR) per timepoint")
+    if input_mode == "lr_native":
+        print("[infer] input already at LR resolution; skipping degradation")
+    else:
+        print("[infer] applied k-space degradation (HR -> LR) per timepoint")
 
     for t_idx in range(T):
-        hr_vol = reader.read_volume(t_idx).astype(np.float32)
-        lr, _, ground_truth = _prepare_lr_volume(hr_vol, ref, config)
+        vol = reader.read_volume(t_idx).astype(np.float32)
+        lr, _, ground_truth = _prepare_lr_volume(vol, ref, config)
         inputs = torch.from_numpy(lr).unsqueeze(0).unsqueeze(0).to(device)
         pred = model_forward(model, inputs, target, config.model_name)
         pred_np = pred.squeeze(0).squeeze(0).detach().cpu().numpy()
@@ -503,7 +553,13 @@ def _infer_nifti_4d_run(
         if (t_idx + 1) % 50 == 0 or t_idx + 1 == T:
             print(f"[infer]   {t_idx + 1}/{T}", flush=True)
 
-    _write_nifti_output(out, in_img, output_path)
+    if input_mode == "lr_native":
+        out_affine, out_zooms = _hr_output_metadata_from_lr(in_img, config)
+        _write_nifti_output(
+            out, in_img, output_path, out_affine=out_affine, out_zooms=out_zooms
+        )
+    else:
+        _write_nifti_output(out, in_img, output_path)
     print(f"[infer] wrote NIfTI -> {output_path}  shape={out.shape}")
 
     preview_out: Path | None = None

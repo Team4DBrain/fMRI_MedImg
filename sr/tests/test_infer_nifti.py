@@ -146,3 +146,55 @@ def test_infer_nifti_4d_full_run(tmp_path: Path) -> None:
     assert result["n_volumes"] == n_time
     assert np.all(np.isfinite(out_img.get_fdata()))
     assert tuple(float(z) for z in out_img.header.get_zooms()) == zooms
+
+
+def test_infer_nifti_4d_lr_native_run(tmp_path: Path) -> None:
+    nib = pytest.importorskip("nibabel")
+
+    from data.degradation_spatial import voxel_size_to_target_shape
+    from sr.checkpoint import EpochState, capture_rng_state, save_epoch
+    from sr.config import SRConfig, to_json
+    from sr.infer import infer_nifti
+    from sr.models import build_model
+
+    hr_shape = (16, 16, 12)
+    n_time = 4
+    config = SRConfig(output_patch_shape=hr_shape)
+    lr_shape = voxel_size_to_target_shape(
+        hr_shape, config.source_voxel_mm, config.target_voxel_mm
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    to_json(config, run_dir / "config.json")
+
+    model = build_model(config)
+    state = EpochState(
+        epoch_number=1,
+        model_state_dict=model.state_dict(),
+        optimizer_state_dict={},
+        scheduler_state_dict=None,
+        rng_state=capture_rng_state(),
+        metrics_history=[{"epoch": 1, "train_loss": 0.0}],
+        best_val_loss=0.0,
+        best_epoch_number=1,
+    )
+    checkpoint = save_epoch(run_dir, state)
+
+    rng = np.random.RandomState(1)
+    data_4d = (rng.rand(*lr_shape, n_time).astype(np.float32) + 50.0) * 100.0
+    input_path = tmp_path / "bold_lr.nii.gz"
+    affine = np.eye(4)
+    lr_zooms = (3.0, 3.0, 3.0, 2.0)
+    img = nib.Nifti1Image(data_4d, affine)
+    img.header.set_zooms(lr_zooms)
+    nib.save(img, str(input_path))
+
+    output_path = tmp_path / "bold_lr_sr.nii.gz"
+    result = infer_nifti(checkpoint, input_path, output_path, norm_ref=100.0)
+
+    out_img = nib.load(str(output_path))
+    assert out_img.shape == (*hr_shape, n_time)
+    assert result["n_volumes"] == n_time
+    assert np.all(np.isfinite(out_img.get_fdata()))
+    hr_zooms = (config.source_voxel_mm, config.source_voxel_mm, config.source_voxel_mm, 2.0)
+    assert tuple(float(z) for z in out_img.header.get_zooms()) == hr_zooms
