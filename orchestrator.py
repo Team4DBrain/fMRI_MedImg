@@ -254,10 +254,10 @@ def save_run(data: np.ndarray, affine: np.ndarray, ref_header, path: Path):
 # endpoint invocation (subprocess, per-endpoint cwd) + soft check
 # ==========================================================================
 def resolve_sr_checkpoint(sr_model: str) -> str:
-    cands = sorted((REPO_ROOT / "models").glob(f"sr_{sr_model}_*_best.pt"))
+    cands = sorted((REPO_ROOT / "weights" / "sr").glob(f"sr_{sr_model}_*_best.pt"))
     if not cands:
         raise FileNotFoundError(
-            f"no SR checkpoint at {REPO_ROOT}/models/sr_{sr_model}_*_best.pt")
+            f"no SR checkpoint at {REPO_ROOT}/weights/sr/sr_{sr_model}_*_best.pt")
     return str(cands[-1])     # latest by timestamped name
 
 
@@ -282,7 +282,7 @@ def build_step_command(name: str, in_path: Path, out_path: Path, *,
         return ([sys.executable, "-c", code], REPO_ROOT / "Denoising")
     if name == "interp":
         return ([sys.executable, "main.py",
-                 "--weights", "checkpoints/pretrained/model_weights.pt",
+                 "--weights", str(REPO_ROOT / "weights" / "temporal" / "model_weights.pt"),
                  "--input", ip, "--output", op, "--mode", interp_mode],
                 REPO_ROOT / "data_interpolation")
     raise ValueError(f"unknown step {name!r}")
@@ -391,7 +391,7 @@ def _interp_leaveout(ref_path: Path, work_dir: Path) -> dict:
     dropping the unpredictable ends). PSNR/L1 only (no SSIM)."""
     out_dir = work_dir / "interp_eval"
     cmd = [sys.executable, "eval.py",
-           "--weights", "checkpoints/pretrained/model_weights.pt",
+           "--weights", str(REPO_ROOT / "weights" / "temporal" / "model_weights.pt"),
            "--file", str(ref_path.resolve()),
            "--output-dir", str(out_dir.resolve())]
     try:

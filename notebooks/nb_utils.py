@@ -44,8 +44,8 @@ class Config:
     bold_file: Path | None = None
 
     # interpolation checkpoint (relative to data_interpolation/)
-    interp_weights: Path = INTERP_DIR / "checkpoints/pretrained/model_weights.pt"
-    interp_history: Path = INTERP_DIR / "checkpoints/pretrained/history.json"
+    interp_weights: Path = REPO_ROOT / "weights" / "temporal" / "model_weights.pt"
+    interp_history: Path = REPO_ROOT / "weights" / "temporal" / "history.json"
     norm_mode: str = "zscore"          # must match training (pretrained = zscore)
     residual: bool = False             # pretrained = non-residual
     base_channels: int = 32

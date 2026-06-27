@@ -2,11 +2,16 @@ import os
 import numpy as np
 import nibabel as nib
 import torch
+from pathlib import Path
 
 # Keep the SimpleUNet class import exactly as it is
-from model import SimpleUNet 
+from model import SimpleUNet
 
-def denoise_run(input_path, output_path, weights_path='mri_unet_robust.pth'):
+_DEFAULT_WEIGHTS = str(Path(__file__).resolve().parent.parent / "weights" / "denoiser" / "mri_unet_robust.pth")
+
+def denoise_run(input_path, output_path, weights_path=None):
+    if weights_path is None:
+        weights_path = _DEFAULT_WEIGHTS
     """Load a PRETRAINED denoiser and denoise an ENTIRE 4D run. No training here."""
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
