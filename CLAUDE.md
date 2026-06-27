@@ -17,7 +17,7 @@ The central `orchestrator.py` runs these as **subprocesses** (conflicting torch/
 - **Python kernel:** `/srv/venvs/team4dbrain/team4dbrain/bin/python`
 - **Jupyter kernel name:** `team4dbrain`
 - **Raw BOLD data (BIDS):** `/srv/fMRI-data/`
-- **Joint model weights:** `/srv/venvs/team4dbrain/joint_model/best.pt`
+- **Joint model weights:** `weights/joint/best.pt` (in repo; VM also has `/srv/venvs/team4dbrain/joint_model/best.pt`, orchestrator prefers that if present)
 - **Manifest (46 runs, norm_ref + masks):** `/srv/venvs/team4dbrain/derivatives/manifest_big.json`
 - **Precomputed masks:** `/srv/venvs/team4dbrain/derivatives/masks/`
 - **SynthStrip weights:** `/srv/synthstrip/synthstrip.1.pt`

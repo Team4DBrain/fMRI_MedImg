@@ -78,7 +78,8 @@ from data.reader import get_reader
 # Shared VM locations + DEFAULT degradation constants (overridden at runtime
 # from the joint checkpoint config — see resolve_degradation_params()).
 # --------------------------------------------------------------------------
-WEIGHTS_PATH = "/srv/venvs/team4dbrain/joint_model/best.pt"
+_VM_WEIGHTS = Path("/srv/venvs/team4dbrain/joint_model/best.pt")
+WEIGHTS_PATH = str(_VM_WEIGHTS) if _VM_WEIGHTS.exists() else str(REPO_ROOT / "weights" / "joint" / "best.pt")
 MANIFEST_PATH = Path("/srv/venvs/team4dbrain/derivatives/manifest_big.json")
 DERIV_DIR = Path("/srv/venvs/team4dbrain/derivatives")
 
