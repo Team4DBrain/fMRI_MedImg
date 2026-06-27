@@ -29,16 +29,20 @@ python orchestrator.py -i /srv/fMRI-data/sub-13_ses-16_task-PainMovie_dir-pa_bol
 
 # quick reproducible test on 10 random timepoints:
 python orchestrator.py -i <run> -o runs/quick --steps joint --truncate 10 --seed 0
+
+# omit -o → output dir is auto-named from the steps (here: runs/denoise_sr):
+python orchestrator.py -i <run> --steps denoise sr
 ```
 
 Each run writes a directory:
 
 ```
-<output>/final.nii.gz        final 4D run
-<output>/metrics.json        PSNR / SSIM / tSNR
+<output>/final.nii.gz        final 4D run  (final_FAILED.nii.gz if a step failed)
+<output>/metrics.json        PSNR / SSIM / tSNR  (+ pipeline_failures / failure_log on failure)
 <output>/slides/*.png        reference-vs-output montages
-<output>/run_config.json     provenance (args, seed, start, norm_ref, …)
-<output>/work/               reference, degraded, per-step intermediates
+<output>/run_config.json     provenance (input, steps, seed, truncate_start, norm_ref, …)
+<output>/work/               intermediates + per-step logs — deleted on success (default),
+                             kept on failure (with FAILED_step*.log promoted to the top level)
 ```
 
 ---
@@ -48,7 +52,7 @@ Each run writes a directory:
 | flag | default | meaning |
 |---|---|---|
 | `--input`, `-i` | — | input 4D BOLD run (`.nii.gz`), full-resolution (128×128×93×T) |
-| `--output`, `-o` | — | output **directory** (created) |
+| `--output`, `-o` | `runs/<steps>` | output **directory**. If omitted, auto-named from the steps — `runs/<steps joined by _>` (e.g. `runs/denoise_sr`; empty steps → `runs/identity`), bumped to `…2`, `…3`, … if that name already exists. |
 | `--steps` | *(empty)* | ordered endpoint steps from `{denoise, sr, joint, interp}`. Repeat a name to run it twice. Empty = identity passthrough (no steps, **no degradation**; `final` == `reference`) — a harness sanity check, not a degraded baseline. |
 | `--degrade-once` | `yes` | `yes` = Architecture A (degrade once, fair). `no` = Architecture B (black-box chain). |
 | `--truncate` | `0` | take N consecutive frames from a **random** valid start (0 = whole run). |

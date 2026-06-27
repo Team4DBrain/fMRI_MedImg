@@ -513,11 +513,25 @@ def _nonneg_int(s: str) -> int:
     return v
 
 
+def default_output_dir(steps, runs_dir=None):
+    """Default output dir named after the steps (e.g. runs/denoise_sr), bumped to
+    <name>2, <name>3, ... if a directory of that name already exists. Empty steps
+    -> 'identity'."""
+    runs_dir = Path("runs") if runs_dir is None else Path(runs_dir)
+    base = "_".join(steps) if steps else "identity"
+    name, n = base, 2
+    while (runs_dir / name).exists():
+        name, n = f"{base}{n}", n + 1
+    return runs_dir / name
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Modular fMRI restoration pipeline harness (joint vs cascade etc.).")
     ap.add_argument("--input", "-i", required=True, help="input 4D BOLD run (.nii.gz)")
-    ap.add_argument("--output", "-o", required=True, help="output DIRECTORY")
+    ap.add_argument("--output", "-o", default=None,
+                    help="output DIRECTORY (default: runs/<steps>, e.g. runs/denoise_sr; "
+                         "auto-incremented runs/<steps>2, 3, ... if it already exists)")
     ap.add_argument("--steps", nargs="*", default=[], choices=VALID_STEPS,
                     help="ordered endpoint steps, e.g. --steps denoise sr (repeat to run "
                          "twice; empty = identity passthrough, no degradation)")
@@ -533,10 +547,14 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     input_path = Path(args.input).resolve()
-    out_dir = Path(args.output).resolve()
+    steps = list(args.steps)
+    if args.output:
+        out_dir = Path(args.output).resolve()
+    else:
+        out_dir = default_output_dir(steps).resolve()
+        print(f"[orch] no --output given; defaulting to {out_dir}")
     work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
-    steps = list(args.steps)
     degrade_a = (args.degrade_once == "yes")
 
     if not input_path.is_file():
