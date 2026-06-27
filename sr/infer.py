@@ -27,9 +27,10 @@ import numpy as np
 import torch
 
 from sr.checkpoint import (
+    load_config_for_inference,
     load_epoch,
     resolve_checkpoint_for_model,
-    run_dir_for_checkpoint,
+    try_run_dir_for_checkpoint,
 )
 from sr.config import SRConfig, auto_device, from_json
 from sr.data import build_loaders, build_spatial_sr_dataset, resolve_dataset_sample
@@ -176,12 +177,19 @@ def extract_slice(
 
 
 def _load_model_from_checkpoint(
-    checkpoint_path: Path, override_manifest: Path | None = None
+    checkpoint_path: Path,
+    override_manifest: Path | None = None,
+    *,
+    model_name: str | None = None,
+    config_path: Path | None = None,
 ) -> tuple[torch.nn.Module, SRConfig, str]:
     """Load the model + config bound to a given epoch checkpoint."""
     checkpoint_path = Path(checkpoint_path)
-    run_dir = run_dir_for_checkpoint(checkpoint_path)
-    config = from_json(run_dir / "config.json")
+    config = load_config_for_inference(
+        checkpoint_path,
+        model_name=model_name,
+        config_path=config_path,
+    )
     if override_manifest is not None:
         config.manifest_path = Path(override_manifest)
     device = auto_device()
@@ -202,6 +210,8 @@ def evaluate(
     checkpoint_path: Path,
     *,
     override_manifest: Path | None = None,
+    model_name: str | None = None,
+    config_path: Path | None = None,
     report_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run the saved validation split through ``checkpoint_path``.
@@ -209,7 +219,12 @@ def evaluate(
     Returns the averaged metric dict and (optionally) writes it to JSON.
     Prints every value so a user piping output to logs sees the numbers.
     """
-    model, config, device = _load_model_from_checkpoint(checkpoint_path, override_manifest)
+    model, config, device = _load_model_from_checkpoint(
+        checkpoint_path,
+        override_manifest,
+        model_name=model_name,
+        config_path=config_path,
+    )
 
     _, val_loader, split_info = build_loaders(config)
     if val_loader is None:
@@ -546,6 +561,8 @@ def infer_nifti(
     write_preview: bool = False,
     preview_path: Path | None = None,
     slice_level: float = 0.5,
+    model_name: str | None = None,
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Super-resolve a 3D/4D NIfTI and write ``<stem>_sr.nii.gz`` by default.
 
@@ -556,7 +573,11 @@ def infer_nifti(
     output_path = resolve_sr_output_path(input_path, output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model, config, device = _load_model_from_checkpoint(checkpoint_path)
+    model, config, device = _load_model_from_checkpoint(
+        checkpoint_path,
+        model_name=model_name,
+        config_path=config_path,
+    )
 
     if t is None and _nifti_is_4d(input_path):
         return _infer_nifti_4d_run(
@@ -708,13 +729,20 @@ def infer_one(
     selection: dict[str, Any],
     *,
     override_manifest: Path | None = None,
+    model_name: str | None = None,
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run one (run, timepoint) through the model and return tensors + metrics.
 
     ``selection`` is the dict returned by ``select_sample`` (must contain
     ``subject``, ``run_id``, ``t``).
     """
-    model, config, device = _load_model_from_checkpoint(checkpoint_path, override_manifest)
+    model, config, device = _load_model_from_checkpoint(
+        checkpoint_path,
+        override_manifest,
+        model_name=model_name,
+        config_path=config_path,
+    )
 
     dataset = build_spatial_sr_dataset(
         config.manifest_path,

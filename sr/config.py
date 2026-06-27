@@ -37,8 +37,12 @@ DEFAULT_RUN_ROOT = Path("sr/runs")
 def resolve_run_root(stored: str | Path) -> Path:
     """Map legacy run-root strings from pre-move runs without editing their JSON."""
     p = Path(stored)
-    if p.as_posix() == "sr/runs":
-        return Path("sr/runs")
+    legacy = {
+        "src/sr/runs": Path("sr/runs"),
+        "sr/runs": Path("sr/runs"),
+    }
+    if p.as_posix() in legacy:
+        return legacy[p.as_posix()]
     return p
 DEFAULT_OUTPUT_SHAPE: tuple[int, int, int] = (128, 128, 93)
 DEFAULT_PATCH_HR_SHAPE: tuple[int, int, int] = (48, 48, 48)

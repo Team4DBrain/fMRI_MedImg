@@ -42,7 +42,7 @@ from sr.infer import (
     resolve_sr_output_path,
     select_sample,
 )
-from sr.checkpoint import resolve_checkpoint_for_model
+from sr.checkpoint import embed_config_in_checkpoint, resolve_checkpoint_for_model
 from sr.losses import loss_names_for_validation
 from sr.models import MODEL_REGISTRY
 from sr.components import OPTIMIZER_REGISTRY, SCHEDULER_REGISTRY
@@ -235,6 +235,16 @@ def _add_infer_arguments(parser: argparse.ArgumentParser) -> None:
         help="Checkpoint .pt (required for manifest infer; optional with --input).",
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        dest="config_path",
+        help=(
+            "SRConfig JSON for standalone weights (sidecar <stem>.config.json "
+            "is auto-detected when omitted)."
+        ),
+    )
+    parser.add_argument(
         "--manifest-path",
         type=Path,
         default=None,
@@ -297,6 +307,43 @@ def build_parser() -> argparse.ArgumentParser:
             "debug",
             help="Inspect HR/LR images and masks (no checkpoint).",
         )
+    )
+    embed_parser = sub.add_parser(
+        "embed-config",
+        help=(
+            "Embed SRConfig into a checkpoint's extra.config (weights unchanged). "
+            "Requires a sidecar .config.json or --config unless already embedded."
+        ),
+    )
+    embed_parser.add_argument(
+        "checkpoint",
+        type=Path,
+        help="Path to .pt checkpoint to update in place.",
+    )
+    embed_parser.add_argument(
+        "--config",
+        dest="config_path",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit config.json path. When omitted, uses "
+            "<stem>.config.json or run config.json beside the checkpoint."
+        ),
+    )
+    embed_parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Skip writing <checkpoint>.pt.bak before updating.",
+    )
+    embed_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Verify weights and config match without writing.",
+    )
+    embed_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing embedded config.",
     )
 
     return parser
@@ -431,6 +478,8 @@ def _run_infer(args: argparse.Namespace) -> None:
             t=args.t,
             write_preview=args.preview,
             slice_level=args.slice_level,
+            model_name=args.model_name,
+            config_path=args.config_path,
         )
         if args.save_png is not None:
             make_slice_figure(
@@ -458,11 +507,11 @@ def _run_infer(args: argparse.Namespace) -> None:
             )
         manifest = args.manifest_path
         if manifest is None:
-            from sr.checkpoint import run_dir_for_checkpoint
-            from sr.config import from_json as _from_json
+            from sr.checkpoint import load_config_for_inference
 
-            run_dir = run_dir_for_checkpoint(args.checkpoint)
-            manifest = _from_json(run_dir / "config.json").manifest_path
+            manifest = load_config_for_inference(
+                args.checkpoint, config_path=args.config_path
+            ).manifest_path
         print(format_sample_table(list_samples(manifest)))
         return
 
@@ -486,11 +535,11 @@ def _run_infer(args: argparse.Namespace) -> None:
 
     manifest = args.manifest_path
     if manifest is None:
-        from sr.checkpoint import run_dir_for_checkpoint
-        from sr.config import from_json as _from_json
+        from sr.checkpoint import load_config_for_inference
 
-        run_dir = run_dir_for_checkpoint(args.checkpoint)
-        manifest = _from_json(run_dir / "config.json").manifest_path
+        manifest = load_config_for_inference(
+            args.checkpoint, config_path=args.config_path
+        ).manifest_path
 
     chosen = select_sample(manifest, **selection_filters)
     print(
@@ -500,7 +549,10 @@ def _run_infer(args: argparse.Namespace) -> None:
         f"run_id={chosen['run_id']} t={chosen['t']}"
     )
     result = infer_one(
-        args.checkpoint, chosen, override_manifest=args.manifest_path
+        args.checkpoint,
+        chosen,
+        override_manifest=args.manifest_path,
+        config_path=args.config_path,
     )
     print(f"[infer] axis={args.axis} slice_level={args.slice_level:.2f}")
     print(f"[infer] input.shape      = {result['input'].shape}")
@@ -543,6 +595,16 @@ def _run_infer(args: argparse.Namespace) -> None:
         )
 
 
+def _run_embed_config(args: argparse.Namespace) -> None:
+    embed_config_in_checkpoint(
+        args.checkpoint,
+        config_path=args.config_path,
+        backup=not args.no_backup,
+        dry_run=args.dry_run,
+        force=args.force,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
@@ -554,6 +616,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_infer(args)
     elif args.command == "debug":
         run_debug(args)
+    elif args.command == "embed-config":
+        _run_embed_config(args)
     else:
         parser.print_help()
         raise SystemExit(2)

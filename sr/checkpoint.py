@@ -283,16 +283,18 @@ def resolve_checkpoint_for_model(
     under ``run_root/<model_name>/`` with the same checkpoint preference.
     """
     if checkpoint is not None:
-        ckpt = Path(checkpoint)
-        config_path = run_dir_for_checkpoint(ckpt) / "config.json"
-        from sr.config import from_json
-
-        saved_name = from_json(config_path).model_name
-        if saved_name != model_name:
-            raise ValueError(
-                f"--model-name {model_name!r} disagrees with checkpoint run "
-                f"config model_name={saved_name!r} ({config_path})."
-            )
+        ckpt = Path(checkpoint).expanduser().resolve()
+        if not ckpt.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+        if model_name is not None:
+            saved_name = load_config_for_inference(
+                ckpt, model_name=model_name
+            ).model_name
+            if saved_name != model_name:
+                raise ValueError(
+                    f"--model-name {model_name!r} disagrees with checkpoint "
+                    f"config model_name={saved_name!r}."
+                )
         return ckpt
 
     candidate_runs: list[Path]
@@ -350,12 +352,260 @@ def run_dir_for_checkpoint(checkpoint_path: Path) -> Path:
 
     Convention: ``<run_dir>/epochs/epoch_NNN.pt``. Walking up two levels
     is enough; we double-check by confirming ``config.json`` is there.
+
+    Raises ``FileNotFoundError`` when the checkpoint is standalone (e.g.
+    ``models/foo_best.pt``). Use ``try_run_dir_for_checkpoint`` or
+    ``load_config_for_inference`` for portable weights.
     """
     checkpoint_path = Path(checkpoint_path)
-    candidate = checkpoint_path.parent.parent
-    if not (candidate / "config.json").is_file():
+    candidate = try_run_dir_for_checkpoint(checkpoint_path)
+    if candidate is None:
         raise FileNotFoundError(
-            f"Could not locate run directory for {checkpoint_path}: "
-            f"expected {candidate / 'config.json'} to exist."
+            f"Could not locate run directory for {checkpoint_path}. "
+            "Standalone checkpoints need a sidecar <name>.config.json, "
+            "an embedded config in the .pt file, or --config on the CLI."
         )
     return candidate
+
+
+def try_run_dir_for_checkpoint(checkpoint_path: Path) -> Path | None:
+    """Return the training run dir for a checkpoint, or ``None`` if unknown."""
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.parent.name != "epochs":
+        return None
+    candidate = checkpoint_path.parent.parent
+    if (candidate / "config.json").is_file():
+        return candidate
+    return None
+
+
+def find_config_json_for_checkpoint(checkpoint_path: Path) -> Path | None:
+    """Locate a ``config.json`` for a checkpoint through several conventions.
+
+    Search order:
+      1. Training layout: ``<run_dir>/epochs/*.pt`` -> ``<run_dir>/config.json``
+      2. Sidecar: ``<stem>.config.json`` next to the ``.pt`` file
+      3. Sidecar: ``<stem>_config.json``
+      4. ``config.json`` in the same directory as the checkpoint
+    """
+    ckpt = Path(checkpoint_path).expanduser().resolve()
+    candidates: list[Path] = []
+    run_dir = try_run_dir_for_checkpoint(ckpt)
+    if run_dir is not None:
+        candidates.append(run_dir / "config.json")
+    stem = ckpt.stem
+    candidates.extend(
+        [
+            ckpt.with_name(f"{stem}.config.json"),
+            ckpt.with_name(f"{stem}_config.json"),
+            ckpt.parent / "config.json",
+        ]
+    )
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _config_from_checkpoint_payload(checkpoint_path: Path) -> "SRConfig | None":
+    """Read an embedded ``config`` dict from a checkpoint payload, if present."""
+    from sr.config import SRConfig, _config_from_dict
+
+    payload = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("config")
+    if raw is None:
+        extra = payload.get("extra")
+        if isinstance(extra, dict):
+            raw = extra.get("config")
+    if raw is None:
+        return None
+    if isinstance(raw, SRConfig):
+        return raw
+    if isinstance(raw, dict):
+        return _config_from_dict(raw)
+    return None
+
+
+def load_config_for_inference(
+    checkpoint_path: Path,
+    *,
+    model_name: str | None = None,
+    config_path: Path | None = None,
+) -> "SRConfig":
+    """Build an ``SRConfig`` for eval/infer without requiring a full run directory.
+
+    Resolution order: explicit ``config_path`` -> sidecar/run ``config.json``
+    -> config embedded in the ``.pt`` payload -> minimal defaults when
+    ``model_name`` is supplied (may not match custom ``model_kwargs``).
+    """
+    from sr.config import SRConfig, from_json
+
+    ckpt = Path(checkpoint_path).expanduser().resolve()
+    if not ckpt.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+
+    if config_path is not None:
+        config = from_json(Path(config_path))
+    else:
+        sidecar = find_config_json_for_checkpoint(ckpt)
+        if sidecar is not None:
+            config = from_json(sidecar)
+        else:
+            embedded = _config_from_checkpoint_payload(ckpt)
+            if embedded is not None:
+                config = embedded
+            elif model_name is not None:
+                config = SRConfig(model_name=model_name)
+                print(
+                    f"[infer] warning: no config found beside {ckpt.name}; "
+                    f"using SRConfig defaults for model_name={model_name!r}. "
+                    "If weights fail to load, add a sidecar "
+                    f"{ckpt.stem}.config.json or pass --config."
+                )
+            else:
+                raise FileNotFoundError(
+                    f"No config found for checkpoint {ckpt}. "
+                    f"Add {ckpt.stem}.config.json next to the weights, embed "
+                    "config in the .pt file, or pass --config / --model-name."
+                )
+
+    if model_name is not None and config.model_name != model_name:
+        raise ValueError(
+            f"model_name={model_name!r} disagrees with checkpoint config "
+            f"model_name={config.model_name!r}."
+        )
+    return config
+
+
+def _load_checkpoint_payload(checkpoint_path: Path) -> dict[str, Any]:
+    """Load a checkpoint dict and verify it looks like an ``EpochState`` payload."""
+    payload = torch.load(
+        Path(checkpoint_path), map_location="cpu", weights_only=False
+    )
+    if not isinstance(payload, dict) or "model_state_dict" not in payload:
+        raise ValueError(
+            f"File at {checkpoint_path} is not a valid EpochState payload."
+        )
+    return payload
+
+
+def _verify_weights_match_config(
+    payload: dict[str, Any], config: "SRConfig"
+) -> None:
+    """Fail fast when ``model_state_dict`` does not match ``config`` architecture."""
+    from sr.models import build_model
+
+    model = build_model(config)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+
+
+def embed_config_in_checkpoint(
+    checkpoint_path: Path,
+    *,
+    config_path: Path | None = None,
+    backup: bool = True,
+    dry_run: bool = False,
+    force: bool = False,
+) -> Path:
+    """Embed ``SRConfig`` into ``payload['extra']['config']`` without touching weights.
+
+    Purpose:
+        Ship a single ``.pt`` file that infer can load without a sidecar JSON.
+    Safety:
+        - Resolves config from ``config_path`` or an existing sidecar/run JSON.
+        - Verifies ``strict=True`` weight load before and after the write.
+        - Refuses to overwrite an embedded config unless ``force=True``.
+        - Writes via ``.tmp`` + atomic replace; optional ``.pt.bak`` backup first.
+    """
+    import shutil
+
+    from sr.config import SRConfig, _config_to_dict, from_json, validate
+
+    ckpt = Path(checkpoint_path).expanduser().resolve()
+    if not ckpt.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+
+    payload = _load_checkpoint_payload(ckpt)
+
+    existing_raw: dict[str, Any] | None = None
+    extra = payload.get("extra")
+    if isinstance(extra, dict) and isinstance(extra.get("config"), dict):
+        existing_raw = extra["config"]
+    elif isinstance(payload.get("config"), dict):
+        existing_raw = payload["config"]
+
+    if existing_raw is not None and not force:
+        embedded = _config_from_checkpoint_payload(ckpt)
+        if embedded is None:
+            raise ValueError(
+                f"{ckpt.name} has an embedded config field but it could not be parsed."
+            )
+        validate(embedded)
+        _verify_weights_match_config(payload, embedded)
+        if dry_run:
+            print(
+                f"[embed-config] dry-run OK: already embeds model_name="
+                f"{embedded.model_name!r} in {ckpt}"
+            )
+            return ckpt
+        raise ValueError(
+            f"{ckpt.name} already embeds a config. Re-run with --force to replace."
+        )
+
+    if config_path is not None:
+        config = from_json(Path(config_path))
+    else:
+        sidecar = find_config_json_for_checkpoint(ckpt)
+        if sidecar is None:
+            raise FileNotFoundError(
+                f"No config source for {ckpt}. Pass --config or add "
+                f"{ckpt.stem}.config.json beside the checkpoint."
+            )
+        config = from_json(sidecar)
+
+    validate(config)
+
+    _verify_weights_match_config(payload, config)
+
+    new_extra = dict(extra) if isinstance(extra, dict) else {}
+    new_extra["config"] = _config_to_dict(config)
+    payload["extra"] = new_extra
+    payload.pop("config", None)
+
+    _verify_weights_match_config(payload, config)
+
+    if dry_run:
+        print(
+            f"[embed-config] dry-run OK: would embed model_name={config.model_name!r} "
+            f"into {ckpt}"
+        )
+        return ckpt
+
+    backup_path: Path | None = None
+    if backup:
+        backup_path = ckpt.with_name(ckpt.name + ".bak")
+        shutil.copy2(ckpt, backup_path)
+        print(f"[embed-config] backup -> {backup_path}")
+
+    tmp = ckpt.with_name(ckpt.name + ".tmp")
+    torch.save(payload, tmp)
+    try:
+        written = _load_checkpoint_payload(tmp)
+        _verify_weights_match_config(written, config)
+        embedded = _config_from_checkpoint_payload(tmp)
+        if embedded is None or embedded.model_name != config.model_name:
+            raise RuntimeError("Post-write verification failed: embedded config missing.")
+        tmp.replace(ckpt)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    print(f"[embed-config] embedded config into {ckpt}")
+    return ckpt

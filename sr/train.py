@@ -44,6 +44,7 @@ from sr.checkpoint import (
 from sr.components import build_optimizer, build_scheduler, step_scheduler
 from sr.config import (
     SRConfig,
+    _config_to_dict,
     auto_device,
     from_json,
     seed_everything,
@@ -454,6 +455,7 @@ def train(config: SRConfig, resume_dir: Path | None = None) -> Path:
                 best_val_loss=best_val_loss,
                 best_epoch_number=best_epoch_number,
                 loss_name=config.loss_name,
+                extra={"config": _config_to_dict(config)},
             )
             written = save_epoch(run_dir, state)
             write_metrics_json(run_dir, metrics_history)
