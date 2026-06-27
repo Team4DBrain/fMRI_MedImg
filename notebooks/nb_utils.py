@@ -753,7 +753,7 @@ def sweep_trial(
         print(f"  {name}: t={t} ({i+1}/{len(ts)})", end="\r", flush=True)
         r = run_trial(bold_path, t, pre_steps, post_steps, models,
                       name=name, label=label, norm_ref=norm_ref)
-        rows.append({"t": t, **r.metrics})
+        rows.append({"t": t, "label": label or name, **r.metrics})
     print(f"  {name}: done ({len(ts)} frames)          ")
     return rows
 
@@ -762,8 +762,8 @@ def sweep_trial(
 # Visualization for trials
 # ---------------------------------------------------------------------------
 
-def show_trial(result: TrialResult, *, title: str = "", save_path=None):
-    """Tri-planar GT / Predicted / |Error model| / |Error naive| figure."""
+def show_trial_simple(result: TrialResult, *, title: str = "", save_path=None):
+    """Classic tri-planar figure — raw error maps, hot colormap (original style)."""
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
 
@@ -813,24 +813,109 @@ def show_trial(result: TrialResult, *, title: str = "", save_path=None):
     return fig
 
 
+def show_trial(result: TrialResult, *, title: str = "", save_path=None):
+    """Tri-planar GT / Predicted / |Error model| / |Error naive| figure."""
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
+    gt, pred, naive = result.gt, result.pred, result.naive
+    err_m, err_n    = result.error, result.naive_error
+    m = result.metrics
+
+    cx, cy, cz = [s // 2 for s in gt.shape]
+    vmax = float(np.percentile(gt, 99.5)) or 1.0
+
+    # normalise errors to [0,1] and mask out background
+    mask   = gt > 0.05 * vmax
+    err_mn = err_m / vmax
+    err_nn = err_n / vmax
+    emax   = float(np.percentile(np.maximum(err_mn[mask], err_nn[mask]), 99)) or 0.1
+
+    def _masked(arr2d, mask2d):
+        out = np.ma.array(arr2d, mask=~mask2d)
+        return out
+
+    planes = [
+        (gt[cx,:,:].T,   pred[cx,:,:].T,   err_mn[cx,:,:].T,  err_nn[cx,:,:].T,  mask[cx,:,:].T,  "Sagittal"),
+        (gt[:,cy,:].T,   pred[:,cy,:].T,    err_mn[:,cy,:].T,  err_nn[:,cy,:].T,  mask[:,cy,:].T,  "Coronal"),
+        (gt[:,:,cz].T,   pred[:,:,cz].T,   err_mn[:,:,cz].T,  err_nn[:,:,cz].T,  mask[:,:,cz].T,  "Axial"),
+    ]
+
+    fig = plt.figure(figsize=(18, 13))
+    gs  = gridspec.GridSpec(3, 4, figure=fig, wspace=0.05, hspace=0.15)
+
+    col_titles = ["Ground Truth", "Prediction", "|Error| model", "|Error| naive"]
+    for col, ct in enumerate(col_titles):
+        ax0 = fig.add_subplot(gs[0, col])
+        ax0.set_title(ct, fontsize=12, fontweight="bold", pad=8)
+        ax0.axis("off")
+
+    for row, (g, p, em, en, mk, plane) in enumerate(planes):
+        anat_kw  = dict(cmap="gray",    vmin=0, vmax=vmax, origin="lower", aspect="auto")
+        err_kw   = dict(cmap="inferno", vmin=0, vmax=emax, origin="lower", aspect="auto")
+
+        ax_g  = fig.add_subplot(gs[row, 0])
+        ax_p  = fig.add_subplot(gs[row, 1])
+        ax_em = fig.add_subplot(gs[row, 2])
+        ax_en = fig.add_subplot(gs[row, 3])
+
+        ax_g.imshow(g,  **anat_kw)
+        ax_p.imshow(p,  **anat_kw)
+        # show anatomy in background, overlay masked error
+        ax_em.imshow(g, **anat_kw)
+        im = ax_em.imshow(_masked(em, mk), **err_kw, alpha=0.85)
+        ax_en.imshow(g, **anat_kw)
+        ax_en.imshow(_masked(en, mk), **err_kw, alpha=0.85)
+
+        for ax, lbl in zip([ax_g, ax_p, ax_em, ax_en], [""] * 4):
+            ax.axis("off")
+        ax_g.set_ylabel(plane, fontsize=10, labelpad=4)
+
+        if row == 2:
+            fig.colorbar(im, ax=ax_en, fraction=0.046, pad=0.04,
+                         label="Normalised |error|")
+
+    beat   = "✓ beats naive" if m["model_beats"] else "✗ loses to naive"
+    norm_l1_m = m["model_l1"] / vmax
+    norm_l1_n = m["naive_l1"] / vmax
+    suptit = (
+        f"{title}  (t={result.t})\n"
+        f"PSNR  model={m['model_psnr']:.2f} dB   naive={m['naive_psnr']:.2f} dB   |   "
+        f"L1 (norm)  model={norm_l1_m:.4f}   naive={norm_l1_n:.4f}   |   {beat}"
+    )
+    fig.suptitle(suptit, fontsize=11, y=1.01)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(str(save_path), dpi=130, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
 def sweep_plot(sweeps: dict, *, title: str = "", save_path=None):
-    """Line plots of PSNR and L1 over time for multiple pipeline variants."""
+    """Line plots of PSNR and normalised L1 over time for multiple pipeline variants."""
     import matplotlib.pyplot as plt
     import pandas as pd
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-    for name, rows in sweeps.items():
-        df = pd.DataFrame(rows)
-        axes[0].plot(df["t"], df["model_psnr"], label=name, lw=2)
-        axes[1].plot(df["t"], df["model_l1"],   label=name, lw=2)
-    for ax, (yl, tt) in zip(axes, [("PSNR (dB)", "PSNR over time"), ("L1", "L1 over time")]):
-        ax.set_xlabel("t"); ax.set_ylabel(yl); ax.set_title(tt)
-        ax.legend(fontsize=8, loc="best"); ax.grid(alpha=0.3)
+    PALETTE = plt.cm.tab10.colors
+    fig, axes = plt.subplots(1, 2, figsize=(18, 5))
+    for i, (name, rows) in enumerate(sweeps.items()):
+        df    = pd.DataFrame(rows)
+        color = PALETTE[i % len(PALETTE)]
+        label = rows[0].get("label", name) if rows else name
+        axes[0].plot(df["t"], df["model_psnr"],             color=color, lw=2,   label=label)
+        axes[0].plot(df["t"], df["naive_psnr"], "--",       color=color, lw=1,   alpha=0.4)
+        axes[1].plot(df["t"], df["model_l1"] / df["model_l1"].max(), color=color, lw=2, label=label)
+    axes[0].set_xlabel("Frame t"); axes[0].set_ylabel("PSNR (dB)")
+    axes[0].set_title("PSNR over time  (dashed = naive baseline)")
+    axes[0].legend(fontsize=8, loc="lower right"); axes[0].grid(alpha=0.25)
+    axes[1].set_xlabel("Frame t"); axes[1].set_ylabel("Normalised L1")
+    axes[1].set_title("L1 error over time  (per-pipeline normalised for shape)")
+    axes[1].legend(fontsize=8, loc="upper right"); axes[1].grid(alpha=0.25)
     if title:
-        fig.suptitle(title, fontsize=12)
+        fig.suptitle(title, fontsize=13, y=1.02)
     fig.tight_layout()
     if save_path:
-        fig.savefig(str(save_path), dpi=120, bbox_inches="tight")
+        fig.savefig(str(save_path), dpi=130, bbox_inches="tight")
     plt.show()
     return fig
 
@@ -842,34 +927,43 @@ def pipelines_summary(sweeps: dict, *, save_path=None):
 
     rows = []
     for name, mlist in sweeps.items():
-        df = pd.DataFrame(mlist)
+        df    = pd.DataFrame(mlist)
+        label = mlist[0].get("label", name) if mlist else name
         rows.append(dict(
-            pipeline        = name,
+            pipeline        = label,
             mean_psnr       = round(df["model_psnr"].mean(), 3),
             mean_l1         = round(df["model_l1"].mean(), 4),
             pct_beats_naive = round(df["model_beats"].mean() * 100, 1),
         ))
     summary = pd.DataFrame(rows).set_index("pipeline")
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for ax, (col, yl, color) in zip(axes, [
-        ("mean_psnr",       "Mean PSNR (dB)",    "#4C72B0"),
-        ("mean_l1",         "Mean L1",            "#DD8452"),
-        ("pct_beats_naive", "% Frames > Naive",   "#55A868"),
-    ]):
+    PALETTE = plt.cm.tab10.colors[:len(summary)]
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+
+    metrics = [
+        ("mean_psnr",       "Mean PSNR (dB)",       "Higher is better ↑"),
+        ("mean_l1",         "Mean L1 (raw)",         "Lower is better ↓"),
+        ("pct_beats_naive", "% Frames beating naive","Higher is better ↑"),
+    ]
+    for ax, (col, yl, sub) in zip(axes, metrics):
         vals = summary[col]
-        bars = ax.bar(range(len(vals)), vals.values, color=color, alpha=0.85, width=0.6)
+        bars = ax.bar(range(len(vals)), vals.values, color=PALETTE, alpha=0.88, width=0.6,
+                      edgecolor="white", linewidth=0.8)
         ax.set_xticks(range(len(vals)))
-        ax.set_xticklabels(vals.index, rotation=35, ha="right", fontsize=8)
-        ax.set_ylabel(yl); ax.set_title(yl); ax.grid(axis="y", alpha=0.3)
+        ax.set_xticklabels(vals.index, rotation=38, ha="right", fontsize=8.5)
+        ax.set_ylabel(yl, fontsize=10)
+        ax.set_title(f"{yl}\n{sub}", fontsize=10, fontweight="bold")
+        ax.grid(axis="y", alpha=0.25, linestyle="--")
+        ax.spines[["top", "right"]].set_visible(False)
         for bar, val in zip(bars, vals.values):
             ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + vals.max() * 0.01,
-                    f"{val:.2f}", ha="center", va="bottom", fontsize=8)
-    fig.suptitle("Pipeline Comparison — Leave-out Evaluation (GT = real held-out frame)",
-                 fontsize=13, y=1.02)
+                    bar.get_height() + vals.max() * 0.012,
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+    fig.suptitle("Pipeline Comparison — Leave-out Evaluation  (GT = real held-out frame)",
+                 fontsize=14, fontweight="bold", y=1.03)
     fig.tight_layout()
     if save_path:
-        fig.savefig(str(save_path), dpi=120, bbox_inches="tight")
+        fig.savefig(str(save_path), dpi=130, bbox_inches="tight")
     plt.show()
     return fig, summary
