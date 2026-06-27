@@ -26,14 +26,24 @@ python -m joint.puppetmaster \
     -o /tmp/sub-13_painmovie_pred.nii.gz
 ```
 
-Per timepoint it runs normalize → degrade (k-space truncation + Rician noise) → forward pass →
-denormalize, then stacks along time. Worth knowing:
+It **auto-detects the input resolution** and runs in one of two modes:
 
-- **Input must be one of the 46 runs in `manifest_big`** — that's where the run's `norm_ref` is
-  looked up. For a brand-new run, add it to a manifest (with a mask + `norm_ref`) first.
-- It's a **round-trip on full-res IBC data** — `model(degrade(HR))` — a demo/eval of the model, not
-  an enhancer for arbitrary external low-res scans (the model only knows our synthetic degradation).
-- Noise is **fresh random each call**, so reruns aren't bit-identical (mimics real thermal noise).
+- **HR input (128×128×93) → round-trip mode:** normalize → degrade (k-space truncation + Rician
+  noise) → forward → denormalize, stacked along time. The standalone demo on existing IBC data,
+  `model(degrade(HR))`. `norm_ref` is looked up from `manifest_big` by filename, so an HR input
+  should be one of the 46 runs there (or pass `--norm-ref`).
+- **LR input (64×64×46) → lr-native mode:** the volume is assumed **already degraded**, so no
+  degradation is applied — it's fed straight to the model (one noisy LR in → denoised HR out). This
+  is what the pipeline orchestrator uses when it degrades a run *once* and compares joint against a
+  denoise+SR cascade on the *identical* noisy LR. `norm_ref` defaults to the input's own
+  temporal-mean 98th percentile (or pass `--norm-ref`).
+
+Worth knowing:
+- It's a **round-trip / reconstruction**, not an enhancer for arbitrary external scans (the model
+  only knows our synthetic degradation).
+- Noise (HR mode only) is **fresh random each call**, so reruns aren't bit-identical (mimics real
+  thermal noise).
+- `--norm-ref <float>` overrides the normalization scale in either mode.
 
 Hardcoded shared locations (on the VM): weights `/srv/venvs/team4dbrain/joint_model/best.pt`
 (the 4M model), manifest `/srv/venvs/team4dbrain/derivatives/manifest_big.json`.
