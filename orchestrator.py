@@ -537,6 +537,9 @@ def main(argv=None):
                          "twice; empty = identity passthrough, no degradation)")
     ap.add_argument("--degrade-once", choices=["yes", "no"], default="yes",
                     help="yes = Architecture A (degrade once, fair); no = B (black-box chain)")
+    ap.add_argument("--noise", choices=["auto", "off"], default="auto",
+                    help="auto = add Rician noise when a denoise/joint step is present (default); "
+                         "off = never add noise (spatial-only degradation, e.g. to isolate SR)")
     ap.add_argument("--truncate", type=_nonneg_int, default=0,
                     help="take N consecutive frames from a random start (0 = whole run)")
     ap.add_argument("--seed", type=_nonneg_int, default=0, help="seed (>=0) for truncation + degradation noise")
@@ -561,7 +564,7 @@ def main(argv=None):
         raise FileNotFoundError(f"input not found: {input_path}")
 
     print(f"[orch] input={input_path}\n[orch] steps={steps or '(identity passthrough)'} "
-          f"degrade_once={args.degrade_once} truncate={args.truncate} seed={args.seed}")
+          f"degrade_once={args.degrade_once} noise={args.noise} truncate={args.truncate} seed={args.seed}")
 
     # 0) degradation params (from the joint checkpoint -> can't drift from training)
     params = resolve_degradation_params(WEIGHTS_PATH)
@@ -588,8 +591,12 @@ def main(argv=None):
     degraded_path = None
     if degrade_a:
         spatial = bool(SPATIAL_STEPS & set(steps))
-        noise = bool(NOISE_STEPS & set(steps))
-        print(f"[orch] degrade-once: spatial={spatial} noise={noise}")
+        want_noise = bool(NOISE_STEPS & set(steps))
+        noise = want_noise and args.noise != "off"
+        msg = f"[orch] degrade-once: spatial={spatial} noise={noise}"
+        if want_noise and not noise:
+            msg += "  (--noise off: noise-step present but noise degradation disabled)"
+        print(msg)
         if spatial or noise:
             deg, deg_shape = degrade_once(ref_data, norm_ref, spatial, noise, args.seed, params)
             degraded_path = work / "degraded.nii.gz"
@@ -658,6 +665,7 @@ def main(argv=None):
     # 7) provenance
     (out_dir / "run_config.json").write_text(json.dumps({
         "input": str(input_path), "steps": steps, "degrade_once": args.degrade_once,
+        "noise": args.noise,
         "truncate": args.truncate, "truncate_start": start, "timepoints": T,
         "seed": args.seed, "sr_model": args.sr_model, "interp_mode": args.interp_mode,
         "norm_ref": norm_ref, "norm_ref_source": nr_src, "mask_fraction": float(mask.mean()),

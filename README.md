@@ -55,6 +55,7 @@ Each run writes a directory:
 | `--output`, `-o` | `runs/<steps>` | output **directory**. If omitted, auto-named from the steps — `runs/<steps joined by _>` (e.g. `runs/denoise_sr`; empty steps → `runs/identity`), bumped to `…2`, `…3`, … if that name already exists. |
 | `--steps` | *(empty)* | ordered endpoint steps from `{denoise, sr, joint, interp}`. Repeat a name to run it twice. Empty = identity passthrough (no steps, **no degradation**; `final` == `reference`) — a harness sanity check, not a degraded baseline. |
 | `--degrade-once` | `yes` | `yes` = Architecture A (degrade once, fair). `no` = Architecture B (black-box chain). |
+| `--noise` | `auto` | `auto` = add Rician noise iff a `denoise`/`joint` step is present (the conditional rule below). `off` = never add noise, i.e. spatial-only degradation even when a noise step is present (e.g. to isolate SR from denoising, or feed a cascade a clean LR). |
 | `--truncate` | `0` | take N consecutive frames from a **random** valid start (0 = whole run). |
 | `--seed` | `0` | seeds the truncation start **and** the degradation noise (reproducible). |
 | `--sr-model` | `rcan3d` | SR model key (e.g. `rcan3d`, `srcnn3d_deep`); resolves `models/sr_<key>_*_best.pt` (no enum validation — an unknown key fails at lookup). |
@@ -70,8 +71,12 @@ The orchestrator degrades the input **once** and feeds that identical run to the
 chosen steps. Degradation is **conditional on the steps**:
 
 - **spatial** degrade (HR→LR, k-space truncation) iff `sr` **or** `joint` is in `--steps`
-- **noise** degrade (Rician) iff `denoise` **or** `joint` is in `--steps`
+- **noise** degrade (Rician) iff `denoise` **or** `joint` is in `--steps` (unless `--noise off`)
 - applied **spatial-then-noise** when both.
+
+**`--noise off`** disables the noise step entirely (spatial degrade is unchanged): e.g.
+`--steps denoise sr --noise off` feeds the cascade a *clean* LR instead of a noisy one,
+isolating SR/denoise behaviour from the noise. Default `auto` keeps the conditional rule above.
 
 So `denoise sr` and `joint` both see the *same* noisy low-res input → an
 apples-to-apples comparison. Here `joint`/`sr` run **LR-native** (selected purely by
@@ -193,6 +198,9 @@ python orchestrator.py -i <sub-13 run> -o runs/cascade  --steps denoise sr
 
 # SR-only baseline (no denoise) on clean LR:
 python orchestrator.py -i <run> -o runs/sr_only --steps sr
+
+# Cascade WITHOUT noise (clean LR) — isolate the denoise->SR handoff from noise:
+python orchestrator.py -i <run> --steps denoise sr --noise off
 
 # Black-box chain for contrast (each endpoint self-degrades):
 python orchestrator.py -i <run> -o runs/bbox --steps denoise sr --degrade-once no
