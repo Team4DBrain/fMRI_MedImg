@@ -529,7 +529,7 @@ def main(argv=None):
     ap.add_argument("--sr-model", default="rcan3d", help="SR model key (default rcan3d)")
     ap.add_argument("--interp-mode", choices=["insert", "fill-gaps"], default="fill-gaps",
                     help="interp output mode (default fill-gaps)")
-    ap.add_argument("--keep-intermediates", choices=["yes", "no"], default="yes")
+    ap.add_argument("--keep-intermediates", choices=["yes", "no"], default="no")
     args = ap.parse_args(argv)
 
     input_path = Path(args.input).resolve()

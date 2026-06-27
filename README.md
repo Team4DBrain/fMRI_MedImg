@@ -55,7 +55,7 @@ Each run writes a directory:
 | `--seed` | `0` | seeds the truncation start **and** the degradation noise (reproducible). |
 | `--sr-model` | `rcan3d` | SR model key (e.g. `rcan3d`, `srcnn3d_deep`); resolves `models/sr_<key>_*_best.pt` (no enum validation — an unknown key fails at lookup). |
 | `--interp-mode` | `fill-gaps` | interp output mode. `fill-gaps` = only synthetic frames (T−1); `insert` = originals + synthetic (2T−1). |
-| `--keep-intermediates` | `yes` | keep `work/` (degraded + per-step runs). `no` deletes it at the end. |
+| `--keep-intermediates` | `no` | keep `work/` (degraded + per-step runs + per-step logs). `no` deletes it at the end. |
 
 ---
 
