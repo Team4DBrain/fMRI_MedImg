@@ -40,8 +40,8 @@ true HR run can override that afterward.
 Noise (HR/round-trip mode only) is fresh and random per call, so reruns are not
 bit-identical — intentional (mimics real thermal noise).
 
-Hardcoded shared locations (exist on the project VM):
-  weights  : /srv/venvs/team4dbrain/joint_model/best.pt           (joint03, the 4M model)
+Shared locations:
+  weights  : <repo>/weights/joint/best.pt                         (joint03, the 4M model)
   manifest : /srv/venvs/team4dbrain/derivatives/manifest_big.json (46 runs)
 """
 from __future__ import annotations
@@ -61,8 +61,10 @@ from data.reader import get_reader
 
 from .eval import load_checkpoint
 
-# --- hardcoded shared locations on the VM -----------------------------------
-WEIGHTS_PATH = "/srv/venvs/team4dbrain/joint_model/best.pt"
+# --- shared locations -------------------------------------------------------
+# joint checkpoint is versioned in the repo (weights/joint/best.pt); the manifest
+# still lives on the project VM.
+WEIGHTS_PATH = str(Path(__file__).resolve().parent.parent / "weights" / "joint" / "best.pt")
 MANIFEST_PATH = "/srv/venvs/team4dbrain/derivatives/manifest_big.json"
 
 
