@@ -813,7 +813,7 @@ def show_trial_simple(result: TrialResult, *, title: str = "", save_path=None):
     return fig
 
 
-def show_trial(result: TrialResult, *, title: str = "", save_path=None):
+def show_trial(result: TrialResult, *, title: str = "", save_path=None, error_vmax=None):
     """Tri-planar GT / Predicted / |Error model| / |Error naive| figure."""
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
@@ -829,7 +829,10 @@ def show_trial(result: TrialResult, *, title: str = "", save_path=None):
     mask   = gt > 0.05 * vmax
     err_mn = err_m / vmax
     err_nn = err_n / vmax
-    emax   = float(np.percentile(np.maximum(err_mn[mask], err_nn[mask]), 99)) or 0.1
+    if error_vmax is not None:
+        emax = float(error_vmax)
+    else:
+        emax = float(np.percentile(np.maximum(err_mn[mask], err_nn[mask]), 99)) or 0.1
 
     def _masked(arr2d, mask2d):
         out = np.ma.array(arr2d, mask=~mask2d)
