@@ -1,4 +1,4 @@
-"""utils.py — shared helpers: device selection, seeding, config loading."""
+"""Shared helpers: device selection, seeding, config loading."""
 
 import random
 from pathlib import Path
