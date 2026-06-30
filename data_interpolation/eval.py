@@ -1,4 +1,4 @@
-"""eval.py — held-out evaluation of a trained checkpoint vs the naive baseline.
+"""Held-out evaluation of a trained checkpoint vs the naive baseline.
 
 For every valid t in a BOLD file, computes L1 and PSNR for:
 

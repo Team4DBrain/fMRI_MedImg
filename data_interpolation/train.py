@@ -1,4 +1,4 @@
-"""train.py — config-driven training entry point for fMRI interpolation.
+"""Config-driven training entry point for fMRI interpolation.
 
 Usage:
 

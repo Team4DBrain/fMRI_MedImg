@@ -1,32 +1,19 @@
-"""main.py — inference pipeline for fMRI temporal interpolation.
+"""Inference CLI for fMRI temporal interpolation.
 
-Loads a trained checkpoint, reads a 4D BOLD NIfTI, and generates a new 4D
-NIfTI with one interpolated frame inserted between every pair of original
-frames. The output time axis is therefore (2T - 1) long for a T-frame input.
-
-Output frame ordering, for input frames V_0, V_1, ..., V_{T-1}:
-
-    out_0  = V_0
-    out_1  = f(V_0, V_2)          # interpolated between V_0 and V_2 ... but
-                                   # better: insert between consecutive frames,
-                                   # see --mode below.
-    out_2  = V_1
-    ...
-
-Two modes are supported:
+Loads a checkpoint, reads a 4D BOLD NIfTI, and writes a new one with synthetic
+frames between the originals. Two modes:
 
     --mode insert (default)
-        For each consecutive pair (V_i, V_{i+1}), predict an intermediate frame
-        f(V_i, V_{i+1}). Output length = 2T - 1. The model was trained on
-        triplets (V_t, V_{t+1}, V_{t+2}) where the "neighbors" were two steps
-        apart, so this mode treats consecutive frames as those neighbors.
+        For each pair (V_i, V_{i+1}), predict the in-between frame. Output is
+        2T-1 long: original frames interleaved with the synthetic ones. The
+        model was trained on (V_t, V_{t+1}, V_{t+2}) triplets, so here we just
+        feed it consecutive frames as the neighbours.
 
     --mode fill-gaps
-        Same model call, but only inserted frames are returned (length T - 1).
-        Useful if you want just the synthetic frames.
+        Same calls, but return only the T-1 synthetic frames.
 
-The output NIfTI keeps the original affine and header (with TR halved when
-nibabel can read it from pixdim[4]).
+The output keeps the input's affine and header (TR is halved when it's readable
+from pixdim[4]).
 
 Example:
 
